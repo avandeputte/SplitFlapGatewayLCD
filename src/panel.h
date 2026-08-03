@@ -40,6 +40,12 @@ void panelBacklightService();   // taskRTC only: performs any pending backlight 
 // Takes effect on the next frame; nothing is cached.
 void panelSetColourOrder(bool bgr);
 
+// Effect render scale (LCD Gateway): shrink the logical drawing surface by 1/s -- the
+// PPA scales it back up in the same pass that rotates. Effects run at 5 (256x160,
+// their authored resolution); everything else at 1. Switching clears the surface.
+void panelSetScale(uint8_t s);
+uint8_t panelGetScale();
+
 // ---- drawing: back buffer, 8-bit RGB, no brightness applied by the caller ----
 void panelClear();
 void panelPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b);

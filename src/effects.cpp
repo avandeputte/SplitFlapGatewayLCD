@@ -423,7 +423,7 @@ static void drawClockTime(int cx, int by, const AAFont* f, const char dg[6], int
 // A clean digital clock: big anti-aliased HH MM (Orbitron) with a small dot colon, drifting through
 // a rainbow, the date (month spelled out) below it, and a seconds bar that shrinks over the minute.
 static void renderClock() {
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   clockRefresh();                                          // rebuild HHMMSS + date only on a new second
   panelClear();
   const int hb = (int)(fxTick / 3);
@@ -555,10 +555,10 @@ static uint16_t mzHold;
 static uint16_t mzHueAcc, mzHueStep;
 
 static inline uint8_t* mzHuePx(int x, int y) {
-  return &fxBuf[(size_t)gPanel.panelW * gPanel.panelH + y * gPanel.panelW + x];
+  return &fxBuf[(size_t)panelInfo().width * panelInfo().height + y * panelInfo().width + x];
 }
 
-static inline uint8_t* mzPx(int x, int y) { return &fxBuf[y * gPanel.panelW + x]; }
+static inline uint8_t* mzPx(int x, int y) { return &fxBuf[y * panelInfo().width + x]; }
 static inline bool mzSeen(int cx, int cy) { return *mzPx(3 * cx + 1, 3 * cy + 1) >= 2; }
 
 static void mzFillCell(int cx, int cy, uint8_t v) {      // the 2x2 passage block
@@ -597,7 +597,7 @@ static bool mzWallOpen(int cx, int cy, int d) {          // sample one gap pixel
 }
 
 static void mzInit() {
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   memset(fxBuf, 0, (size_t)W * H);
   mzCols = (int16_t)((W - 1) / 3);
   mzRows = (int16_t)((H - 1) / 3);
@@ -656,7 +656,7 @@ static bool mzSolvePass() {                      // one dead-end-filling pass
 }
 
 static void renderMaze() {
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   if (!fxBuf) { panelShow(); return; }
 
   if (mzMode == MZ_WALK) {
@@ -735,7 +735,7 @@ struct Ripple { int16_t x, y; uint16_t r8; uint8_t hue, amp; bool alive; };
 static Ripple ripPool[14];
 
 static void renderRipple() {
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   const int maxR = W / 2 + 8;
 
   if (fxAud.beat) {
@@ -783,7 +783,7 @@ static void renderRipple() {
 void effectReset(uint8_t type) {
   fxBuildLUTs();
   fxFrame = 0; fxTick = 0;
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   // Only fire and Life use the shared grid -- don't allocate 2*W*H (32 KB on a
   // 256x64 panel) for plasma/matrix/clock/fliporama, which never touch it.
   if (type == EFFECT_FIRE || type == EFFECT_LIFE || type == EFFECT_MAZE) {
@@ -824,7 +824,7 @@ void effectReset(uint8_t type) {
 }
 
 static void renderPlasma() {
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   const uint32_t t = fxFrame;
   const int hue = gEffectHue;             // one volatile read per frame, not per pixel
   for (int y = 0; y < H; y++) {
@@ -843,7 +843,7 @@ static void renderPlasma() {
 }
 
 static void renderFire() {
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   if (!fxBuf) { panelShow(); return; }
   // Bottom row is the source: a flickering orange-yellow base (160..223), with the occasional
   // white-hot spark. Keeping the base below the white tip is what stops it becoming a white slab.
@@ -880,7 +880,7 @@ static void renderFire() {
 }
 
 static void renderMatrix() {
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   const int cols = W < FX_MAXW ? W : FX_MAXW;
   panelClear();                           // black field
   // With "audio":true the rain falls harder with loudness, and a beat spawns a
@@ -921,7 +921,7 @@ static void renderMatrix() {
 
 /* ---- spectrum (v3.4): log-band bars, falling peak caps, hue gradient ---- */
 static void renderSpectrum() {
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   panelClear();
   const int bw   = W / AUDIO_BANDS;                    // 8 px per band at 128, 16 at 256
   const int base = (gEffectHue >= 0) ? gEffectHue : 160;   // default: red bass -> blue treble
@@ -950,7 +950,7 @@ static void renderSpectrum() {
 /* ---- oscilloscope (v3.10): time-domain mic waveform ---- */
 static int8_t scopeBuf[AUDIO_SCOPE];
 static void renderScope() {
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   audioReadScope(scopeBuf, AUDIO_SCOPE);
   panelClear();
   const int mid = H / 2;
@@ -982,7 +982,7 @@ static void renderScope() {
 // through the fire palette -- black floor, red-orange mids, white-hot peaks.
 // speed 1..10 sets the scroll rate (columns per second, roughly speed*8).
 static void renderSpectrogram() {
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  const int W = panelInfo().width, H = panelInfo().height;
   // Gate the scroll to the configured speed: at ~70 fps a 1 px/frame scroll empties
   // 256 columns in under 4 s. Advance every N ticks instead.
   const int gate = 11 - (gEffectSpeed < 1 ? 1 : gEffectSpeed > 10 ? 10 : gEffectSpeed);
@@ -1058,7 +1058,11 @@ void effectRender(uint8_t type) {
     if (fxAud.beat) fxFrame += 40;
   }
   fxTick++;
-  const int W = gPanel.panelW, H = gPanel.panelH;
+  // panelInfo(), not gPanel: gPanel is the BOOT wall plan (full native panel). On the
+  // LCD surface the drawing area shrinks while an effect runs (panelSetScale) and every
+  // renderer must follow the live surface, or it computes -- and mostly clips away --
+  // sixteen times the pixels it can show. Found the hard way: 8 fps plasma.
+  const int W = panelInfo().width, H = panelInfo().height;
   switch (type) {
     case EFFECT_PLASMA:    renderPlasma();    break;
     case EFFECT_FIRE:      renderFire();      break;

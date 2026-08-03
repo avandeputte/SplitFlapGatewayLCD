@@ -100,6 +100,28 @@ void panelBacklightService() {                 // taskRTC only (the I2C rule)
 static bool bgrOrder = false;
 void panelSetColourOrder(bool bgr) { bgrOrder = bgr; }
 
+// Effect render scale (LCD Gateway): the pixel effects were authored for a ~256-wide
+// LED matrix -- at native 1280x800 their spatial features shrink to shimmer and the
+// pixel count is 16x their budget. panelSetScale(5) makes the drawing surface 256x160:
+// every primitive, clone, scroll and readback operates in that logical space, and
+// panelShow has the PPA scale 5x in the same hardware pass that rotates -- pattern
+// size and frame rate fixed together, for free. Scale 1 is the native surface (wall,
+// canvas, alerts). Switching memsets both buffers: old content is the wrong geometry.
+static uint8_t gScale = 1;
+void panelSetScale(uint8_t s) {
+  if (s < 1) s = 1;
+  if (s > 8) s = 8;
+  if (!info.ok || s == gScale) return;
+  gScale = s;
+  W = (uint16_t)(PANEL_NATIVE_H / s);
+  H = (uint16_t)(PANEL_NATIVE_W / s);
+  info.width = W; info.height = H;
+  panelClearClip();
+  memset(fb[0], 0, gFbBytes);
+  memset(fb[1], 0, gFbBytes);
+}
+uint8_t panelGetScale() { return gScale; }
+
 static inline px_t pack565(uint8_t r, uint8_t g, uint8_t b) {
   if (bgrOrder) { uint8_t t = r; r = b; b = t; }
   return (px_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
@@ -542,20 +564,26 @@ static void rotateToScanout() {
     op.out.block_offset_y = 0;
     op.out.srm_cm        = PPA_SRM_COLOR_MODE_RGB565;
     op.rotation_angle    = PANEL_ROT_180 ? PPA_SRM_ROTATION_ANGLE_270 : PPA_SRM_ROTATION_ANGLE_90;
-    op.scale_x           = 1.0f;
-    op.scale_y           = 1.0f;
+    op.scale_x           = (float)gScale;
+    op.scale_y           = (float)gScale;
     op.mode              = PPA_TRANS_MODE_BLOCKING;
     if (ppa_do_scale_rotate_mirror(gPpa, &op) == ESP_OK) return;
     // fall through to the CPU path on error
   }
   const px_t* src = fb[drawBuf];
   px_t* dst = (px_t*)gScanout;
+  const int S = gScale, LW = W * S, LH = H * S;   // landscape-native span
   for (int y = 0; y < H; y++)
     for (int x = 0; x < W; x++) {
-      int nx, ny;
-      if (!PANEL_ROT_180) { nx = H - 1 - y;  ny = x; }
-      else                { nx = y;          ny = W - 1 - x; }
-      dst[(size_t)ny * PANEL_NATIVE_W + nx] = src[(size_t)y * W + x];
+      const px_t v = src[(size_t)y * W + x];
+      for (int dy = 0; dy < S; dy++)
+        for (int dx = 0; dx < S; dx++) {
+          const int lx = x * S + dx, ly = y * S + dy;   // native landscape coords
+          int nx, ny;
+          if (!PANEL_ROT_180) { nx = LH - 1 - ly;  ny = lx; }
+          else                { nx = ly;           ny = LW - 1 - lx; }
+          dst[(size_t)ny * PANEL_NATIVE_W + nx] = v;
+        }
     }
   esp_cache_msync(gScanout, (size_t)PANEL_NATIVE_W * PANEL_NATIVE_H * sizeof(px_t),
                   ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
@@ -567,9 +595,23 @@ void panelShow() {
   if (blipUntil && (int32_t)(millis() - blipUntil) < 0) { blipStamp(); liveHasBlip = true; }
   else liveHasBlip = false;
 
-  // PPA reads physical PSRAM; the CPU drew through the cache. Flush before the blit.
-  if (gPpa) esp_cache_msync(fb[drawBuf], gFbBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+  // PPA reads physical PSRAM; the CPU drew through the cache. Flush before the blit --
+  // only the LOGICAL region (at effect scale that is 82 KB, not the buffer's 2 MB).
+  static uint32_t tSync = 0, tBlit = 0, nShow = 0, tLast = 0;   // bring-up: frame timing
+  const uint32_t t0 = micros();
+  const size_t liveBytes = ((size_t)W * H * sizeof(px_t) + 63u) & ~((size_t)63u);
+  if (gPpa) esp_cache_msync(fb[drawBuf], liveBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+  const uint32_t t1 = micros();
   rotateToScanout();
+  const uint32_t t2 = micros();
+  tSync += t1 - t0; tBlit += t2 - t1; nShow++;
+  if (!tLast) tLast = millis();
+  if (gSerialDebug && millis() - tLast > 2000 && nShow > 5) {
+    printf("[PANEL] show: %lu fps, msync %lu us, blit %lu us\n",
+           (unsigned long)(nShow * 1000UL / (millis() - tLast)),
+           (unsigned long)(tSync / nShow), (unsigned long)(tBlit / nShow));
+    tSync = tBlit = 0; nShow = 0; tLast = millis();
+  }
 
   // Swap roles: what we just presented becomes the live copy; the old live buffer is
   // the new (stale) draw buffer. Synchronous blit -- no tear-guard needed.

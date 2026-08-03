@@ -429,9 +429,10 @@ void taskDisplay(void* pv) {
     // frames, and that is acceptable for an alert.
     if (timerAlarmActive()) {
       gDispParked = false;
+      panelSetScale(1);                   // alerts render native, whatever was running
       if (timerAlarmRender()) { wdgDispMs = millis(); continue; }
     }
-    if (gCanvasMode) { gDispParked = true; vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+    if (gCanvasMode) { panelSetScale(1); gDispParked = true; vTaskDelay(pdMS_TO_TICKS(50)); continue; }
     gDispParked = false;                  // rendering again: the panel is ours until we next park
     // Pick up a pending effect start HERE, on the render task: effectReset() (which frees/reallocs
     // the PSRAM grid and rewrites the cell arrays) then never runs under an in-flight effectRender()
@@ -449,6 +450,13 @@ void taskDisplay(void* pv) {
     // On-device effect owns the panel: render a frame at the panel's native rate (panelShow
     // inside effectRender paces us to one refresh), instead of the reel wall.
     else if (gEffect != EFFECT_NONE) {
+      // Pixel effects render at their authored scale (see panelSetScale). An alert or
+      // canvas interlude resets the surface to native; coming back here re-establishes
+      // the scale AND re-resets the effect -- its buffers were sized for the old dims.
+      if (panelGetScale() != EFFECT_RENDER_SCALE) {
+        panelSetScale(EFFECT_RENDER_SCALE);
+        effectReset(gEffect);
+      }
       effectRender(gEffect);
       wdgDispMs = millis();
       vTaskDelay(pdMS_TO_TICKS(2));
@@ -456,6 +464,7 @@ void taskDisplay(void* pv) {
     }
     // On-device animation loop / scrolling ticker: same deal as an effect -- taskDisplay owns the
     // panel and each render call presents a frame (or yields until its next step is due).
+    panelSetScale(1);                     // every non-effect mode renders native
     if (gAnimActive)   { canvasAnimRender();   canvasTickerTick(now); wdgDispMs = millis(); continue; }
     if (gTickerActive && !gTickerOverlay) { canvasTickerRender(); wdgDispMs = millis(); continue; }
     canvasTickerTick(now);   // overlay ticker: advance scroll; repaints the idle wall as needed

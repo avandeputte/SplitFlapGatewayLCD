@@ -220,7 +220,8 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 // panel (256x64) sits near this under companion load; a small one never does.
 #define CANVAS_MIN_UPLOAD_HEAP  (40u * 1024u)
 
-#define PANEL_MAX_W          1280   // panel height is validated by the enumerated 16/32/64 set
+#define PANEL_MAX_W          1280
+#define EFFECT_RENDER_SCALE  5     // effects draw at 1/5 (256x160); the PPA scales up (panel.h)   // panel height is validated by the enumerated 16/32/64 set
 
 /* ---- Flip animation ----
    Changing the displayed flap cascades forward through the reel, which is what
