@@ -2171,6 +2171,9 @@ paths:
                         source:  { type: string, enum: [reported, assumed, builtin] }
                         chars:   { type: string, description: "The reel verbatim, in flap-index order" }
                         modules: { type: string, description: "Compressed id list", example: "0-44,50" }
+                  surface:
+                    type: object
+                    description: "What the wall is drawn on (family-wide): {kind: led-matrix | lcd, w, h, colorBits (total bits per pixel), refreshHz}. Stated directly -- same philosophy as motion -- so a client renders for the actual display instead of parsing the product name. This gateway answers kind: lcd, 1280x800, 16, 60."
                   motion:
                     type: object
                     description: >

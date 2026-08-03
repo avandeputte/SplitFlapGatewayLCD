@@ -775,6 +775,18 @@ static esp_err_t handleApiCapabilities(httpd_req_t* r) {
              (unsigned long)cfg.flapMs * (unsigned long)cfg.flapMax);
     capPut(motion); }
 
+  // What the wall is DRAWN ON. Both drawn gateways answer "motion":"drawn", but a
+  // 10.1" 60 Hz LCD and a chunky LED matrix invite different client rendering --
+  // art density, font choices, whether "pixels" means glowing dots or a continuous
+  // panel. Same philosophy as motion: state the surface directly, never make a
+  // client parse the product name. colorBits is total bits per pixel (RGB565 = 16).
+  // The physical SplitFlap Gateway omits the key -- no pixels to describe.
+  { char surf[96];
+    snprintf(surf, sizeof(surf),
+             "\"surface\":{\"kind\":\"lcd\",\"w\":%u,\"h\":%u,\"colorBits\":16,\"refreshHz\":60},",
+             (unsigned)gPanel.panelW, (unsigned)gPanel.panelH);
+    capPut(surf); }
+
   // Raw canvas and on-device effects are Matrix-only -- the physical wall has no framebuffer to
   // hand out, and answers this URL without these keys. Stated here so the companion lights up
   // canvas/effect controls from capabilities, not from a firmware-version sniff: `canvas` is the
