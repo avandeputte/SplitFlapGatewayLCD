@@ -142,7 +142,8 @@ void taskRTC(void* pv) {
   // else keeps its old cadence via the ms-timers below.
   uint32_t lastSched = 0, lastEnv = 0, lastSec = 0;
   while (true) {
-    if (cfg.tapEnabled) imuTapTick();     // QMI8658 tap status, ~100 ms (v3.15)
+    if (cfg.tapEnabled) imuTapTick();
+    panelBacklightService();   // pending backlight writes land here (the I2C rule)     // QMI8658 tap status, ~100 ms (v3.15)
     if (lastSec == 0 || millis() - lastSec >= 1000UL) {
       lastSec = millis();
       rtcRead();

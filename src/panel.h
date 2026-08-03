@@ -30,8 +30,11 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram = f
 const PanelInfo& panelInfo();
 bool panelFbInPsram();   // v3.11: true when the framebuffer is running from PSRAM
 
-// 0..255, applied as the OE duty cycle. Call it whenever cfg.panelBright moves.
+// 0..255, a real backlight level (I2C controller on the display FPC). Call it
+// whenever cfg.panelBright moves; the write itself happens on taskRTC via
+// panelBacklightService() -- the shared I2C bus has no lock (the taskRTC rule).
 void panelSetBrightness(uint8_t b);
+void panelBacklightService();   // taskRTC only: performs any pending backlight write
 
 // Some HUB75 panels are wired BGR, not RGB. Set true to swap red and blue on the way out.
 // Takes effect on the next frame; nothing is cached.

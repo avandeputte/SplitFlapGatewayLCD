@@ -1,503 +1,119 @@
-// panel.cpp -- the HUB75 driver: ESP32-S3 LCD_CAM + GDMA, no ISR, no external library.
+// panel.cpp -- the LCD output layer: ESP32-P4 MIPI-DSI to the Waveshare 10.1" panel.
 //
-// WHY THIS EXISTS
-// ---------------
-// A common HUB75 approach DMAs only the six RGB data lines and drives LAT, OE and the
-// address lines as ordinary GPIO from a timer ISR, once per row per bitplane. Any
-// variance in when that ISR runs lands on the OE window, and dim pixels shimmer whenever
-// WiFi, a flash write or a PSRAM cache miss delays it.
+// WHY THIS IS SIMPLE (compared to the Matrix Gateway's HUB75 driver this replaces)
+// -------------------------------------------------------------------------------
+// A HUB75 matrix has no memory: the driver must scan bitplanes into it forever, and
+// that firmware earned every one of its 1100 lines (BCM chains, OE duty brightness,
+// GDMA stall watchdogs). A DSI panel is the opposite: the JD9365 controller and the
+// P4's DPI engine own the refresh entirely -- we keep a plain linear RGB565
+// framebuffer, and presenting a frame is one rotate-blit into the DPI scanout
+// buffer. Brightness is a real backlight (an I2C controller on the display FPC),
+// so it still costs no colour levels.
 //
-// Here, all thirteen signals live in the 16-bit LCD_CAM data word, and GDMA walks a
-// CIRCULAR descriptor chain. Once started, the refresh runs entirely in hardware: no
-// interrupt, no CPU, nothing for WiFi to disturb. The CPU only writes pixels. It also
-// costs no colour levels to dim the wall, because brightness is the OE duty cycle
-// rather than a multiply into every colour.
+// GEOMETRY
+// --------
+// The panel is natively 800x1280 PORTRAIT; the gateway mounts it landscape. All
+// drawing happens in LOGICAL landscape space (W=1280, H=800); panelShow() rotates
+// 90 degrees into the native scanout, in hardware via the P4's PPA
+// (Pixel Processing Accelerator) with a CPU fallback. Flip PANEL_ROT_180 below if
+// the physical mount turns out upside-down.
 //
-// THE DATA WORD (16-bit parallel output, one word per PCLK)
-// ---------------------------------------------
-//   bit  0..5   R1 G1 B1 R2 G2 B2   pixel data for the row pair
-//   bit  6      LAT                 latch the shift register into the output register
-//   bit  7      OE                  ACTIVE LOW: 0 = LEDs on, 1 = blanked
-//   bit  8..12  A B C D E           which row pair is displayed
-//
-// THE FRAME
-// ---------
-// For each row pair r and bitplane p there is one BLOCK of (width + TAIL) words:
-//
-//   body[0 .. width-1]  shift row r's plane-p pixels.  ADDR = the previously latched
-//                       row -- r-1 for each row's plane-0 block, r for the plane>=1
-//                       repeats (see writeControlBits) -- because the panel is still
-//                       DISPLAYING that row. OE is low for the first `onClocks` words
-//                       -- that is the brightness, and it costs no colour levels.
-//   tail[0 .. TAIL-1]   OE high (blanked), ADDR = r, and a LAT pulse in the middle so
-//                       row r's data moves into the output register while it is dark.
-//
-// Binary code modulation: plane p must be displayed 2^p times as long as plane 0. We do
-// not duplicate the pixel data -- we link the SAME block into the chain 2^p times. Each
-// repetition re-shifts and re-latches identical data, so the row simply stays lit for
-// another block. Total blocks per frame = rows * (2^depth - 1).
-//
-// TUNING
-// ------
-// Verified on a 128x32 chain (two 64x32 panels) at depth 4, ~157 Hz at the current
-// 5 MHz LCD_CLK_HZ (the WiFi-coexistence cap below). If you change the
-// panel, two constants below are where reality bites, in order:
-//   1. TAIL_WORDS -- the blanking window, vs the panel's latch setup/hold.
-//   2. LCD_CLK_HZ -- drop it if the far end of a long chain ghosts.
-// PANEL_BOOT_TEST in common.h draws a border and a diagonal for four seconds at boot;
-// it tells you which of the two is wrong far faster than a wall of glyphs.
-//
-// The one thing NOT to touch: LAT is strobed on the LAST PIXEL word, not on a tail word.
-// LCD_CAM clocks every word it sends, tail words included, and the panel's shift register
-// advances on every one of them. A LAT on a tail word is therefore an EXTRA clock past
-// the data: it shifts a blank in and pushes column 0 out the far end, so the whole image
-// lands one pixel left with a dead column on the right. Latching on the last pixel word
-// is the clock that shifts that pixel in, so the register holds exactly columns 0..W-1
-// at the latch and nothing moves.
+// BUFFER MODEL (same contract as the Matrix Gateway)
+// --------------------------------------------------
+// Two PSRAM buffers: drawBuf (the CPU draws) and liveBuf (a CPU-side copy of what
+// is on screen -- panelCloneToBack, panelReadback and panelScroll read it). The DPI
+// scanout buffer is a third, owned by esp_lcd; the CPU never reads it. panelShow
+// copies draw -> scanout (rotating), then swaps the draw/live roles. The copy is
+// synchronous, so unlike the HUB75 driver there is no tear-guard: after show, both
+// CPU buffers are immediately writable.
 
 #include "panel.h"
 #include <math.h>          // sqrtf, for the ellipse scanlines
 
 #include <Arduino.h>
-#include <driver/gpio.h>
-#include <esp_private/gdma.h>
-#include <esp_private/gpio.h>   // gpio_iomux_output (the driver/gpio.h one is deprecated)
-#include <esp_private/periph_ctrl.h>
-#include <esp_rom_gpio.h>
-#include <esp_rom_sys.h>
-#include <hal/dma_types.h>
-#include <hal/gdma_ll.h>        // current-descriptor register, for the stall watchdog
-#include <soc/gdma_struct.h>
-#include <hal/gpio_hal.h>
-#include <soc/lcd_cam_reg.h>
-#include <soc/lcd_cam_struct.h>
-#include <soc/gpio_sig_map.h>
+#include <Wire.h>          // backlight controller (0x45 on the shared I2C bus)
 #include <esp_heap_caps.h>
 #include <esp_cache.h>
-#include "sdcard.h"        // sdLog: on-card event log (v3.13.2)         // esp_cache_msync: flush the CPU cache to PSRAM (fb-in-PSRAM, v3.11)
+#include <esp_ldo_regulator.h>       // MIPI DPHY power rail (LDO channel 3)
+#include <esp_lcd_mipi_dsi.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_io.h>
+#include <driver/ppa.h>              // hardware rotate for the landscape mount
+#include "esp_lcd_jd9365_10_1.h"     // vendored Waveshare panel driver (Apache-2.0)
+#include "sdcard.h"        // sdLog: on-card event log
 
 // ---- tunables ---------------------------------------------------------------------
-/* PCLK. Must divide the 160 MHz PLL by an integer (see lcdInit).
+#define MIPI_LDO_CHAN       3        // P4 D-PHY power rail (2.5 V on LDO channel 3)
+#define MIPI_LDO_MV         2500
+#define PANEL_NATIVE_W      800      // portrait native; logical W/H arrive rotated
+#define PANEL_NATIVE_H      1280
+#define PANEL_ROT_180       0        // set 1 if the landscape mount is upside-down
 
-   5 MHz, not 10. This is a RADIO constraint, not a display one. The GDMA chain reads
-   this framebuffer out of internal SRAM continuously and forever -- at 10 MHz that is
-   ~20 MB/s plus ~76k descriptor fetches/sec of AHB traffic, on the same internal SRAM
-   the WiFi MAC DMAs through. It starved the radio: association failed with
-   4WAY_HANDSHAKE_TIMEOUT / ASSOC_EXPIRE at an RSSI of -46, outbound SYNs went
-   unanswered, and MQTT could not connect. Building with -DPANEL_DISABLE=1 (panel never
-   started, everything else identical) made WiFi associate instantly and MQTT connect on
-   the first try -- which is what identified the panel as the cause.
-
-   The display does not need 10 MHz. 5 MHz still yields ~157 Hz refresh on the default
-   128x32 @ depth 4, which is far above the flicker threshold, and it halves both the
-   data rate and the descriptor-fetch rate.
-
-   If a long chain ghosts at the far end, lower this further (the far end sees the clock
-   last). Do not raise this DEFAULT: on the internal-SRAM path it buys refresh nobody can
-   see. (The fbPsram path deliberately runs 10 MHz -- see gLcdClkHz below -- because depth 4
-   doubles the words per frame and needs it for ~80 Hz.) Refresh also scales with bit
-   depth: cfg.panelBitDepth is the other lever.
-
-   A/B'd at 10 MHz on the Waveshare board (2026-07-18): unlike the MatrixPortal,
-   the radio SURVIVED -- instant association, 0% ping loss, normal HTTP latency.
-   That result is what made v3.11's fbPsram mode viable: with the framebuffer in
-   octal PSRAM (the internal-RAM blocker gone) the PSRAM path runs 10 MHz and
-   256x64 @ depth 4 refreshes at ~80 Hz. */
-#define LCD_CLK_HZ      5000000u
-#define TAIL_WORDS      4           // blanked settle words after the latch: address hold
-#define MIN_ON_CLOCKS   1           // never fully dark while brightness > 0
-
-// ---- data-word bit assignments (we choose these; the pinmux below must agree) ------
-#define BIT_R1  (1u << 0)
-#define BIT_G1  (1u << 1)
-#define BIT_B1  (1u << 2)
-#define BIT_R2  (1u << 3)
-#define BIT_G2  (1u << 4)
-#define BIT_B2  (1u << 5)
-#define BIT_LAT (1u << 6)
-#define BIT_OE  (1u << 7)           // active low
-#define ADDR_SHIFT 8
-#define RGB_MASK  (BIT_R1|BIT_G1|BIT_B1|BIT_R2|BIT_G2|BIT_B2)
-
-typedef uint16_t word_t;
+typedef uint16_t px_t;               // RGB565, little-endian native
 
 static PanelInfo info = {false, 0, 0, 0, 0, 0};
 
-static word_t*           fb[2]    = {nullptr, nullptr};   // framebuffers
-static dma_descriptor_t* desc[2]  = {nullptr, nullptr};   // one circular chain each
-static int               descN    = 0;                    // descriptors per chain
-static gdma_channel_handle_t dma_chan = nullptr;
-static int  dmaChanId    = -1;      // GDMA channel index, for the stall watchdog
-static bool outputParked = false;   // intentional stop (OTA park): watchdog stands down
+static px_t*   fb[2]   = {nullptr, nullptr};   // logical landscape framebuffers (PSRAM)
+static uint8_t drawBuf = 1;                    // buffer the CPU draws into
+static uint8_t liveBuf = 0;                    // CPU-side copy of the displayed frame
+static size_t  gFbBytes = 0;                   // per-buffer size, cache-line rounded
 
 static uint16_t W = 0, H = 0;
-static uint8_t  DEPTH = 0, ROWS = 0, ADDR_BITS = 0;
-static uint32_t BLOCK = 0;              // words per (row, plane) block
-static uint8_t  drawBuf = 1;            // buffer the CPU draws into
-static uint8_t  liveBuf = 0;            // buffer GDMA is walking
-static volatile uint8_t bright        = 255;   // written from taskWeb (settings) + taskDisplay
-static volatile uint8_t brightPending = 0;      // buffers still to receive the new OE duty
-static uint32_t frameUs = 0;            // one full pass over the chain
-// Pixel clock (v3.11): 5 MHz is the WiFi-coexistence default. fb-in-PSRAM runs at depth 4, which
-// doubles the words per frame -- at 5 MHz that is only ~40 Hz and flickers -- so the PSRAM path
-// bumps to 10 MHz (~80 Hz at depth 4). The MatrixPortal's radio broke at 10 MHz; the Waveshare
-// survives it (A/B'd), which is the whole reason this move is viable on THIS board.
-static uint32_t gLcdClkHz = LCD_CLK_HZ;
 
-static inline word_t* blockPtr(uint8_t buf, int row, int plane) {
-  return fb[buf] + ((uint32_t)row * DEPTH + plane) * BLOCK;
+static esp_lcd_panel_handle_t    gPanel   = nullptr;
+static esp_lcd_panel_io_handle_t gDbiIo   = nullptr;
+static esp_lcd_dsi_bus_handle_t  gDsiBus  = nullptr;
+static esp_ldo_channel_handle_t  gPhyLdo  = nullptr;
+static void*                     gScanout = nullptr;   // DPI frame buffer (esp_lcd owns it)
+static ppa_client_handle_t       gPpa     = nullptr;   // hardware rotate; null = CPU fallback
+
+// ---- backlight --------------------------------------------------------------------
+// The display FPC carries a small controller at 0x45: reg 0x95 is the power-up
+// sequence, reg 0x96 the backlight level (0..255). Runtime writes are deferred to
+// panelBacklightService() -- the shared I2C bus has no lock, and taskRTC owns all
+// runtime I2C on this firmware (same rule as the Matrix Gateway's sensors).
+static volatile int gBlPending = -1;           // -1 idle, else 0..255 to write
+static volatile uint8_t bright = 255;
+
+static void blWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(LCD_BL_I2C_ADDR);
+  Wire.write(reg); Wire.write(val);
+  Wire.endTransmission();
 }
-
-// Quantize an 8-bit channel to DEPTH bits, rounding rather than truncating. Brightness
-// is NOT applied here -- it is the OE duty cycle, so a dim wall keeps all its levels.
-static inline uint8_t quant(uint8_t c) {
-  const uint16_t maxv = (1u << DEPTH) - 1;
-  return (uint8_t)(((uint32_t)c * maxv + 127) / 255);
-}
-
-// ---- control-bit skeleton ----------------------------------------------------------
-// Written once at begin() and after every brightness change. Pixel writes only ever
-// touch RGB_MASK, so the skeleton survives them.
-static void writeControlBits(uint8_t buf) {
-  const uint32_t bodyLen  = W;
-  const uint32_t addrMask = (uint32_t)((1u << ADDR_BITS) - 1) << ADDR_SHIFT;
-  uint32_t onClocks = ((uint32_t)bright * bodyLen) / 255;
-  if (bright && onClocks < MIN_ON_CLOCKS) onClocks = MIN_ON_CLOCKS;
-  if (onClocks > bodyLen) onClocks = bodyLen;
-
-  for (int r = 0; r < ROWS; r++) {
-    uint32_t prev = (uint32_t)((r + ROWS - 1) % ROWS) << ADDR_SHIFT;
-    uint32_t self = (uint32_t)r << ADDR_SHIFT;
-    for (int p = 0; p < DEPTH; p++) {
-      // A block's body displays whatever the PREVIOUS block's tail latched -- so the
-      // address lines must name that row, not the row being shifted in.
-      //
-      // Row r's plane-0 block is the first of the row: the block before it was row r-1's
-      // last repeat, so row r-1 is on screen and ADDR = r-1. But every plane >= 1 block
-      // follows another block OF ROW r (plane p-1's last repeat, or an earlier repeat of
-      // plane p itself), so row r is already latched and ADDR = r.
-      //
-      // Getting this wrong is not subtle and it is not survivable: with ADDR = r-1
-      // everywhere, 28672 of a frame's 30720 lit clocks land on the wrong row and the
-      // BCM weights collapse from 1:2:4:8 to 0:0:0:1.
-      uint32_t addr = (p == 0) ? prev : self;
-      word_t* blk = blockPtr(buf, r, p);
-      for (uint32_t x = 0; x < bodyLen; x++) {
-        word_t w = (word_t)(blk[x] & RGB_MASK);        // keep pixels
-        w |= (word_t)(addr & addrMask);
-        if (x >= onClocks) w |= BIT_OE;                // blank the rest of the block
-        if (x == bodyLen - 1) {
-          // Latch on the clock that shifts the last pixel in: no extra clock, no shift.
-          // Force OE high here too -- OE gates the row currently on screen (the one this
-          // block is still displaying), so latching while it is lit would tear it. One
-          // dark clock in W is invisible.
-          w |= BIT_LAT | BIT_OE;
-        }
-        blk[x] = w;
-      }
-      // Tail: blanked, address already switched to our row. Pure hold time so the panel
-      // settles after the latch before the next block's data starts shifting.
-      for (uint32_t t = 0; t < TAIL_WORDS; t++) {
-        blk[bodyLen + t] = BIT_OE | (word_t)(self & addrMask);
-      }
-    }
-  }
-}
-
-// ---- LCD_CAM + GDMA ----------------------------------------------------------------
-static void pinmux(int8_t pin, uint8_t signal) {
-  esp_rom_gpio_connect_out_signal(pin, signal, false, false);
-  gpio_iomux_output((gpio_num_t)pin, PIN_FUNC_GPIO);
-  gpio_set_drive_capability((gpio_num_t)pin, GPIO_DRIVE_CAP_3);
-}
-
-static void lcdInit() {
-  periph_module_enable(PERIPH_LCD_CAM_MODULE);
-  periph_module_reset(PERIPH_LCD_CAM_MODULE);
-
-  LCD_CAM.lcd_user.lcd_reset = 1;
-  esp_rom_delay_us(100);
-
-  // 160 MHz PLL, integer prescale to the active pixel clock (5 MHz default, 10 MHz for PSRAM/depth 4).
-  uint32_t div = 160000000u / gLcdClkHz;
-  if (div < 2) div = 2;
-  LCD_CAM.lcd_clock.clk_en             = 1;
-  LCD_CAM.lcd_clock.lcd_clk_sel        = 3;        // PLL160M
-  LCD_CAM.lcd_clock.lcd_clkm_div_a     = 1;
-  LCD_CAM.lcd_clock.lcd_clkm_div_b     = 1;
-  LCD_CAM.lcd_clock.lcd_clkm_div_num   = div - 1;
-  LCD_CAM.lcd_clock.lcd_ck_out_edge    = 0;        // PCLK low in first half
-  LCD_CAM.lcd_clock.lcd_ck_idle_edge   = 0;        // PCLK idles low
-  LCD_CAM.lcd_clock.lcd_clk_equ_sysclk = 1;
-
-  LCD_CAM.lcd_ctrl.lcd_rgb_mode_en    = 0;   // i8080 mode, not RGB
-  LCD_CAM.lcd_rgb_yuv.lcd_conv_bypass = 0;
-  LCD_CAM.lcd_misc.lcd_next_frame_en  = 0;
-  LCD_CAM.lcd_data_dout_mode.val      = 0;   // no per-line data delays
-  LCD_CAM.lcd_user.lcd_8bits_order    = 0;
-  LCD_CAM.lcd_user.lcd_bit_order      = 0;
-  LCD_CAM.lcd_user.lcd_2byte_en       = 1;   // 16-bit output: all 13 signals per word
-  LCD_CAM.lcd_user.lcd_cmd            = 0;
-  LCD_CAM.lcd_user.lcd_dummy          = 0;   // no dummy phases: the chain never restarts
-  LCD_CAM.lcd_user.lcd_always_out_en  = 1;   // keep clocking as long as DMA feeds us
-  LCD_CAM.lcd_user.lcd_dout           = 1;
-  LCD_CAM.lcd_user.lcd_update         = 1;
-
-  // Data lines. The order here IS the bit assignment above.
-  const int8_t pins[13] = {
-    HUB75_R1, HUB75_G1, HUB75_B1, HUB75_R2, HUB75_G2, HUB75_B2,
-    HUB75_LAT, HUB75_OE,
-    HUB75_ADDR_A, HUB75_ADDR_B, HUB75_ADDR_C, HUB75_ADDR_D, HUB75_ADDR_E
-  };
-  for (int i = 0; i < 13; i++) {
-    if (i >= 8 + ADDR_BITS) break;           // a 1/16 panel never drives E
-    pinmux(pins[i], (uint8_t)(LCD_DATA_OUT0_IDX + i));
-  }
-  pinmux(HUB75_CLK, LCD_PCLK_IDX);
-
-  LCD_CAM.lc_dma_int_ena.val = 0;            // no interrupts: nothing to service
-  LCD_CAM.lc_dma_int_clr.val = 0x03;
-}
-
-// Build one circular descriptor chain per buffer. Plane p is linked 2^p times, which is
-// the BCM weighting -- the data is not duplicated, only the descriptor pointing at it.
-// The order here is load-bearing: writeControlBits() assumes each row's blocks are
-// contiguous and that plane 0 comes first. Reorder this and the address lag breaks.
-static bool buildChains() {
-  const int repeats = (1 << DEPTH) - 1;      // 1 + 2 + 4 + ... + 2^(depth-1)
-  descN = ROWS * repeats;
-  for (int b = 0; b < 2; b++) {
-    desc[b] = (dma_descriptor_t*)heap_caps_aligned_alloc(
-        64, sizeof(dma_descriptor_t) * descN, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (!desc[b]) return false;
-    int d = 0;
-    for (int r = 0; r < ROWS; r++) {
-      for (int p = 0; p < DEPTH; p++) {
-        for (int rep = 0; rep < (1 << p); rep++, d++) {
-          dma_descriptor_t& x = desc[b][d];
-          x.dw0.owner    = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
-          x.dw0.suc_eof  = 0;                // never end: this is a loop
-          x.dw0.size     = BLOCK * sizeof(word_t);
-          x.dw0.length   = BLOCK * sizeof(word_t);
-          x.buffer       = blockPtr((uint8_t)b, r, p);
-          x.next         = &desc[b][d + 1];  // patched below for the last one
-        }
-      }
-    }
-    desc[b][descN - 1].next = &desc[b][0];   // close the loop
-  }
-  return true;
-}
-
-// Release everything panelBegin() may have claimed. Every failure path below runs
-// through here: bailing out with the framebuffers still held would strand tens of KB
-// of internal DMA RAM for the rest of the boot -- and the firmware then runs headless
-// (display.cpp), so nothing would ever reclaim it. That is strictly worse than not
-// having tried, because WiFi draws from the same pool.
-static void panelFreeAll() {
-  for (int b = 0; b < 2; b++) {
-    if (fb[b])   { heap_caps_free(fb[b]);   fb[b]   = NULL; }
-    if (desc[b]) { heap_caps_free(desc[b]); desc[b] = NULL; }
-  }
-  descN = 0;
-  panelLayerDiscard();   // an OTA/teardown mid-ops-batch must not leak an open layer (v3.11.1)
-}
-
-// v3.11: when the framebuffer lives in PSRAM, the CPU draws through the cache but GDMA reads
-// physical PSRAM, so the finished frame must be flushed cache->memory before it goes live.
-static bool   gFbPsram  = false;
-static size_t gFbBytes  = 0;               // per-buffer size, rounded up to a cache line for msync
-
-bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
-  info = {false, width, height, depth, 0, 0};
-  if (depth < 1 || depth > 8) depth = DEFAULT_BIT_DEPTH;
-  gFbPsram = fbPsram;
-  gLcdClkHz = fbPsram ? 10000000u : LCD_CLK_HZ;      // 10 MHz keeps depth-4 refresh ~80 Hz (v3.11)
-
-  W = width; H = height;
-  ROWS = (uint8_t)(height / 2);                       // row PAIRS
-  ADDR_BITS = (height == 64) ? 5 : (height == 32 ? 4 : 3);
-  // GDMA moves bytes, and in 16-bit LCD mode a descriptor's length must be a whole number
-  // of 32-bit words. Every real panel width is even, but pad rather than trust that.
-  BLOCK = (uint32_t)W + TAIL_WORDS;
-  if (BLOCK & 1) BLOCK++;
-
-  // Why the depth gate exists: dispInit() runs BEFORE WiFi.begin(), so an over-deep
-  // INTERNAL panel would starve the WiFi/lwIP pool allocated moments later -- the
-  // symptom is TCP connects failing and loop()'s heap-floor reboot, not a panel fault.
-  // Internal DMA RAM the panel costs at a given depth. The descriptor chains are ALWAYS internal
-  // (GDMA reads them without a cache path). The two framebuffers are internal by default, but with
-  // fbPsram they move to octal PSRAM (v3.11) -- which lifts the internal-RAM cap so depth can go to
-  // 4+ (the PSRAM path clocks pixels at 10 MHz, ~100 ns/word, still ~8x under octal PSRAM's read rate, so the GDMA
-  // FIFO stays fed). dispInit() runs BEFORE WiFi.begin(), so an over-deep INTERNAL panel would
-  // starve the WiFi/lwIP pool; PANEL_RAM_BUDGET caps what we spend before WiFi, PANEL_RAM_RESERVE
-  // is what must stay free after. With fbPsram only the descriptors count against that budget.
-  auto fbFor   = [&](uint8_t d) -> size_t { return (size_t)ROWS * d * BLOCK * sizeof(word_t); };
-  auto descFor = [&](uint8_t d) -> size_t { return sizeof(dma_descriptor_t) * (size_t)ROWS * ((1u << d) - 1); };
-  auto intWant = [&](uint8_t d) -> size_t { return (gFbPsram ? 0 : fbFor(d) * 2) + descFor(d) * 2; };
-
-  const size_t freeNow   = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-  const uint8_t reqDepth = depth;
-  while (depth > 1 && (intWant(depth) > PANEL_RAM_BUDGET ||
-                       intWant(depth) + PANEL_RAM_RESERVE > freeNow))
-    depth--;
-  const size_t want = intWant(depth);
-  if (want > PANEL_RAM_BUDGET || want + PANEL_RAM_RESERVE > freeNow) {
-    printf("[PANEL] %ux%u even at depth 1 needs %u B of internal DMA RAM "
-           "(budget %u, free %u, reserve %u for WiFi) -- refusing\n",
-           (unsigned)W, (unsigned)H, (unsigned)want,
-           (unsigned)PANEL_RAM_BUDGET, (unsigned)freeNow, (unsigned)PANEL_RAM_RESERVE);
-    return false;
-  }
-  const size_t fbBytesRaw = fbFor(depth);
-  if (gFbPsram) {                                  // framebuffers go to PSRAM: verify they fit
-    const size_t freePs = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    if (fbBytesRaw * 2 + (64u * 1024u) > freePs) {
-      printf("[PANEL] fbPsram: %ux%u depth %u needs %u B of PSRAM (free %u) -- refusing\n",
-             (unsigned)W, (unsigned)H, (unsigned)depth, (unsigned)(fbBytesRaw * 2), (unsigned)freePs);
-      return false;
-    }
-  }
-  if (depth != reqDepth)
-    printf("[PANEL] %ux%u depth %u wants %u B of internal DMA RAM (budget %u, free %u) -- "
-           "clamped to depth %u so the panel still lights\n",
-           (unsigned)W, (unsigned)H, (unsigned)reqDepth, (unsigned)intWant(reqDepth),
-           (unsigned)PANEL_RAM_BUDGET, (unsigned)freeNow, (unsigned)depth);
-  DEPTH = depth;
-  info.depth = DEPTH;
-  const size_t fbBytes = fbBytesRaw;
-  gFbBytes = (fbBytes + 63u) & ~((size_t)63u);     // round up so esp_cache_msync stays line-aligned
-
-  for (int b = 0; b < 2; b++) {
-    // Default: MALLOC_CAP_DMA (internal, single-cycle for the pixel clock). fbPsram: octal PSRAM,
-    // 64-byte aligned for the cache line + DMA; the finished frame is flushed to memory in panelShow.
-    if (gFbPsram)
-      fb[b] = (word_t*)heap_caps_aligned_alloc(64, gFbBytes, MALLOC_CAP_SPIRAM);
-    else
-      fb[b] = (word_t*)heap_caps_aligned_alloc(64, fbBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (!fb[b]) {
-      printf("[PANEL] native: %u bytes of %s unavailable\n",
-             (unsigned)(gFbPsram ? gFbBytes : fbBytes), gFbPsram ? "PSRAM" : "DMA RAM");
-      panelFreeAll(); return false;
-    }
-    memset(fb[b], 0, gFbPsram ? gFbBytes : fbBytes);
-  }
-
-  bright = 255;
-  writeControlBits(0);
-  writeControlBits(1);
-
-  if (!buildChains()) {
-    printf("[PANEL] native: descriptor alloc failed\n");
-    panelFreeAll(); return false;
-  }
-  info.bytes = fbBytes * 2 + sizeof(dma_descriptor_t) * descN * 2;
-
-  lcdInit();
-
-  gdma_channel_alloc_config_t cc = {};
-  cc.direction = GDMA_CHANNEL_DIRECTION_TX;
-  if (gdma_new_ahb_channel(&cc, &dma_chan) != ESP_OK) {
-    printf("[PANEL] native: no GDMA channel\n");
-    panelFreeAll(); return false;
-  }
-  gdma_connect(dma_chan, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_LCD, 0));
-  // Link-following is inherent to GDMA linked-list mode -- that is what lets the
-  // chain run forever with no interrupt. These two flags are something else:
-  // owner_check off (the chain never hands ownership back) and auto_update_desc off
-  // (the engine must not write into descriptors we are about to re-point on a swap).
-  gdma_strategy_config_t sc = {.owner_check = false, .auto_update_desc = false};
-  gdma_apply_strategy(dma_chan, &sc);
-  // fb-in-PSRAM (v3.11): without this, GDMA reads the framebuffer from PSRAM in tiny bursts and
-  // occasionally misses the LCD_CAM FIFO refill deadline -> visible flicker. A 64-byte PSRAM burst
-  // block lets one access cover 32 pixels, giving the FIFO a cushion against PSRAM latency spikes.
-  if (gFbPsram) {
-    gdma_transfer_ability_t ta = { .sram_trans_align = 0, .psram_trans_align = 64 };
-    gdma_set_transfer_ability(dma_chan, &ta);
-  }
-  gdma_get_channel_id(dma_chan, &dmaChanId);        // for the stall watchdog's register read
-
-  liveBuf = 0; drawBuf = 1;
-  if (gFbPsram) {                                  // control bits + zeroed frames must reach PSRAM
-    esp_cache_msync(fb[0], gFbBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-    esp_cache_msync(fb[1], gFbBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-  }
-  gdma_start(dma_chan, (intptr_t)&desc[0][0]);
-  esp_rom_delay_us(1);
-  LCD_CAM.lcd_user.lcd_start = 1;
-
-  // Words per frame -> refresh. No measurement needed: nothing can steal these clocks.
-  uint32_t wordsPerFrame = (uint32_t)descN * BLOCK;
-  frameUs = (wordsPerFrame * 1000000ull) / gLcdClkHz;
-  info.refreshHz = frameUs ? (1000000u / frameUs) : 0;
-  info.ok = true;
-  return true;
-}
-
-const PanelInfo& panelInfo() { return info; }
-bool panelFbInPsram() { return info.ok && gFbPsram; }   // v3.11 diagnostic
 
 void panelSetBrightness(uint8_t b) {
   if (b == bright) return;
   bright = b;
-  // BOTH buffers carry their own OE duty in their control bits. Writing only the one
-  // we are about to draw into would leave the other at the old brightness, and the
-  // wall would strobe between the two on alternate frames. Apply it over two shows.
-  brightPending = 2;
+  gBlPending = b;                              // taskRTC picks it up within 100 ms
 }
 
-// ---- drawing (back buffer) ----------------------------------------------------------
-static void panelWaitDrawable();    // defined with the tear-guard below
-
-static bool panelLayerOpen();       // defined with the layer state below
-
-void panelClear() {
-  if (!info.ok) return;
-  // An OPEN LAYER must capture the clear like every other primitive (the "all draws
-  // redirect" contract in panel.h) -- route through the fill path, which honours layers.
-  if (panelLayerOpen()) { panelFillRect(0, 0, W, H, 0, 0, 0); return; }
-  panelWaitDrawable();              // same draw-guard as every other framebuffer write
-  const uint32_t bodyLen = W;
-  for (int r = 0; r < ROWS; r++)
-    for (int p = 0; p < DEPTH; p++) {
-      word_t* blk = blockPtr(drawBuf, r, p);
-      for (uint32_t x = 0; x < bodyLen; x++) blk[x] &= (word_t)~RGB_MASK;
-    }
+void panelBacklightService() {                 // taskRTC only (the I2C rule)
+  const int p = gBlPending;
+  if (p < 0) return;
+  gBlPending = -1;
+  blWrite(0x96, (uint8_t)p);
 }
 
-// Some HUB75 panels are wired BGR rather than RGB -- the panel's own colour order, not
-// something the firmware can detect. On a BGR panel every colour comes out wrong in a very
-// specific way: red draws blue, blue draws orange, yellow draws cyan, purple draws pink,
-// while green and white look perfectly fine (green is its own channel, white is all three).
-// That is exactly why it can go unnoticed for a long time -- text is white.
-//
-// Swap here, at the one choke point every pixel passes through (panelHLine, panelVLine and
-// panelFillRect all funnel into this), rather than by re-mapping the pins: the pin map is
-// correct and matches Adafruit's reference, and the next panel may well be RGB.
+// ---- pixel core -------------------------------------------------------------------
+// 565 by truncation on write, bit-replication on read: write(read(x)) is exact, which
+// is what lets panelScroll shift a frame repeatedly without the colours drifting.
 static bool bgrOrder = false;
 void panelSetColourOrder(bool bgr) { bgrOrder = bgr; }
 
-// Lazy tear-guard (v3.1): panelShow used to SLEEP ~one frame after every swap so the CPU
-// could not draw into a buffer GDMA was still scanning. That parked the caller even when
-// nothing would draw for a while (every HTTP frame push ate it inside the request). Now
-// the swap only STAMPS the moment, and the wait happens at the FIRST buffer write after
-// it -- usually already absorbed by network transfer or compose time.
-static volatile bool     swapPending = false;
-static volatile uint32_t swapAtUs    = 0;
-static void panelWaitDrawable() {
-  if (!swapPending) return;
-  const uint32_t el = (uint32_t)(micros() - swapAtUs);
-  if (el < frameUs) {
-    const uint32_t rem = frameUs - el;
-    if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
-      vTaskDelay(pdMS_TO_TICKS(rem / 1000 + 1));
-    else
-      esp_rom_delay_us(rem);
-  }
-  swapPending = false;
+static inline px_t pack565(uint8_t r, uint8_t g, uint8_t b) {
+  if (bgrOrder) { uint8_t t = r; r = b; b = t; }
+  return (px_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+static inline void readPixelRGB(uint8_t buf, int x, int y, uint8_t& r, uint8_t& g, uint8_t& b) {
+  const px_t v = fb[buf][(size_t)y * W + x];
+  uint8_t r5 = (v >> 11) & 0x1F, g6 = (v >> 5) & 0x3F, b5 = v & 0x1F;
+  r = (uint8_t)((r5 << 3) | (r5 >> 2));
+  g = (uint8_t)((g6 << 2) | (g6 >> 4));
+  b = (uint8_t)((b5 << 3) | (b5 >> 2));
+  if (bgrOrder) { uint8_t t = r; r = b; b = t; }
 }
 
-// The ops clip window (panelSetClip). Full-panel when inactive; panelBegin resets it.
+// ---- clip / blend / layers (unchanged semantics from the Matrix Gateway) ----------
 static int clipX0 = 0, clipY0 = 0, clipX1 = 1 << 14, clipY1 = 1 << 14;
 void panelSetClip(int x0, int y0, int x1, int y1) {
   clipX0 = x0 < 0 ? 0 : x0;  clipY0 = y0 < 0 ? 0 : y0;
@@ -505,13 +121,6 @@ void panelSetClip(int x0, int y0, int x1, int y1) {
 }
 void panelClearClip() { clipX0 = 0; clipY0 = 0; clipX1 = 1 << 14; clipY1 = 1 << 14; }
 
-static inline void readPixelRGB(uint8_t buf, int x, int y, uint8_t& r, uint8_t& g, uint8_t& b);
-
-// Compositing (v3.8): the ops layer sets a blend mode + alpha, and panelPixel composites
-// over the current back-buffer pixel instead of overwriting. Modes: 0 over (normal alpha),
-// 1 add (LED glow), 2 multiply, 3 screen, 4 max/lighten. Inactive by default (opaque, the
-// hot path pays only one predictable branch). AA drawing rides this too, passing coverage
-// as alpha. gBlendActive is false unless a mode/alpha actually changes the result.
 static bool    gBlendActive = false;
 static uint8_t gBlendMode   = 0;
 static uint8_t gBlendAlpha  = 255;
@@ -535,21 +144,17 @@ void panelSetBlend(uint8_t mode, uint8_t alpha) {
 }
 void panelClearBlend() { gBlendActive = false; gBlendMode = 0; gBlendAlpha = 255; }
 
-// Offscreen layers (v3.9): while a layer is open, every drawing primitive redirects into
-// this full-panel RGBA shadow (a[3] marks written pixels / carries AA coverage) instead
-// of the framebuffer. panelLayerComposite blends the whole group back onto the canvas with
-// one group blend+alpha -- i.e. group opacity, the thing per-op alpha can't express. One
-// layer at a time; the buffer lives in PSRAM only between begin and composite/discard.
-static uint8_t* gLayerBuf = nullptr;          // W*H*4 RGBA, or null when no layer is open
+// Offscreen layers: while open, every drawing primitive redirects into a full-panel
+// RGBA shadow; composite flattens the group back with one blend mode + group alpha.
+static uint8_t* gLayerBuf = nullptr;
 static bool panelLayerOpen() { return gLayerBuf != nullptr; }
 
 bool panelLayerBegin() {
   if (gLayerBuf) { memset(gLayerBuf, 0, (size_t)W * H * 4); return true; }
   gLayerBuf = (uint8_t*)heap_caps_calloc((size_t)W * H * 4, 1, MALLOC_CAP_SPIRAM);
-  if (!gLayerBuf) gLayerBuf = (uint8_t*)calloc((size_t)W * H * 4, 1);   // tiny panels: internal
   return gLayerBuf != nullptr;
 }
-void panelLayerDiscard() {                    // drop an open layer without drawing it
+void panelLayerDiscard() {
   if (!gLayerBuf) return;
   free(gLayerBuf); gLayerBuf = nullptr;
 }
@@ -569,17 +174,13 @@ void panelLayerComposite(int ox, int oy, uint8_t mode, uint8_t galpha) {
   free(buf);
 }
 
-// Write one pixel into the open layer (over-compositing within the layer so AA edges and
-// per-op alpha accumulate before the group is flattened). Returns true if a layer consumed it.
 static inline bool layerWrite(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
   if (!gLayerBuf) return false;
-  // The panelPixel caller has already bounds/clip-checked; these repeats are deliberate
-  // defence-in-depth so any FUTURE direct caller cannot write outside the layer buffer.
   if (x < 0 || y < 0 || x >= W || y >= H) return true;
   if (x < clipX0 || y < clipY0 || x >= clipX1 || y >= clipY1) return true;
   uint8_t* px = &gLayerBuf[((size_t)y * W + x) * 4];
   const uint8_t a = gBlendActive ? gBlendAlpha : 255;
-  if (gBlendActive && px[3]) {                     // blend over what the layer already holds
+  if (gBlendActive && px[3]) {
     px[0] = blendCh(gBlendMode, r, px[0], gBlendAlpha);
     px[1] = blendCh(gBlendMode, g, px[1], gBlendAlpha);
     px[2] = blendCh(gBlendMode, b, px[2], gBlendAlpha);
@@ -588,32 +189,24 @@ static inline bool layerWrite(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
   return true;
 }
 
+// ---- drawing primitives -----------------------------------------------------------
 void panelPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
   if (!info.ok || x < 0 || y < 0 || x >= W || y >= H) return;
   if (x < clipX0 || y < clipY0 || x >= clipX1 || y >= clipY1) return;
-  if (layerWrite(x, y, r, g, b)) return;          // redirected into the open offscreen layer
-  if (gBlendActive) {                              // composite over the back-buffer pixel
+  if (layerWrite(x, y, r, g, b)) return;
+  if (gBlendActive) {
     uint8_t dr, dg, db; readPixelRGB(drawBuf, x, y, dr, dg, db);
     r = blendCh(gBlendMode, r, dr, gBlendAlpha);
     g = blendCh(gBlendMode, g, dg, gBlendAlpha);
     b = blendCh(gBlendMode, b, db, gBlendAlpha);
   }
-  panelWaitDrawable();
-  if (bgrOrder) { uint8_t t = r; r = b; b = t; }
-  const bool lower = (y >= ROWS);
-  const int  row   = lower ? (y - ROWS) : y;
-  const uint8_t qr = quant(r), qg = quant(g), qb = quant(b);
-  const word_t rb = lower ? BIT_R2 : BIT_R1;
-  const word_t gb = lower ? BIT_G2 : BIT_G1;
-  const word_t bb = lower ? BIT_B2 : BIT_B1;
-  for (int p = 0; p < DEPTH; p++) {
-    word_t* w = blockPtr(drawBuf, row, p) + x;
-    word_t v = *w & (word_t)~(rb | gb | bb);
-    if ((qr >> p) & 1) v |= rb;
-    if ((qg >> p) & 1) v |= gb;
-    if ((qb >> p) & 1) v |= bb;
-    *w = v;
-  }
+  fb[drawBuf][(size_t)y * W + x] = pack565(r, g, b);
+}
+
+void panelClear() {
+  if (!info.ok) return;
+  if (panelLayerOpen()) { panelFillRect(0, 0, W, H, 0, 0, 0); return; }
+  memset(fb[drawBuf], 0, (size_t)W * H * sizeof(px_t));
 }
 
 void panelHLine(int x, int y, int w, uint8_t r, uint8_t g, uint8_t b) {
@@ -622,72 +215,31 @@ void panelHLine(int x, int y, int w, uint8_t r, uint8_t g, uint8_t b) {
 void panelVLine(int x, int y, int h, uint8_t r, uint8_t g, uint8_t b) {
   for (int i = 0; i < h; i++) panelPixel(x, y + i, r, g, b);
 }
+
 void panelFillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) {
-  // Fast path (v3.0.1): a fill is the hottest canvas op -- ops apps clear the whole
-  // panel every frame -- and per-pixel panelPixel calls made a 256x64 clear cost
-  // ~25 ms (50K branchy read-modify-writes). Hoist the per-(row,plane) masks and run
-  // a tight word loop instead: same quant, same bit assembly, ~5x faster.
+  // Fast path: a fill is the hottest canvas op. With a linear 565 buffer it is one
+  // packed word written in a tight span loop -- no per-pixel calls.
   if (!info.ok) return;
-  if (gBlendActive || gLayerBuf) {                 // blending / open layer: the fast path can't composite
+  if (gBlendActive || gLayerBuf) {                 // blending / open layer: composite per pixel
     for (int yy = 0; yy < h; yy++)
       for (int xx = 0; xx < w; xx++) panelPixel(x + xx, y + yy, r, g, b);
     return;
   }
   int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
   int x1 = (x + w > W) ? W : x + w, y1 = (y + h > H) ? H : y + h;
-  if (x0 < clipX0) x0 = clipX0;  if (y0 < clipY0) y0 = clipY0;   // ops clip window
+  if (x0 < clipX0) x0 = clipX0;  if (y0 < clipY0) y0 = clipY0;
   if (x1 > clipX1) x1 = clipX1;  if (y1 > clipY1) y1 = clipY1;
   if (x0 >= x1 || y0 >= y1) return;
-  panelWaitDrawable();
-  if (bgrOrder) { uint8_t t = r; r = b; b = t; }
-  const uint8_t qr = quant(r), qg = quant(g), qb = quant(b);
+  const px_t v = pack565(r, g, b);
   for (int yy = y0; yy < y1; yy++) {
-    const bool lower = (yy >= ROWS);
-    const int  row   = lower ? (yy - ROWS) : yy;
-    const word_t rb = lower ? BIT_R2 : BIT_R1;
-    const word_t gb = lower ? BIT_G2 : BIT_G1;
-    const word_t bb = lower ? BIT_B2 : BIT_B1;
-    const word_t mask = (word_t)~(rb | gb | bb);
-    for (int p = 0; p < DEPTH; p++) {
-      word_t set = 0;
-      if ((qr >> p) & 1) set |= rb;
-      if ((qg >> p) & 1) set |= gb;
-      if ((qb >> p) & 1) set |= bb;
-      word_t* wp = blockPtr(drawBuf, row, p) + x0;
-      for (int i = x1 - x0; i > 0; i--, wp++) *wp = (word_t)((*wp & mask) | set);
-    }
-  }
-}
-
-// Row blitters (v3.1): the frame-shaped paths (full-frame PUT, animation playback, QOI
-// decode, transition tweens) draw whole horizontal runs -- per-pixel panelPixel calls
-// cost ~20 ms a frame in call overhead, repeated row math and branchy bit assembly.
-// Same recipe as the fill fast path: quantize the run once, then one tight
-// read-modify-write pass per bitplane. ~4-6x faster than the per-pixel path.
-static uint8_t blitQ[3][PANEL_MAX_W];      // per-channel quantized run (panel width max)
-
-static void panelBlitRun(int x, int y, int n) {   // blitQ[]: n quantized pixels
-  const bool lower = (y >= ROWS);
-  const int  row   = lower ? (y - ROWS) : y;
-  const word_t rb = lower ? BIT_R2 : BIT_R1;
-  const word_t gb = lower ? BIT_G2 : BIT_G1;
-  const word_t bb = lower ? BIT_B2 : BIT_B1;
-  const word_t mask = (word_t)~(rb | gb | bb);
-  for (int p = 0; p < DEPTH; p++) {
-    word_t* wp = blockPtr(drawBuf, row, p) + x;
-    for (int i = 0; i < n; i++) {
-      word_t set = 0;
-      if ((blitQ[0][i] >> p) & 1) set |= rb;
-      if ((blitQ[1][i] >> p) & 1) set |= gb;
-      if ((blitQ[2][i] >> p) & 1) set |= bb;
-      wp[i] = (word_t)((wp[i] & mask) | set);
-    }
+    px_t* p = fb[drawBuf] + (size_t)yy * W + x0;
+    for (int i = x1 - x0; i > 0; i--) *p++ = v;
   }
 }
 
 void panelBlitRow888(int x, int y, int n, const uint8_t* rgb) {
   if (!info.ok || y < 0 || y >= H || y < clipY0 || y >= clipY1) return;
-  if (gLayerBuf) {                                 // open layer: no fast path, go per-pixel
+  if (gLayerBuf) {
     for (int i = 0; i < n; i++) panelPixel(x + i, y, rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]);
     return;
   }
@@ -696,19 +248,13 @@ void panelBlitRow888(int x, int y, int n, const uint8_t* rgb) {
   if (x + n > W) n = W - x;
   if (x + n > clipX1) n = clipX1 - x;
   if (n <= 0) return;
-  panelWaitDrawable();
-  const int ri = bgrOrder ? 2 : 0, bi = bgrOrder ? 0 : 2;
-  for (int i = 0; i < n; i++) {
-    blitQ[0][i] = quant(rgb[i * 3 + ri]);
-    blitQ[1][i] = quant(rgb[i * 3 + 1]);
-    blitQ[2][i] = quant(rgb[i * 3 + bi]);
-  }
-  panelBlitRun(x, y, n);
+  px_t* p = fb[drawBuf] + (size_t)y * W + x;
+  for (int i = 0; i < n; i++) p[i] = pack565(rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]);
 }
 
 void panelBlitRow565(int x, int y, int n, const uint8_t* be565) {
   if (!info.ok || y < 0 || y >= H || y < clipY0 || y >= clipY1) return;
-  if (gLayerBuf) {                                 // open layer: no fast path, go per-pixel
+  if (gLayerBuf) {
     for (int i = 0; i < n; i++) {
       const uint16_t v = ((uint16_t)be565[i * 2] << 8) | be565[i * 2 + 1];
       panelPixel(x + i, y, (uint8_t)(((v >> 11) & 0x1F) << 3),
@@ -721,18 +267,17 @@ void panelBlitRow565(int x, int y, int n, const uint8_t* be565) {
   if (x + n > W) n = W - x;
   if (x + n > clipX1) n = clipX1 - x;
   if (n <= 0) return;
-  panelWaitDrawable();
-  for (int i = 0; i < n; i++) {
-    const uint16_t v = ((uint16_t)be565[i * 2] << 8) | be565[i * 2 + 1];
-    uint8_t r = (uint8_t)(((v >> 11) & 0x1F) << 3);
-    uint8_t g = (uint8_t)(((v >> 5)  & 0x3F) << 2);
-    uint8_t b = (uint8_t)((v & 0x1F) << 3);
-    if (bgrOrder) { uint8_t t = r; r = b; b = t; }
-    blitQ[0][i] = quant(r);
-    blitQ[1][i] = quant(g);
-    blitQ[2][i] = quant(b);
+  px_t* p = fb[drawBuf] + (size_t)y * W + x;
+  if (!bgrOrder) {
+    // Wire 565 is big-endian and ours is native little-endian: one byte swap per pixel.
+    for (int i = 0; i < n; i++) p[i] = (px_t)(((px_t)be565[i * 2] << 8) | be565[i * 2 + 1]);
+  } else {
+    for (int i = 0; i < n; i++) {
+      const uint16_t v = ((uint16_t)be565[i * 2] << 8) | be565[i * 2 + 1];
+      p[i] = pack565((uint8_t)(((v >> 11) & 0x1F) << 3),
+                     (uint8_t)(((v >> 5) & 0x3F) << 2), (uint8_t)((v & 0x1F) << 3));
+    }
   }
-  panelBlitRun(x, y, n);
 }
 
 // Bresenham line from (x0,y0) to (x1,y1). panelPixel clamps, so off-panel endpoints are fine.
@@ -889,48 +434,14 @@ void panelEllipse(int cx, int cy, int a, int b, bool fill, uint8_t r, uint8_t g,
   }
 }
 
-// Copy the live buffer into the back buffer, so a PARTIAL draw lands on top of what is currently on
-// screen rather than on the frame from two shows ago (the two buffers otherwise diverge). Both
-// buffers carry the same control-bit skeleton, and pixel writes only touch RGB, so copying whole
-// words is safe. Reading the live buffer while GDMA also reads it is fine -- both are readers.
 void panelCloneToBack() {
   if (!info.ok) return;
-  memcpy(fb[drawBuf], fb[liveBuf], (size_t)ROWS * DEPTH * BLOCK * sizeof(word_t));
-}
-
-// Reconstruct the LIVE frame (what is on screen right now, in any mode) into `out` as raw pixels,
-// row-major, top-left origin: W*H*3 rgb888, or W*H*2 big-endian rgb565 if rgb565. This reverses the
-// bitplane packing, so the colours are quantised to the panel's actual bit depth -- a true
-// screenshot, not the intended image. Brightness is the OE duty, not in the framebuffer, so it is
-// not reflected (a dim wall reads back at full value). Read-only: it never parks or swaps, so a
-// frame swap mid-read can tear a live effect slightly -- fine for a preview. Snapshot fast, then the
-// caller streams `out` at leisure. out must hold W*H*(rgb565?2:3) bytes.
-// One pixel of `buf` reconstructed from the bitplanes into 8-bit RGB: quantised to the panel depth,
-// with the BGR swap undone. The quant() round-trip is exact (a read then a panelPixel write is
-// idempotent), which is what lets panelScroll shift a frame repeatedly without the colours drifting.
-static inline void readPixelRGB(uint8_t buf, int x, int y, uint8_t& r, uint8_t& g, uint8_t& b) {
-  const uint16_t maxv = (uint16_t)((1u << DEPTH) - 1);
-  const bool lower = (y >= ROWS);
-  const int  row   = lower ? (y - ROWS) : y;
-  const word_t rmask = lower ? BIT_R2 : BIT_R1;
-  const word_t gmask = lower ? BIT_G2 : BIT_G1;
-  const word_t bmask = lower ? BIT_B2 : BIT_B1;
-  uint16_t qr = 0, qg = 0, qb = 0;
-  for (int p = 0; p < DEPTH; p++) {
-    word_t w = blockPtr(buf, row, p)[x];
-    if (w & rmask) qr |= (uint16_t)(1u << p);
-    if (w & gmask) qg |= (uint16_t)(1u << p);
-    if (w & bmask) qb |= (uint16_t)(1u << p);
-  }
-  r = (uint8_t)((qr * 255 + maxv / 2) / maxv);
-  g = (uint8_t)((qg * 255 + maxv / 2) / maxv);
-  b = (uint8_t)((qb * 255 + maxv / 2) / maxv);
-  if (bgrOrder) { uint8_t t = r; r = b; b = t; }
+  memcpy(fb[drawBuf], fb[liveBuf], (size_t)W * H * sizeof(px_t));
 }
 
 void panelReadback(uint8_t* out, bool rgb565) {
   if (!info.ok || !out) return;
-  const uint8_t buf = liveBuf;                     // the displayed buffer (single-byte, atomic read)
+  const uint8_t buf = liveBuf;
   size_t o = 0;
   for (int y = 0; y < H; y++)
     for (int x = 0; x < W; x++) {
@@ -942,10 +453,8 @@ void panelReadback(uint8_t* out, bool rgb565) {
     }
 }
 
-// Shift the live frame into the back buffer by (dx,dy); pixels shifted in from off-frame get the
-// (fr,fg,fb) fill. Reads liveBuf, writes drawBuf -- separate buffers, so no temp is needed. Because
-// the read/write round-trips exactly, a client can scroll repeatedly (a marquee) with no drift.
-void panelScroll(int dx, int dy, uint8_t fr, uint8_t fg, uint8_t fb) {
+// Shift the live frame into the back buffer by (dx,dy); vacated pixels get the fill colour.
+void panelScroll(int dx, int dy, uint8_t fr, uint8_t fg, uint8_t fb_) {
   if (!info.ok) return;
   const uint8_t src = liveBuf;
   for (int y = 0; y < H; y++)
@@ -954,31 +463,21 @@ void panelScroll(int dx, int dy, uint8_t fr, uint8_t fg, uint8_t fb) {
       if (sx >= 0 && sx < W && sy >= 0 && sy < H) {
         uint8_t r, g, b; readPixelRGB(src, sx, sy, r, g, b);
         panelPixel(x, y, r, g, b);
-      } else panelPixel(x, y, fr, fg, fb);
+      } else panelPixel(x, y, fr, fg, fb_);
     }
 }
 
-// Swap buffers by re-pointing the LIVE chain's tail at the other chain's head. GDMA reads
-// desc->next when it finishes a descriptor, so the switch happens at a block boundary and
-// never mid-row. Then wait one frame, so the caller cannot start drawing into a buffer the
-// engine is still reading.
+// ---- overlay + gesture ack blip (same contract as the Matrix Gateway) -------------
 static void (*sOverlay)(void) = nullptr;
 void panelSetOverlay(void (*fn)(void)) { sOverlay = fn; }
 
-// ---- Gesture ack blip (v3.15): a 4x4 corner flash acknowledging a clap/tap that no
-// alert consumed. Composited here rather than in any presenter: panelShow() stamps it
-// onto whatever frame is going out (saving the pixels underneath first), and
-// panelBlipService() -- pumped from taskWeb -- presents it when the panel is otherwise
-// static and clears it at expiry by restoring the saved pixels over a clone of the
-// live frame. The save always holds the under-blip content of the most recently
-// presented frame, so the restore is right whether the presenter kept streaming or
-// went quiet. Stamp and service can race across tasks; the worst case is one frame
-// with a stale 4x4 corner, corrected by the next present.
-static const int      BLIP_SZ = 4;
+// Blip: sized up from the Matrix Gateway's 4x4 -- on a 1280-wide panel a 4-pixel
+// square is invisible from across the room.
+static const int      BLIP_SZ = 24;
 static const uint32_t BLIP_MS = 220;
-static volatile uint32_t blipUntil = 0;   // millis() deadline; 0 = idle
+static volatile uint32_t blipUntil = 0;
 static uint8_t  blipRGB[3];
-static bool     liveHasBlip = false;      // the frame on screen has the blip burned in
+static bool     liveHasBlip = false;
 static uint8_t  blipSave[BLIP_SZ * BLIP_SZ * 3];
 
 void panelGestureBlip(uint8_t r, uint8_t g, uint8_t b) {
@@ -987,7 +486,7 @@ void panelGestureBlip(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 static void blipStamp() {                 // panelShow only: drawBuf holds the final frame
-  const int x0 = W - BLIP_SZ - 1, y0 = 1;
+  const int x0 = W - BLIP_SZ - 4, y0 = 4;
   size_t o = 0;
   for (int y = y0; y < y0 + BLIP_SZ; y++)
     for (int x = x0; x < x0 + BLIP_SZ; x++) {
@@ -1001,92 +500,221 @@ void panelBlipService() {
   if (!info.ok || !blipUntil) return;
   const bool expired = (int32_t)(millis() - blipUntil) >= 0;
   if (!expired && !liveHasBlip) {
-    panelCloneToBack();                   // no presenter has shown it yet: do it ourselves
-    panelShow();                          // stamps the blip (deadline is live)
+    panelCloneToBack();
+    panelShow();
   } else if (expired) {
-    if (liveHasBlip) {                    // static panel: put back what was underneath
+    if (liveHasBlip) {
       panelCloneToBack();
-      const int x0 = W - BLIP_SZ - 1, y0 = 1;
+      const int x0 = W - BLIP_SZ - 4, y0 = 4;
       size_t o = 0;
       for (int y = y0; y < y0 + BLIP_SZ; y++)
         for (int x = x0; x < x0 + BLIP_SZ; x++) {
           panelPixel(x, y, blipSave[o], blipSave[o + 1], blipSave[o + 2]);
           o += 3;
         }
-      blipUntil = 0;                      // before the show, so it isn't re-stamped
+      blipUntil = 0;
       panelShow();
-    } else blipUntil = 0;                 // a presenter already painted over it
+    } else blipUntil = 0;
   }
 }
 
-static uint32_t lastSwapUs = 0;   // when the previous swap relinked the chain
+// ---- present ----------------------------------------------------------------------
+// Rotate the logical landscape frame into the native portrait scanout. PPA does it in
+// hardware; the CPU fallback is exact but ~an order of magnitude slower. Logical
+// (x,y) -> native (nx,ny): a 90-degree turn, direction chosen so "landscape with the
+// board's connectors down" reads upright; PANEL_ROT_180 flips it for the other mount.
+static void rotateToScanout() {
+  if (gPpa) {
+    ppa_srm_oper_config_t op = {};
+    op.in.buffer         = fb[drawBuf];
+    op.in.pic_w          = W;
+    op.in.pic_h          = H;
+    op.in.block_w        = W;
+    op.in.block_h        = H;
+    op.in.block_offset_x = 0;
+    op.in.block_offset_y = 0;
+    op.in.srm_cm         = PPA_SRM_COLOR_MODE_RGB565;
+    op.out.buffer        = gScanout;
+    op.out.buffer_size   = (size_t)PANEL_NATIVE_W * PANEL_NATIVE_H * sizeof(px_t);
+    op.out.pic_w         = PANEL_NATIVE_W;
+    op.out.pic_h         = PANEL_NATIVE_H;
+    op.out.block_offset_x = 0;
+    op.out.block_offset_y = 0;
+    op.out.srm_cm        = PPA_SRM_COLOR_MODE_RGB565;
+    op.rotation_angle    = PANEL_ROT_180 ? PPA_SRM_ROTATION_ANGLE_270 : PPA_SRM_ROTATION_ANGLE_90;
+    op.scale_x           = 1.0f;
+    op.scale_y           = 1.0f;
+    op.mode              = PPA_TRANS_MODE_BLOCKING;
+    if (ppa_do_scale_rotate_mirror(gPpa, &op) == ESP_OK) return;
+    // fall through to the CPU path on error
+  }
+  const px_t* src = fb[drawBuf];
+  px_t* dst = (px_t*)gScanout;
+  for (int y = 0; y < H; y++)
+    for (int x = 0; x < W; x++) {
+      int nx, ny;
+      if (!PANEL_ROT_180) { nx = H - 1 - y;  ny = x; }
+      else                { nx = y;          ny = W - 1 - x; }
+      dst[(size_t)ny * PANEL_NATIVE_W + nx] = src[(size_t)y * W + x];
+    }
+  esp_cache_msync(gScanout, (size_t)PANEL_NATIVE_W * PANEL_NATIVE_H * sizeof(px_t),
+                  ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+}
 
 void panelShow() {
-  if (sOverlay) sOverlay();   // draw the overlay into the outgoing frame (v2.1)
+  if (sOverlay) sOverlay();   // draw the overlay into the outgoing frame
   if (!info.ok) return;
-  if (brightPending) { writeControlBits(drawBuf); brightPending = (uint8_t)(brightPending - 1); }
   if (blipUntil && (int32_t)(millis() - blipUntil) < 0) { blipStamp(); liveHasBlip = true; }
   else liveHasBlip = false;
 
-  // HARDWARE INVARIANT (v3.1, learned the hard way): never relink the descriptor
-  // chain twice within one scan pass. GDMA is traversing those descriptors as we
-  // rewrite their next pointers; the old always-sleep-after-swap code enforced at
-  // most one relink per pass as a side effect, and when respond-then-show removed
-  // that pacing, back-to-back swaps could catch the engine mid-traversal and halt
-  // the channel -- output dead, framebuffer fine, no error anywhere (the "black
-  // panel, healthy API" wedge, reproduced twice under soak load). Wait out the
-  // remainder of the previous swap's pass before touching the chain again.
-  {
-    const uint32_t el = (uint32_t)(micros() - lastSwapUs);
-    if (lastSwapUs && el < frameUs) {
-      const uint32_t rem = frameUs - el;
-      if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
-        vTaskDelay(pdMS_TO_TICKS(rem / 1000 + 1));
-      else
-        esp_rom_delay_us(rem);
-    }
-  }
+  // PPA reads physical PSRAM; the CPU drew through the cache. Flush before the blit.
+  if (gPpa) esp_cache_msync(fb[drawBuf], gFbBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+  rotateToScanout();
 
-  const uint8_t next = drawBuf;
-  // fb-in-PSRAM (v3.11): the CPU drew `next` through the cache; flush it to physical PSRAM before
-  // GDMA starts reading it, or the engine would scan out stale pixels. One ~130 KB writeback/frame.
-  if (gFbPsram) esp_cache_msync(fb[next], gFbBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-  desc[liveBuf][descN - 1].next = &desc[next][0];
-  desc[next][descN - 1].next    = &desc[next][0];   // stay on `next` until the swap after
-  liveBuf = next;
-  drawBuf = (uint8_t)(next ^ 1);
-
-  // GDMA may still be reading the buffer we just handed back to the CPU, for up to one
-  // pass of the chain. Two policies (v3.1):
-  //   * taskDisplay (effects, animations, the wall renderer) keeps the ORIGINAL
-  //     sleep-now behaviour -- its draw/show loops were tuned against it, and making
-  //     the wait lazy made the clock effect visibly pulse and stutter.
-  //   * every other caller (the HTTP canvas paths) gets the lazy guard: stamp the
-  //     swap, and the first buffer write afterwards waits out whatever remains --
-  //     usually absorbed entirely by network transfer time.
-  lastSwapUs = micros();
-  if (xTaskGetCurrentTaskHandle() == hTaskDisp) {
-    swapPending = false;
-    if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
-      vTaskDelay(pdMS_TO_TICKS(frameUs / 1000 + 1));
-    else
-      esp_rom_delay_us(frameUs);
-  } else {
-    swapPending = true;
-    swapAtUs    = micros();
-  }
+  // Swap roles: what we just presented becomes the live copy; the old live buffer is
+  // the new (stale) draw buffer. Synchronous blit -- no tear-guard needed.
+  const uint8_t shown = drawBuf;
+  drawBuf = liveBuf;
+  liveBuf = shown;
 }
+
+// ---- bring-up / teardown ----------------------------------------------------------
+static void panelFreeAll() {
+  for (int b = 0; b < 2; b++)
+    if (fb[b]) { heap_caps_free(fb[b]); fb[b] = nullptr; }
+  panelLayerDiscard();
+}
+
+bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
+  (void)depth; (void)fbPsram;                     // HUB75 concepts; the LCD is always RGB565/PSRAM
+  info = {false, width, height, 16, 0, 0};
+  // The logical geometry must be the native panel rotated. Anything else (a smaller
+  // "window") is representable later; bring-up keeps the 1:1 mapping.
+  if (width != PANEL_NATIVE_H || height != PANEL_NATIVE_W) {
+    printf("[PANEL] %ux%u requested; this build drives the 10.1\" DSI panel only "
+           "(landscape %ux%u) -- using native geometry\n",
+           (unsigned)width, (unsigned)height, PANEL_NATIVE_H, PANEL_NATIVE_W);
+  }
+  W = PANEL_NATIVE_H;  H = PANEL_NATIVE_W;        // landscape logical space
+  info.width = W; info.height = H;
+
+  const size_t fbBytes = (size_t)W * H * sizeof(px_t);
+  gFbBytes = (fbBytes + 63u) & ~((size_t)63u);
+  for (int b = 0; b < 2; b++) {
+    fb[b] = (px_t*)heap_caps_aligned_alloc(64, gFbBytes, MALLOC_CAP_SPIRAM);
+    if (!fb[b]) {
+      printf("[PANEL] %u B of PSRAM unavailable for framebuffer %d\n", (unsigned)gFbBytes, b);
+      panelFreeAll(); return false;
+    }
+    memset(fb[b], 0, gFbBytes);
+  }
+
+  // MIPI D-PHY power (the P4 routes it through an internal LDO channel).
+  esp_ldo_channel_config_t ldo = {};
+  ldo.chan_id = MIPI_LDO_CHAN;
+  ldo.voltage_mv = MIPI_LDO_MV;
+  if (esp_ldo_acquire_channel(&ldo, &gPhyLdo) != ESP_OK) {
+    printf("[PANEL] MIPI D-PHY LDO acquire failed\n");
+    panelFreeAll(); return false;
+  }
+
+  // Backlight controller power-up (display FPC, I2C 0x45): the sequence the vendor
+  // driver performs, done here so the vendored file stays free of I2C plumbing.
+  // setup() is single-threaded at this point -- the one context allowed to touch
+  // the bus outside taskRTC.
+  blWrite(0x95, 0x11); blWrite(0x95, 0x17);
+  blWrite(0x96, 0x00);
+  delay(100);
+  blWrite(0x96, 0xFF);
+
+  // Vendor macros (JD9365_PANEL_BUS_DSI_2CH_CONFIG etc.) are C designated-initializer
+  // lists that C++ rejects; the same values, spelled out. Source of truth: the
+  // vendored esp_lcd_jd9365_10_1.h.
+  esp_lcd_dsi_bus_config_t busCfg = {};
+  busCfg.bus_id = 0;
+  busCfg.num_data_lanes = 2;
+  busCfg.phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT;
+  busCfg.lane_bit_rate_mbps = 1500;
+  if (esp_lcd_new_dsi_bus(&busCfg, &gDsiBus) != ESP_OK) {
+    printf("[PANEL] DSI bus create failed\n");
+    panelFreeAll(); return false;
+  }
+  esp_lcd_dbi_io_config_t dbiCfg = {};
+  dbiCfg.virtual_channel = 0;
+  dbiCfg.lcd_cmd_bits = 8;
+  dbiCfg.lcd_param_bits = 8;
+  if (esp_lcd_new_panel_io_dbi(gDsiBus, &dbiCfg, &gDbiIo) != ESP_OK) {
+    printf("[PANEL] DBI io create failed\n");
+    panelFreeAll(); return false;
+  }
+
+  esp_lcd_dpi_panel_config_t dpiCfg = {};
+  dpiCfg.dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT;
+  dpiCfg.dpi_clock_freq_mhz = 80;                  // 60 Hz at the timing below
+  dpiCfg.virtual_channel = 0;
+  dpiCfg.pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565;
+  dpiCfg.num_fbs = 1;
+  dpiCfg.video_timing.h_size = PANEL_NATIVE_W;
+  dpiCfg.video_timing.v_size = PANEL_NATIVE_H;
+  dpiCfg.video_timing.hsync_back_porch = 20;
+  dpiCfg.video_timing.hsync_pulse_width = 20;
+  dpiCfg.video_timing.hsync_front_porch = 40;
+  dpiCfg.video_timing.vsync_back_porch = 10;
+  dpiCfg.video_timing.vsync_pulse_width = 4;
+  dpiCfg.video_timing.vsync_front_porch = 30;
+  dpiCfg.flags.use_dma2d = true;
+  jd9365_vendor_config_t vendor = {};
+  vendor.mipi_config.dsi_bus = gDsiBus;
+  vendor.mipi_config.dpi_config = &dpiCfg;
+  vendor.mipi_config.lane_num = 2;
+  esp_lcd_panel_dev_config_t devCfg = {};
+  devCfg.reset_gpio_num = DSI_RESET_PIN;
+  devCfg.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
+  devCfg.bits_per_pixel = 16;
+  devCfg.vendor_config = &vendor;
+  if (esp_lcd_new_panel_jd9365(gDbiIo, &devCfg, &gPanel) != ESP_OK ||
+      esp_lcd_panel_reset(gPanel) != ESP_OK ||
+      esp_lcd_panel_init(gPanel)  != ESP_OK) {
+    printf("[PANEL] JD9365 init failed\n");
+    panelFreeAll(); return false;
+  }
+  esp_lcd_panel_disp_on_off(gPanel, true);
+
+  // The DPI engine scans its own frame buffer continuously; get its address so the
+  // rotate-blit can target it directly.
+  if (esp_lcd_dpi_panel_get_frame_buffer(gPanel, 1, &gScanout) != ESP_OK || !gScanout) {
+    printf("[PANEL] DPI frame buffer unavailable\n");
+    panelFreeAll(); return false;
+  }
+
+  // PPA client for the hardware rotate. Optional: on failure the CPU path serves.
+  ppa_client_config_t ppaCfg = {};
+  ppaCfg.oper_type = PPA_OPERATION_SRM;
+  if (ppa_register_client(&ppaCfg, &gPpa) != ESP_OK) {
+    gPpa = nullptr;
+    printf("[PANEL] PPA unavailable -- CPU rotate fallback\n");
+  }
+
+  info.bytes = (uint32_t)(gFbBytes * 2);
+  info.refreshHz = 60;                             // DPI timing, fixed
+  info.ok = true;
+  printf("[PANEL] DSI up: %ux%u landscape (native %ux%u), RGB565, %s rotate\n",
+         (unsigned)W, (unsigned)H, PANEL_NATIVE_W, PANEL_NATIVE_H, gPpa ? "PPA" : "CPU");
+  return true;
+}
+
+const PanelInfo& panelInfo() { return info; }
+bool panelFbInPsram() { return info.ok; }          // always: the framebuffers live in PSRAM
 
 void panelStop() {
   if (!info.ok) return;
-  outputParked = true;                              // the stall watchdog stands down
-  LCD_CAM.lcd_user.lcd_start = 0;
-  gdma_stop(dma_chan);
-  // OE is still muxed to LCD_DATA_OUT7, so driving it as GPIO would do nothing. Detach
-  // the peripheral signal first, then park it high: dark, nothing latched, no clock.
-  esp_rom_gpio_connect_out_signal(HUB75_OE, SIG_GPIO_OUT_IDX, false, false);
-  gpio_set_direction((gpio_num_t)HUB75_OE, GPIO_MODE_OUTPUT);
-  gpio_set_level((gpio_num_t)HUB75_OE, 1);
+  gBlPending = -1;
+  blWrite(0x96, 0x00);                             // backlight off; scanout keeps running dark
+}
+
+void panelResume() {
+  if (!info.ok) return;
+  blWrite(0x96, bright);
 }
 
 void panelRelease() {
@@ -1095,52 +723,7 @@ void panelRelease() {
   info.ok = false;
 }
 
-void panelResume() {
-  if (!info.ok) return;
-  pinmux(HUB75_OE, (uint8_t)(LCD_DATA_OUT0_IDX + 7));
-  gdma_start(dma_chan, (intptr_t)&desc[liveBuf][0]);
-  esp_rom_delay_us(1);
-  LCD_CAM.lcd_user.lcd_start = 1;
-  outputParked = false;
-}
-
-/* ---- output-stage stall watchdog (v3.5) --------------------------------------------
-   The "black panel, healthy API" wedge: the GDMA channel halts, leaving the
-   framebuffer, the API and panel.ok perfectly healthy with nothing physically lit --
-   observed twice in v3.0.1 under back-to-back swaps (since paced away in panelShow)
-   and once more at a v3.5 OTA boot. Only human eyes ever caught it; a reboot always
-   cured it. This makes the firmware its own witness: the channel's working-descriptor
-   register (outlink_dscr, via gdma_ll_tx_get_prefetched_desc_addr) must move between
-   two samples 1.5 ms apart. A descriptor lasts ~26-52 us and a full pass 6-25 ms
-   across the supported geometry/clock range (5 or 10 MHz), so a healthy chain always
-   moves within 1.5 ms and two equal samples can never be a coincidental full-loop
-   alias. Frozen on two consecutive ticks = the output
-   stage is dead; the reboot's cure -- stop, reset the LCD FIFO, re-arm the chain,
-   restart -- is applied in place, with the event logged loudly. */
-static void panelOutputRestart() {
-  LCD_CAM.lcd_user.lcd_start = 0;
-  gdma_stop(dma_chan);
-  LCD_CAM.lcd_user.lcd_reset = 1;
-  esp_rom_delay_us(5);
-  desc[liveBuf][descN - 1].next = &desc[liveBuf][0];   // a mid-wedge swap could leave a cross-link
-  gdma_start(dma_chan, (intptr_t)&desc[liveBuf][0]);
-  esp_rom_delay_us(1);
-  LCD_CAM.lcd_user.lcd_start = 1;
-}
-
-void panelHealthTick() {
-  if (!info.ok || !dma_chan || dmaChanId < 0 || outputParked) return;
-  static uint8_t stuck = 0;
-  const uint32_t a1 = gdma_ll_tx_get_prefetched_desc_addr(&GDMA, (uint32_t)dmaChanId);
-  esp_rom_delay_us(1500);
-  const uint32_t a2 = gdma_ll_tx_get_prefetched_desc_addr(&GDMA, (uint32_t)dmaChanId);
-  if (a1 == a2) {
-    if (++stuck >= 2) {
-      printf("[PANEL] output stage STALLED (desc frozen at 0x%08x) -- self-healing\n",
-             (unsigned)a1);
-      sdLog("PANEL gdma stall (desc 0x%08x) -- self-healed", (unsigned)a1);
-      panelOutputRestart();
-      stuck = 0;
-    }
-  } else stuck = 0;
-}
+// The DPI engine owns refresh end to end; there is no descriptor chain to freeze.
+// Kept as a hook: if a DSI-underrun class of wedge ever shows up in the field, its
+// detector goes here (esp_lcd exposes DPI event callbacks for it).
+void panelHealthTick() {}

@@ -104,25 +104,15 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 
    All 13 signals route through the GPIO matrix into one LCD_CAM data word
    (panel.cpp), so the map is arbitrary as far as the driver is concerned. */
-#define HUB75_R1     4
-#define HUB75_G1     5
-#define HUB75_B1     6
-#define HUB75_R2     7
-#define HUB75_G2     15
-#define HUB75_B2     16
-#define HUB75_ADDR_A 18
-#define HUB75_ADDR_B 8
-#define HUB75_ADDR_C 3
-#define HUB75_ADDR_D 42
-#define HUB75_ADDR_E 9           // 64-row panels only
-#define HUB75_CLK    41
-#define HUB75_LAT    40
-#define HUB75_OE     2
+// ---- Waveshare ESP32-P4-WIFI6-POE-ETH: the display is MIPI-DSI (2-lane), so there
+// is no parallel pin map -- the DSI PHY has dedicated pins. What the board DOES route:
+#define DSI_RESET_PIN   -1       // panel reset: TODO confirm from the board schematic (-1 = none)
+#define LCD_BL_I2C_ADDR 0x45     // backlight/power controller on the display FPC (regs 0x95/0x96)
 
 
 /* ---- Other Waveshare ESP32-S3-RGB-Matrix hardware ---- */
-#define I2C_SDA_PIN     47       // shared bus: PCF85063 RTC, QMI8658 IMU, SHTC3
-#define I2C_SCL_PIN     48
+#define I2C_SDA_PIN     7        // shared bus: display backlight ctrl (0x45), GT9xx touch,
+#define I2C_SCL_PIN     8        // ES8311 codec control -- Waveshare P4 demo wiring
 
 /* ---- Time ----
    This board carries a battery-backed PCF85063 RTC (addr 0x51) on the I2C bus.
@@ -143,8 +133,8 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 // and as "fw" in capabilities. Clients key product-specific behaviour on "product" and on
 // capability tokens, never on version heuristics (the old API_VERSION="3.1.0" masquerade
 // for the physical-gateway companion gate was removed in v3.12).
-#define FW_VERSION           "3.16.0"   // this product's version (UI + boot log)
-#define PRODUCT_NAME         "Matrix Portal Gateway"
+#define FW_VERSION           "0.1.0"    // this product's version (UI + boot log)
+#define PRODUCT_NAME         "LCD Gateway"
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 /* WiFi credentials are intentionally BLANK. A freshly flashed board therefore comes
@@ -178,11 +168,11 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
    one-pixel gutter). 15 columns need 120 px, so a 64-wide panel cannot host this
    wall; chain two 64x32 panels (or use a native 128x32). For a roomy version,
    chain two 64x64 panels: an 8x21 cell picks up the 6x13 face. */
-#define DEFAULT_PANEL_W      128    // total chain width in px
-#define DEFAULT_PANEL_H      32     // panel height in px (32 or 64)
-#define DEFAULT_GRID_COLS    15     // virtual modules across
+#define DEFAULT_PANEL_W      1280   // landscape: the 800x1280 portrait panel mounted wide
+#define DEFAULT_PANEL_H      800
+#define DEFAULT_GRID_COLS    15     // virtual modules across (85x266 px flaps -- roomy)
 #define DEFAULT_GRID_ROWS    3      // virtual modules down
-#define DEFAULT_BIT_DEPTH    4      // bitplanes, 1..8 (RAM and refresh rate scale with it)
+#define DEFAULT_BIT_DEPTH    16     // bits per pixel now (RGB565); kept for config compatibility
 #define DEFAULT_PANEL_BGR    false  // true if the panel is wired BGR (see panelSetColourOrder)
 #define DEFAULT_BRIGHTNESS   160    // 1..255, scales every colour before output
 // A real module flips a handful of flaps per second, not fifty. This also sets the
@@ -230,7 +220,7 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 // panel (256x64) sits near this under companion load; a small one never does.
 #define CANVAS_MIN_UPLOAD_HEAP  (40u * 1024u)
 
-#define PANEL_MAX_W          256   // panel height is validated by the enumerated 16/32/64 set
+#define PANEL_MAX_W          1280   // panel height is validated by the enumerated 16/32/64 set
 
 /* ---- Flip animation ----
    Changing the displayed flap cascades forward through the reel, which is what

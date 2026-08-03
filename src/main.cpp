@@ -56,7 +56,6 @@ void setup() {
   // (100 ms by default) whenever a host has enumerated the port but is not
   // draining it -- a monitor left paused, or a USB power brick. DBG() is called
   // from inside web handlers, so that blocks taskWeb. 0 = drop instead of block.
-  Serial.setTxTimeoutMs(0);
   { unsigned long t = millis(); while (!Serial && millis() - t < 3000) delay(10); }
   delay(200);
   printf("\n[Boot] %s v%s\n", PRODUCT_NAME, FW_VERSION);
