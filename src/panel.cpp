@@ -616,12 +616,11 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   // = no display: run headless, loudly, and say what to check.
   Wire.beginTransmission(LCD_BL_I2C_ADDR);
   if (Wire.endTransmission() != 0) {
-    printf("[PANEL] display controller (0x%02X) not answering on I2C -- is the "
-           "display's POWER cable connected (the DSI FPC alone does not power it)? "
-           "Running headless\n", LCD_BL_I2C_ADDR);
+    printf("[PANEL] display controller (0x%02X) not answering on I2C -- display "
+           "absent or not ready (check the FPC seating). Running headless\n",
+           LCD_BL_I2C_ADDR);
     panelFreeAll(); return false;
   }
-  printf("[PANEL] bring-up: fb allocated, acquiring D-PHY LDO\n");
   // MIPI D-PHY power (the P4 routes it through an internal LDO channel).
   esp_ldo_channel_config_t ldo = {};
   ldo.chan_id = MIPI_LDO_CHAN;
@@ -631,7 +630,6 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
     panelFreeAll(); return false;
   }
 
-  printf("[PANEL] bring-up: LDO ok, backlight power-up\n");
   // Backlight controller power-up (display FPC, I2C 0x45): the sequence the vendor
   // driver performs, done here so the vendored file stays free of I2C plumbing.
   // setup() is single-threaded at this point -- the one context allowed to touch
@@ -644,7 +642,6 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   // Vendor macros (JD9365_PANEL_BUS_DSI_2CH_CONFIG etc.) are C designated-initializer
   // lists that C++ rejects; the same values, spelled out. Source of truth: the
   // vendored esp_lcd_jd9365_10_1.h.
-  printf("[PANEL] bring-up: backlight ok, creating DSI bus\n");
   esp_lcd_dsi_bus_config_t busCfg = {};
   busCfg.bus_id = 0;
   busCfg.num_data_lanes = 2;
@@ -663,7 +660,6 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
     panelFreeAll(); return false;
   }
 
-  printf("[PANEL] bring-up: DBI io ok, JD9365 init\n");
   esp_lcd_dpi_panel_config_t dpiCfg = {};
   dpiCfg.dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT;
   dpiCfg.dpi_clock_freq_mhz = 80;                  // 60 Hz at the timing below
@@ -690,14 +686,12 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   devCfg.bits_per_pixel = 16;
   devCfg.vendor_config = &vendor;
   esp_err_t e = esp_lcd_new_panel_jd9365(gDbiIo, &devCfg, &gPanel);
-  printf("[PANEL] bring-up: new_panel -> %d\n", (int)e);
-  if (e == ESP_OK) { e = esp_lcd_panel_reset(gPanel); printf("[PANEL] bring-up: reset -> %d\n", (int)e); }
-  if (e == ESP_OK) { e = esp_lcd_panel_init(gPanel);  printf("[PANEL] bring-up: init -> %d\n", (int)e); }
+  if (e == ESP_OK) e = esp_lcd_panel_reset(gPanel);
+  if (e == ESP_OK) e = esp_lcd_panel_init(gPanel);
   if (e != ESP_OK) {
     printf("[PANEL] JD9365 init failed\n");
     panelFreeAll(); return false;
   }
-  printf("[PANEL] bring-up: JD9365 init ok, display on\n");
   esp_lcd_panel_disp_on_off(gPanel, true);
 
   // The DPI engine scans its own frame buffer continuously; get its address so the
