@@ -1,0 +1,2990 @@
+openapi: 3.1.0
+info:
+  title: Matrix Portal Gateway API
+  version: "3.16"
+  description: |
+    REST API for the **Matrix Portal Gateway** firmware, running on a
+    Waveshare ESP32-S3-RGB-Matrix driver board. It emulates a wall of split-flap modules on a
+    HUB75 LED matrix and speaks the Split-Flap Gateway's API, so existing clients work unchanged.
+
+    **Firmware 2.0 changed the target board, not the API.** Versions up to 1.25.0 ran on the
+    Adafruit MatrixPortal S3 (that final build lives on the `matrixportal` git branch); the port
+    is hardware-only, so every endpoint, schema and behaviour documented here is identical on
+    both boards.
+
+    **One honest version since v3.12**: `GET /api/config` reports the firmware's real version
+    in both `version` and `fwVersion` (the old fixed `3.1.0` "API level" masquerade is gone).
+    Clients key product-specific behaviour on `product` and on capability tokens.
+
+    **Firmware 3.0 replaced the HTTP server** (ESP-IDF `esp_http_server`, natively) and with it:
+    `GET /api/events`, a Server-Sent Events stream pushing the display state whenever the wall
+    changes (the `events` capability token — the dashboard's live preview rides it); and a
+    **breaking change to the two upload endpoints**: `POST /api/ota/upload` and
+    `POST /api/fs/upload?name=<filename>` now take the raw file as the request body — no
+    multipart. Everything else on this surface is unchanged.
+
+    **Firmware 2.1 grows the canvas surface** — an animation library persisted to FATFS (plus a
+    `bootAnim` config field), an overlay ticker, full-frame transitions, a sprite atlas (a **named, persistent library** since 3.1) for the
+    ops path, on-device GIF import and uploadable fonts. All additive: every pre-2.1 client
+    keeps working unchanged, and the new features are visible in `GET /api/capabilities`
+    (the `sprite` op) and `GET /api/canvas` (the `atlas` field).
+
+    **Firmware 2.2 adds a FATFS file browser** — `GET /api/fs` (list + totals),
+    `GET /api/fs/file` (download), `POST /api/fs/delete` and `POST /api/fs/upload` — behind
+    the dashboard's new Files tab, plus a live brightness endpoint
+    (`GET`/`POST /api/display/brightness`) advertised as the `brightness` capability token.
+    All additive, as before.
+
+    Endpoints for calibration and provisioning are absent by design — this product's modules are
+    *drawn*, not driven, so there is nothing to calibrate.
+
+    **Base URL:** `http://<gateway-ip>` — replace with the gateway's IP
+    (shown on the Status page), or use `http://192.168.4.1` when connected to
+    the AP fallback network.
+
+    JSON endpoints accept and return `application/json`. The canvas
+    frame/rect/qoi/anim/atlas/gif/font uploads, the companion settings blob, the OTA upload and
+    the fs upload carry binary bodies instead. All endpoints include
+    `Access-Control-Allow-Origin: *`.
+
+servers:
+  - url: http://192.168.4.1
+    description: AP fallback (default)
+  - url: http://{ip}
+    description: Station IP (after WiFi connect)
+    variables:
+      ip:
+        default: "192.168.1.100"
+        description: Gateway IP address
+
+tags:
+  - name: Frames
+    description: Raw protocol-frame access to the virtual modules
+  - name: Modules
+    description: Split-flap module display control
+  - name: Display
+    description: The visual state of the wall
+  - name: Canvas
+    description: Raw pixel control of the LED panel (Matrix only) — bypasses the split-flap wall
+  - name: Status
+    description: System status and diagnostics
+  - name: Config
+    description: Persistent configuration
+  - name: Files
+    description: FATFS file browser — list, download, delete and upload files on the flash filesystem (v2.2)
+  - name: Companion
+    description: Companion-app registration and its settings blob store
+  - name: OTA
+    description: Over-the-air firmware update
+  - name: UI
+    description: Assets the dashboard (and the companion's proxy) fetch from the firmware image
+
+paths:
+
+  # ── Protocol frames ─────────────────────────────────────────────
+
+  /api/log:
+    get:
+      tags: [Frames]
+      summary: Drain the command log
+      description: >-
+        Returns the commands received since the last call, up to 64, then
+        advances the cursor. On this firmware there is no physical wire, so this is a log of
+        commands the gateway acted on, not an RX/TX wire trace. Each call drains what is new.
+      responses:
+        "200":
+          description: Array of log entries (may be empty)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LogEntry"
+
+  /api/frames/send:
+    post:
+      tags: [Frames]
+      summary: Send a raw ASCII protocol frame to the virtual modules
+      description: >-
+        The only send path since v1.22.0: the physical gateway's `/api/rs485/send`
+        (kept as a compatibility alias through v1.21) and the interim `/api/bus/send`
+        were removed in v1.22.0 and now 404.
+
+        Frames are **one-way** (v1.24.0): the modules act on `-` (show character), `+`
+        (show index) and `h` (home), silently ignore everything else, and nothing ever
+        replies — the `v`/`A` queries were removed. The command log carries only the
+        outbound wire (`<prefix>/frames/tx`). Read the wall back through
+        `/api/display/state`, `/api/flap/modules` and `/api/capabilities`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [data]
+              properties:
+                data:
+                  type: string
+                  description: >
+                    ASCII frame to transmit. A trailing newline is optional — the
+                    gateway normalizes framing (adds/strips the terminator and trims
+                    any bytes past a complete known command) unless `raw` is true.
+                raw:
+                  type: boolean
+                  default: false
+                  description: >
+                    When true, the bytes in `data` are sent verbatim with no
+                    sanitization or terminator changes (debugging escape hatch).
+            examples:
+              home_all:
+                value: { data: "m*h" }
+              show_char:
+                value: { data: "m5-A" }
+              show_index:
+                value: { data: "m5+223" }
+              raw_verbatim:
+                value: { data: "m5-A\n", raw: true }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/frames/batch:
+    post:
+      tags: [Frames]
+      summary: Send many raw frames in one request (v3.0)
+      description: >
+        Sends each frame in `frames`, normalized like `/api/frames/send`, so a host can draw a
+        whole animated page in one HTTP call instead of one request per module. Capped at 512
+        frames. An optional `step_ms` paces the cascade: the request returns immediately and the
+        frames are delivered on a schedule by the frames task (so a paced batch never blocks the
+        web server). `step_ms` 0 sends everything at once. The only batch path since v1.22.0:
+        `/api/rs485/batch` and the interim `/api/bus/batch` were removed in v1.22.0 and now 404.
+        Like `/api/frames/send`, frames are one-way (v1.24.0) — nothing replies, and the
+        mirror carries only `<prefix>/frames/tx`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [frames]
+              properties:
+                frames:
+                  type: array
+                  items: { type: string }
+                  description: ASCII frames, e.g. ["m00-A\n","m01-B\n"]
+                step_ms:
+                  type: integer
+                  default: 0
+                  description: Delay (0–30 ms) between frames, for a paced cascade.
+            example: { frames: ["m00-A\n", "m01-B\n", "m02-y\n"], step_ms: 15 }
+      responses:
+        "200":
+          description: How many frames were sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:   { type: boolean, example: true }
+                  sent: { type: integer, example: 45 }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  # ── Module display control ──────────────────────────────────────
+
+  /api/display/state:
+    get:
+      tags: [Display]
+      summary: Current visual state of the split-flap wall
+      description: |
+        Returns the configured grid dimensions and the character shown in each
+        cell. Cells map to module IDs left-to-right, top-to-bottom (cell index =
+        row*cols + col == module id). Drives the Live Display.
+
+        Each cell is the character the module is actually showing, read straight
+        from the module (there is no tracking layer to go stale). Lowercase,
+        accents and pictographs are reported as themselves — the cell carries a
+        Unicode code point, not a Windows-1252 byte, so a heart reads back as "♥".
+        A colour flap has no character and reports as its protocol letter
+        (r o y g b p w). null means no module has that id — only possible if the
+        panel clamped the grid.
+      responses:
+        "200":
+          description: Display state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rows:  { type: integer, example: 3 }
+                  cols:  { type: integer, example: 15 }
+                  cells:
+                    type: array
+                    items: { type: [string, "null"] }
+                    example: [" ","1","2",":","0","4","A","M",null,null]
+
+  /api/events:
+    get:
+      tags: [Display]
+      summary: Server-Sent Events push stream — the live preview's pipe (v3.0)
+      description: |
+        A `text/event-stream` (SSE) the gateway pushes to whenever the wall changes,
+        advertised as the `events` capability token. Connect with the browser's
+        `EventSource` (it reconnects on its own) or `curl -N`. On connect the stream
+        opens with a `retry:` hint and an immediate `display` snapshot; after that a
+        `display` event carries the same JSON as `GET /api/display/state` every time
+        the wall changes — rate-limited to ~7 events/s, so a flip cascade streams as
+        motion. Since v3.2 a `status` event carries the `GET /api/status` JSON every
+        5 s, so a connected dashboard needs no status poller. A `: ka` comment every
+        15 s keeps idle connections warm (any data event resets that clock).
+
+        At most **3** concurrent streams; a fourth connect is refused with `503`.
+        The dashboard's Live Display rides this stream and falls back to polling
+        `/api/display/state` when it drops.
+      responses:
+        "200":
+          description: |
+            An SSE stream. Example frames:
+
+                retry: 3000
+
+                event: display
+                data: {"rows":5,"cols":32,"cells":["H","E","L","L","O",...]}
+
+                event: status
+                data: {"uptime":476,"heap":139364,"minheap":121516,...}
+
+                : ka
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "503":
+          description: All event-stream slots are taken (max 3)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/display/cells:
+    post:
+      tags: [Display]
+      summary: Set the wall by flap INDEX — lowercase, pictographs, named colours (v1.6)
+      description: |
+        The index-addressed display API. It exists because two things are **impossible** on
+        the legacy character protocol, and no amount of care fixes either:
+
+        * **Lowercase.** `m<id>-<char>` carries one byte, and the byte for `r` already means
+          **red** — the seven colour flaps are addressed by `r o y g b p w`, by protocol. So
+          on that path a lowercase letter must fold to uppercase, or the colours break. You
+          cannot have both on one byte.
+        * **Pictographs.** A heart has no Windows-1252 byte at all, so there is no byte to
+          send.
+
+        Both flaps *exist* on the reel (163–222 lowercase, 223–236 pictographs). They are
+        simply unreachable by character. This endpoint addresses them **by index** — the
+        ordinary `m<id>+<n>` command, which the modules have always understood — and names
+        colours explicitly instead of stealing letters for them.
+
+        The legacy endpoints are untouched and still work exactly as before.
+
+        Every cell is resolved **before anything is sent**. A character with no flap is a
+        `400`, not a silent blank: a half-written wall is worse than a rejected request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cells]
+              properties:
+                start:
+                  type: integer
+                  default: 0
+                  description: First module id the cells land on.
+                step_ms:
+                  type: integer
+                  default: 0
+                  description: >
+                    0–30 ms between cells, for a paced cascade. Scheduled, never a delay()
+                    — the request returns immediately.
+                cells:
+                  type: array
+                  description: One entry per module, left to right. Exactly one key each.
+                  items:
+                    type: object
+                    properties:
+                      ch:
+                        type: string
+                        description: >
+                          One character, UTF-8. Lowercase and accents are kept as typed.
+                          A pictograph goes here as itself.
+                      color:
+                        type: string
+                        enum: [red, orange, yellow, green, blue, purple, white]
+                        description: A colour flap, NAMED. On this path `r` is the letter r.
+                      blank:
+                        type: boolean
+                        description: Home the module (flap 0).
+                      skip:
+                        type: boolean
+                        description: Leave that module exactly as it is.
+            example:
+              start: 0
+              step_ms: 15
+              cells:
+                - { ch: "H" }
+                - { ch: "e" }
+                - { ch: "l" }
+                - { ch: "l" }
+                - { ch: "o" }
+                - { ch: "♥" }
+                - { color: "red" }
+                - { blank: true }
+      responses:
+        "200":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:    { type: boolean, example: true }
+                  cells: { type: integer, example: 8 }
+                  sent:  { type: integer, example: 7, description: "cells actually transmitted (skips are not)" }
+        "400":
+          description: >
+            Bad request — including a character the reel cannot show
+            ("no flap for U+1F600") or an unknown colour name.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/display/brightness:
+    get:
+      tags: [Display]
+      summary: Get the panel brightness (v2.2)
+      description: The panel's global brightness, `1..255` — the same value `panelBright` in the config carries.
+      responses:
+        "200":
+          description: Current brightness
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:         { type: boolean, example: true }
+                  brightness: { type: integer, minimum: 1, maximum: 255, example: 160 }
+    post:
+      tags: [Display]
+      summary: Set the panel brightness (v2.2)
+      description: |
+        Sets the panel's global brightness, **live**: the new duty is applied on the next
+        presented frame, whatever is presenting (wall, effect, animation, canvas), with no
+        reboot. The value is persisted — it is the same setting as `panelBright` in
+        `POST /api/config/settings`, on a display-shaped endpoint so clients that read the
+        `brightness` capability token from `GET /api/capabilities` can drive it without
+        knowing the config schema.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [brightness]
+              properties:
+                brightness: { type: integer, minimum: 1, maximum: 255 }
+            example: { brightness: 96 }
+      responses:
+        "200":
+          description: New brightness
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:         { type: boolean, example: true }
+                  brightness: { type: integer, example: 96 }
+        "400":
+          description: "`brightness` missing or outside 1..255"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /openapi.yaml:
+    get:
+      tags: [Status]
+      summary: This document, served by the device (v3.5)
+      description: |
+        The gateway serves its own API contract — the exact spec for the firmware it is
+        running, which beats any repo copy. Compressed at build time and sent with
+        `Content-Encoding: gzip` unconditionally (~28 KB on the wire); build-stamp `ETag`
+        with `304` revalidation like the other immutable assets. Discoverable via the
+        `openapi` field of `GET /api/capabilities` and via `/.well-known/api-catalog`.
+      responses:
+        "200":
+          description: This OpenAPI document (YAML, gzip-encoded)
+          content: { application/yaml: { schema: { type: string } } }
+
+  /.well-known/api-catalog:
+    get:
+      tags: [Status]
+      summary: RFC 9727 API catalog (v3.5)
+      description: |
+        The IETF-standard discovery pointer — a linkset naming this host's APIs and
+        linking their descriptions. Here it carries one entry pointing at
+        `/openapi.yaml`.
+      responses:
+        "200":
+          description: Linkset
+          content: { application/linkset+json: { schema: { type: object } } }
+
+  /api/environment:
+    get:
+      tags: [Status]
+      summary: Onboard temperature + humidity (v3.7, `environment` token)
+      description: |
+        The board's Sensirion SHTC3 sensor, polled once every ~10 s. Present only on
+        hardware that carries it (advertised as the `environment` capability token; the
+        same reading also rides `GET /api/status` under `env`). Note the temperature
+        reads a few degrees warm — the sensor sits near the LED panel and the ESP32.
+      responses:
+        "200":
+          description: Reading (or availability when no reading yet / absent)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+                  tempC:     { type: number, description: "°C, calibration offset applied (v3.7)" }
+                  tempF:     { type: number, description: "°F, calibration offset applied" }
+                  rh:        { type: number, description: "relative humidity %, temperature-compensated from the offset (v3.7)" }
+                  rawTempC:  { type: number, description: "°C before the calibration offset (v3.7)" }
+                  rawRH:     { type: number, description: "relative humidity % before compensation (v3.7)" }
+                  offsetC:   { type: number, description: "the applied temperature offset, °C (v3.7)" }
+                  ageMs:     { type: integer, description: "ms since the reading was taken" }
+  /api/backup:
+    get:
+      tags: [System]
+      summary: FATFS backup status (v3.16)
+      description: |
+        The gateway mirrors its internal FATFS storage (animations, fonts, atlases,
+        the companion blob) to `/backup/fatfs` on the microSD card, with the full
+        settings export beside it as `/backup/config.json`. Passes are incremental
+        (size/mtime) and prune files deleted from the source. Runs nightly at 03:30
+        local (`backupEnabled` setting), once shortly after boot when the card has no
+        mirror yet, and on demand via POST. **If FATFS is ever reformatted** — the
+        crash-recovery path does this after 3 panic boots in a row — **the mirror is
+        restored automatically on the next boot.**
+      responses:
+        "200": { description: "{available,enabled,running,everRan,lastOk,lastEpoch,lastMs,copied,pruned,unchanged,bytes}" }
+    post:
+      tags: [System]
+      summary: Run a backup pass now
+      description: Sets a flag the housekeeping task picks up within a second; poll GET `running` for completion. `503` with no card.
+      responses:
+        "200": { description: "{ok,started}" }
+  /api/config/export:
+    get:
+      tags: [System]
+      summary: Download the full settings as JSON (v3.16)
+      description: |
+        Every configuration field as one JSON document (`Content-Disposition` names it
+        `<hostname>-config.json`). The WiFi password is deliberately excluded — import
+        runs over the network, so the receiving device already holds working credentials,
+        and its absence makes the file safe to store anywhere.
+      responses:
+        "200": { description: "application/json settings document" }
+  /api/config/import:
+    post:
+      tags: [System]
+      summary: Apply an exported settings file (v3.16)
+      description: |
+        Applies whichever known keys the body contains (unknown keys ignored, malformed
+        values skipped), with the same clamps NVS load enforces, then saves.
+        `rebootNeeded:true` means a boot-read field changed (panel geometry, grid,
+        hostname, fbPsram). `400` when no recognized key is present.
+      responses:
+        "200": { description: "{ok,applied,rebootNeeded}" }
+  /api/gestures:
+    get:
+      tags: [Status]
+      summary: Gesture detection state (v3.15, `claps`/`taps` tokens)
+      description: |
+        Clap (microphone transient) and tap (QMI8658 hardware tap engine) detection.
+        Enable via `clapEnabled`/`tapEnabled` in `POST /api/config/settings` (both default
+        off; clap detection keeps the microphone capturing). Events are pushed on the SSE
+        stream (`GET /api/events`) as `event: clap` / `event: tap` with `{count, seq}` —
+        count 2 = a double (clap bursts are counted; two single events within 1 s also
+        pair). **A double gesture dismisses a running timer or ringing alarm on-device**
+        (logged to the on-card event log) and is not forwarded to SSE. Any gesture not consumed by a dismissal flashes a
+        4×4 acknowledgment square in the panel's top-right corner (~220 ms, cyan =
+        clap, amber = tap). This endpoint also
+        carries tuning telemetry (peak mic RMS + spectral fraction, peak accel deviation
+        in milli-g, reset on read) and lifetime event counters.
+      responses:
+        "200": { description: "{claps:{available,enabled,total,peakRms,peakBright,peakFloor}, taps:{available,enabled,total,peakMg}}" }
+  /api/timer:
+    get:
+      tags: [Status]
+      summary: Countdown timer state (v3.14, `timer` token)
+      responses:
+        "200": { description: "{active, remaining (s), alarmFiring}" }
+    post:
+      tags: [Status]
+      summary: Start or stop the countdown (v3.14)
+      description: |
+        `{"sec":N}` or `{"min":N}` (1 s .. 24 h) starts/replaces the countdown — rendered
+        full-screen on the panel over every other mode, chiming at zero (the chime
+        deliberately overrides Quiet Time; the speaker master enable still applies).
+        `{"stop":true}` cancels the timer and dismisses a ringing alarm.
+      responses:
+        "200": { description: ok }
+        "400": { description: bad duration }
+  /api/alarms:
+    get:
+      tags: [Status]
+      summary: The four daily alarm slots (v3.14)
+      responses:
+        "200": { description: "[{time:\"HH:MM\", days:bitmask(bit0=Sun), enabled}] x4" }
+    post:
+      tags: [Status]
+      summary: Replace the alarm slots (v3.14)
+      description: |
+        Body: up to 4 `{time,days,enabled}` slots (omitted slots are disabled). Times are
+        the user's local "HH:MM"; the first slot may carry `tzOffsetMin` (browser minutes
+        east of UTC, shared with the quiet/dim schedules). Alarms ring for up to 90 s
+        with a full-screen flash, **overriding Quiet Time by design**; dismiss via
+        `POST /api/timer {"stop":true}`. Persisted in NVS.
+      responses:
+        "200": { description: ok }
+        "400": { description: bad time }
+  /api/sd:
+    get:
+      tags: [Status]
+      summary: microSD card presence + capacity (v3.10, `sd` token)
+      description: |
+        The onboard TF card slot (SD_MMC 1-bit). The firmware also keeps its own event log
+        on the card at `/logs/gateway.log` (v3.13.2): boot post-mortems, watchdog reboot
+        reasons, OTA events and a 10-minute heap heartbeat — fetch it via `/api/sd/get`.
+        Present only when a card is mounted at boot
+        (advertised as the `sd` capability token; the same info also rides `GET /api/status`
+        under `sd`). Always answers 200; `present:false` when no card is fitted.
+      responses:
+        "200":
+          description: Card presence and capacity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  present: { type: boolean }
+                  type:    { type: string, description: "MMC | SDSC | SDHC" }
+                  sizeMB:  { type: integer }
+                  usedMB:  { type: integer }
+                  freeMB:  { type: integer }
+  /api/sd/list:
+    get:
+      tags: [Status]
+      summary: List a directory on the SD card (v3.10)
+      parameters:
+        - { name: path, in: query, schema: { type: string, default: "/" }, description: "card-absolute path; must start with /, no .." }
+      responses:
+        "200":
+          description: One directory level
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    dir:  { type: boolean }
+                    size: { type: integer, description: "bytes (0 for directories)" }
+        "400": { description: Bad path }
+        "404": { description: Not a directory }
+        "503": { description: No card mounted }
+  /api/sd/get:
+    get:
+      tags: [Status]
+      summary: Download a file from the SD card (v3.10)
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string }, description: "card-absolute path" }
+        - { name: tail, in: query, schema: { type: integer }, description: "v3.14: stream only the last N bytes (the dashboard log viewer)" }
+      responses:
+        "200": { description: Raw file bytes, application/octet-stream }
+        "400": { description: Bad path / is a directory }
+        "404": { description: Not found }
+        "503": { description: No card mounted }
+  /api/sd/mkdir:
+    put:
+      tags: [Status]
+      summary: Create a directory on the SD card (v3.10)
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string }, description: "card-absolute path; the parent directory must already exist" }
+      responses:
+        "200": { description: Created }
+        "400": { description: Bad path }
+        "409": { description: Already exists }
+        "503": { description: No card mounted }
+        "507": { description: "mkdir failed (parent missing?)" }
+  /api/sd/put:
+    put:
+      tags: [Status]
+      summary: Upload a file to the SD card (v3.10)
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string }, description: "card-absolute path; overwrites" }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        "200": { description: "{ok:true, bytes:N}" }
+        "400": { description: Bad path / truncated body }
+        "503": { description: No card mounted }
+        "507": { description: Write failed }
+  /api/sd/delete:
+    delete:
+      tags: [Status]
+      summary: Delete a file or folder from the SD card (v3.10)
+      description: |
+        Removes a file, an empty directory, or — with `recursive=1` — a directory and all its
+        contents. A non-empty directory without `recursive=1` returns 409. The card root (`/`)
+        cannot be deleted.
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string }, description: "card-absolute path" }
+        - { name: recursive, in: query, schema: { type: string, enum: ["1"] }, description: "set to 1 to delete a directory and everything under it" }
+      responses:
+        "200": { description: Deleted }
+        "400": { description: Bad path / refusing to delete the card root }
+        "404": { description: Not found }
+        "409": { description: Directory not empty (pass recursive=1) }
+        "503": { description: No card mounted }
+        "507": { description: Delete failed }
+  /api/sound:
+    get:
+      tags: [Status]
+      summary: Speaker state (v3.6)
+      responses:
+        "200":
+          description: Availability + playback state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean, description: "ES8311 codec found at boot" }
+                  playing:   { type: boolean }
+    post:
+      tags: [Status]
+      summary: Play tones or a WAV from the SD card (v3.6 / v3.13)
+      description: |
+        Tones: `{freq,ms,vol}` or `{notes:[[f,ms],…],vol}`; `{stop:true}` halts anything.
+        **WAV (v3.13):** `{"wav":"/sounds/x.wav","vol":80}` streams a file from the SD
+        card — strict 16-bit 16 kHz mono/stereo PCM (the duplex I2S clock is fixed).
+        Replaces queued tones; a newer request replaces it; Quiet Time silences it.
+        Format problems are logged on-device (the request 200s once the file exists).
+      description: |
+        On-device tone synthesis through the ES8311 DAC and power amp: one tone
+        (`freq` 20–8000 Hz, `ms` ≤ 2000) or a `notes` sequence (`[[freq,ms],…]`,
+        freq 0 = rest, ≤ 32 notes), `vol` 0–100. `{"stop":true}` stops immediately.
+        Anti-click envelopes; the amp powers only while playing. **Quiet Time silences
+        the speaker**: a play is refused with `409`, and turning Quiet Time on stops any
+        tone mid-play. The settings master enable (`403` when off) and master volume
+        (scales `vol`, v3.6.1) apply too. No PCM upload — tones only, by design.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                freq:  { type: integer, minimum: 20, maximum: 8000 }
+                ms:    { type: integer, minimum: 1, maximum: 2000 }
+                notes: { type: array, items: { type: array, items: { type: integer } } }
+                vol:   { type: integer, minimum: 0, maximum: 100, default: 60 }
+                stop:  { type: boolean }
+            example: { notes: [[523,150],[659,150],[784,300]], vol: 70 }
+      responses:
+        "200":
+          description: Queued (or stopped)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:     { type: boolean }
+                  queued: { type: integer }
+        "400": { description: Nothing playable in the request, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "403": { description: Speaker disabled in settings (soundEnabled=false), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: Quiet Time is active, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: No speaker codec on this board, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /api/canvas:
+    get:
+      tags: [Canvas]
+      summary: Raw-canvas state and panel size (v1.13)
+      description: |
+        The raw-canvas API is unique to the Matrix gateway: it hands you the HUB75 panel as a
+        plain framebuffer, bypassing the split-flap wall entirely. While a canvas is **active**
+        the reel renderer stands down (the same way it does during an OTA) and these endpoints
+        own every pixel; releasing it repaints the wall from the modules' current state. Nothing
+        is persisted — a reboot returns to the wall.
+
+        This GET reports whether a canvas is active, the panel dimensions (so a client can size
+        the frames it pushes), which on-device `effect` (if any) is currently running, whether
+        an uploaded animation (`anim`) or a ticker is playing, and (v3.1) the atlas library
+        state: the sticky-**bound** sheet (or null) and every resident sheet name.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active:  { type: boolean, example: false }
+                  width:   { type: integer, example: 128 }
+                  height:  { type: integer, example: 32 }
+                  formats: { type: array, items: { type: string }, example: [rgb888, rgb565, qoi] }
+                  effect:  { type: string, example: none, description: Running on-device effect, or "none". }
+                  anim:    { type: boolean, example: false, description: An uploaded animation is playing. }
+                  ticker:  { type: boolean, example: false, description: A ticker is scrolling. }
+                  atlas:
+                    type: object
+                    description: "Atlas library state (v3.1): the sheet the ops `sprite` op blits from, and every resident sheet."
+                    properties:
+                      bound:  { type: [string, "null"], example: "weather-3fa2" }
+                      loaded: { type: array, items: { type: string }, example: ["weather-3fa2","icons-77c1"] }
+                  effects: { type: array, items: { type: string }, example: [plasma, fire, matrix, fliporama, clock, life] }
+    post:
+      tags: [Canvas]
+      summary: Take over the panel, or release it back to the wall (v1.13)
+      description: |
+        `{"active": true}` blanks the panel and stands the reel renderer down so the canvas
+        endpoints own it. `{"active": false}` returns to the split-flap wall. Pushing a frame or
+        ops also takes over automatically, so this is only needed to blank-and-hold, or to release.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                active: { type: boolean }
+            example: { active: true }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:     { type: boolean, example: true }
+                  active: { type: boolean, example: true }
+
+  /api/canvas/frame:
+    get:
+      tags: [Canvas]
+      summary: Read the live panel back as raw pixels (v1.20)
+      description: |
+        A screenshot of whatever is on screen — wall, effect, canvas, animation or ticker —
+        reconstructed from the framebuffer and quantised to the panel's bit depth. Read-only:
+        it never takes the panel over. The body is raw pixels, **width × height**, row-major,
+        top-left origin, in the format chosen by `?fmt=` (rgb888 unless `rgb565` is asked for);
+        the dimensions and format are echoed in the `X-Canvas-*` headers so a client need not
+        have called `GET /api/canvas` first.
+      parameters:
+        - name: fmt
+          in: query
+          required: false
+          schema: { type: string, enum: [rgb888, rgb565], default: rgb888 }
+          description: Pixel format of the returned bytes. Anything other than `rgb565` means rgb888.
+      responses:
+        "200":
+          description: Raw pixel bytes (width × height × 3 for rgb888, × 2 for rgb565 big-endian)
+          headers:
+            X-Canvas-Width:
+              schema: { type: integer }
+              description: Panel width in pixels
+            X-Canvas-Height:
+              schema: { type: integer }
+              description: Panel height in pixels
+            X-Canvas-Format:
+              schema: { type: string, enum: [rgb888, rgb565] }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "503":
+          description: Panel not running (the gateway is headless), or the readback buffer could not be allocated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: Internal heap is low — streaming a screenshot now could destabilise the gateway; retry shortly
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    put:
+      tags: [Canvas]
+      summary: Blit a full raw frame — draw anything (v1.13)
+      description: |
+        A complete frame as raw pixel bytes: **width × height** pixels, row-major, top-left
+        origin. Render whatever you like on the client and push the pixels. Auto-takes-over the
+        panel. The body is streamed straight to the back buffer, so no multi-KB frame is buffered
+        whole.
+
+        The **pixel format is inferred from the body length** — a full frame is unambiguously one
+        of these, so nothing else has to be signalled:
+
+        * `width × height × 3` bytes → **rgb888**, `R G B` per pixel.
+        * `width × height × 2` bytes → **rgb565**, big-endian (high byte first).
+
+        Any other length is a `400`. The `fmt` query arg is accepted as a hint but ignored by the
+        firmware (a raw-body handler cannot read URL args); the length is authoritative. Get the
+        dimensions from `GET /api/canvas`. rgb565 halves the upload — worth it for animation, and
+        the panel's colour depth loses nothing.
+
+        When a transition is configured (`POST /api/canvas/transition`, v2.1), the incoming frame
+        is staged in PSRAM and presented through the configured tween instead of a hard cut.
+        Full-frame PUTs only — rect, qoi and anim are unaffected. If the staging buffers cannot
+        be allocated the frame falls back to a direct present (a hard cut beats a 500).
+      parameters:
+        - name: fmt
+          in: query
+          required: false
+          schema: { type: string, enum: [rgb888, rgb565] }
+          description: Optional hint; the actual format is inferred from the body length.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Frame presented
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:     { type: boolean, example: true }
+                  width:  { type: integer, example: 128 }
+                  height: { type: integer, example: 32 }
+                  pixels: { type: integer, example: 4096 }
+        "400":
+          description: Body length is neither width×height×3 (rgb888) nor width×height×2 (rgb565)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running (the gateway is headless)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/rect:
+    put:
+      tags: [Canvas]
+      summary: Update one rectangle without resending the whole panel (v1.18)
+      description: |
+        A partial update, drawn **on top of what is on screen** — the back buffer is synced to
+        the live frame first, so everything outside the rectangle is untouched. Auto-takes-over
+        the panel.
+
+        The body is an **8-byte big-endian header** — `x`, `y`, `w`, `h`, one unsigned 16-bit
+        each — followed by `w × h` pixels, row-major. As with `PUT /api/canvas/frame` the pixel
+        format follows from the remaining body length: `w × h × 3` is rgb888, `w × h × 2` is
+        rgb565 big-endian. Off-panel pixels are dropped, not clamped.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Rectangle presented
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  x:  { type: integer, example: 10 }
+                  y:  { type: integer, example: 4 }
+                  w:  { type: integer, example: 32 }
+                  h:  { type: integer, example: 16 }
+        "400":
+          description: Malformed body — missing/short header, w or h of 0, or a body that is not w×h×3 or w×h×2 pixels
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running (the gateway is headless)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/rects:
+    put:
+      tags: [Canvas]
+      summary: Multi-rect delta update (v3.1)
+      description: |
+        One binary body carrying **N changed regions**, drawn over what is on screen and
+        presented once — the network fix for full-frame re-sends: a client that diffs its
+        frames sends 10–50× less. Advertised as `canvas.rects` in capabilities. No
+        transitions (deltas are incremental updates, not presents). Big-endian body:
+        `u16 count (≤256), u8 fmt (2 = rgb565 BE, 3 = rgb888), u8 reserved(0)`, then per
+        rect `u16 x, u16 y, u16 w, u16 h` followed by `w×h×bpp` pixels. Body cap: two
+        full frames.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Drawn and presented
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:    { type: boolean, example: true }
+                  rects: { type: integer, example: 3 }
+        "400":
+          description: Malformed header, geometry, or truncated body
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "413":
+          description: Body exceeds two full frames — send a frame instead
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running or out of memory
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: Internal heap low — retry shortly
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/audio:
+    get:
+      tags: [Canvas]
+      summary: Microphone features (v3.5)
+      description: |
+        The live audio features behind the audio-reactive effects: whether the ES7210
+        dual-microphone ADC is present, whether capture is currently running (it starts
+        with the first audio consumer and self-stops ~3 s after the last one leaves), and
+        the current level / peak / beat / 16 log-band spectrum. `seq` increments per 8 ms
+        DSP hop — a static value means capture is idle. These are derived numbers only;
+        audio samples are never stored or exposed by any endpoint.
+      responses:
+        "200":
+          description: Audio frontend state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean, description: "ES7210 found and configured at boot" }
+                  capturing: { type: boolean }
+                  seq:       { type: integer }
+                  level:     { type: number, description: "0–1 auto-gained loudness" }
+                  peak:      { type: number }
+                  beat:      { type: boolean }
+                  bassRaw:   { type: number }
+                  bands:
+                    type: array
+                    items: { type: number }
+                    description: "16 log-spaced bands, 125 Hz–7.9 kHz, each 0–1"
+
+  /api/canvas/opsb:
+    post:
+      tags: [Canvas]
+      summary: Binary draw commands (v3.5)
+      description: |
+        The binary twin of `POST /api/canvas/ops` — a fixed-layout encoding
+        (`canvas.opsBin` capability) that skips JSON parsing
+        entirely: ~6× smaller and 1.5–1.9× the frame rate on op-heavy scenes. Same
+        semantics (auto-present unless the batch contains SHOW); a malformed batch is
+        a `400` with nothing drawn presented. Game-rate clients should carry the same
+        bytes in stream record `0x06` instead of this endpoint.
+
+        All integers big-endian; coordinates signed int16. Each op is `u8 opcode` +
+        fixed fields: `0x01` CLEAR rgb · `0x02` PIXEL x y rgb · `0x03`/`0x04`
+        HLINE/VLINE x y len rgb · `0x05` LINE x y x1 y1 t rgb · `0x06` RECT x y w h
+        flags t rgb (flags bit0 fill) · `0x07` CIRCLE x y r flags t rgb · `0x08`
+        ELLIPSE x y rx ry flags t rgb · `0x09` TRIANGLE 3×(x y) flags rgb · `0x0A`
+        ROUNDRECT x y w h r flags rgb · `0x0B` GRADIENT x y w h from(3) to(3) dir ·
+        `0x0C` ARC x y r t start end flags rgb · `0x0D` POLY n flags t rgb n×(x y)
+        (flags bit0 fill, bit1 closed outline) · `0x0E` CLIP x y w h (w≤0 clears) ·
+        `0x0F` ORIGIN x y · `0x10` TEXT x y size flags rgb [outline rgb] [shadow rgb]
+        len utf8 (flags bits0-1 align, bit2 aa, bit3/4 has-outline/shadow) · `0x11`
+        SPRITE i x y flags (bit0/1 flip h/v, bits2-3 rot/90, bits4-5 scale−1) ·
+        `0x12` SCROLL dx dy rgb · `0x13` SHOW · `0x14` BLEND mode · `0x15` ALPHA a
+        (both fw 3.8).
+
+        Every coordinate runs through the same affine transform as the JSON decoder
+        (`ORIGIN` is a matrix reset + pure translate):
+        `0x16` SAVE · `0x17` RESTORE (stack depth 8) · `0x18` TRANSLATE x y ·
+        `0x19` SCALE sx sy (u16 8.8 fixed-point; sy 0 = uniform) · `0x1A` ROTATE deg
+        (s16, clockwise) · `0x1B` LAYER · `0x1C` COMPOSITE x y mode alpha ·
+        `0x1D` DEFINE id len(u16) blob (macro id 0–7; blob is embedded binary ops) ·
+        `0x1E` CALL id x y (scoped replay under a pushed translate, nestable to
+        depth 4) · `0x1F` BEZIER n t flags rgb n×(x y) (n 3|4; flags bit0 aa) ·
+        `0x20` AALINE x y x1 y1 rgb. Additive flag bits: CIRCLE flags bit1 = aa
+        outline, POLY flags bit2 = aa. Strict decode: an unknown opcode or a
+        truncated op fails the batch.
+      requestBody:
+        required: true
+        content: { application/octet-stream: { schema: { type: string, format: binary } } }
+      responses:
+        "200":
+          description: Applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean }
+                  applied: { type: integer }
+        "400":
+          description: Malformed binary batch (nothing presented)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: Canvas stream active
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/stream:
+    put:
+      tags: [Canvas]
+      summary: Persistent TLV draw channel (v3.2)
+      description: |
+        One long-lived PUT carrying draw records back-to-back, executed as they arrive —
+        no per-frame HTTP round trip and **no per-record response**, so the ~40 ms
+        delayed-ACK floor on request/response traffic does not apply. Advertised as
+        `canvas.stream` in capabilities.
+
+        Record framing (big-endian): `u8 type, u24 payloadLength, payload`.
+
+        | type | payload | effect |
+        |------|---------|--------|
+        | 0x01 | `u8 fmt (2 = rgb565 BE, 3 = rgb888)` + W×H×bpp pixels | full frame — draw, no present |
+        | 0x02 | the `PUT /api/canvas/rects` body verbatim | rect deltas — draw, no present |
+        | 0x03 | a JSON array as `POST /api/canvas/ops` | ops (present only via its `show` op) |
+        | 0x04 | sheet name | bind a named atlas sheet |
+        | 0x05 | *(empty)* | present the back buffer |
+        | 0x06 | a binary op batch as `POST /api/canvas/opsb` (v3.5) | zero-parse ops — present via its SHOW op |
+        | 0x00 | *(empty)* | end — the gateway answers `200 {"ok":true,"records":N}` and closes the socket |
+
+        Client requirements:
+        - Declare a large placeholder `Content-Length` (inbound chunked encoding is not
+          supported) and simply stop at the end record.
+        - **Send the first record in the same write as the request head.** A bare head
+          with a body-carrying Content-Length parse-blocks the single HTTP worker for
+          the 8 s socket timeout (a stock esp_http_server behaviour, not specific to
+          this route) — any body byte alongside the head avoids it entirely.
+        - One stream at a time; the drawing REST endpoints answer 409 while it is open.
+        - A malformed or oversized record aborts the stream; the panel keeps its last
+          frame. Streams idle for more than 30 s are dropped.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: End record received — stream closed cleanly
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean, example: true }
+                  records: { type: integer, example: 83 }
+        "409":
+          description: A stream is already open
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running, OTA in progress, or out of memory
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: Internal heap low — retry shortly
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    get:
+      tags: [Canvas]
+      summary: Stream channel state (v3.2)
+      description: |
+        Diagnostics and discovery: whether a stream is open, records executed, pump
+        activity, and why the previous stream ended.
+      responses:
+        "200":
+          description: Channel state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  open:      { type: boolean }
+                  records:   { type: integer }
+                  ticks:     { type: integer }
+                  lastRecv:  { type: integer }
+                  inRec:     { type: boolean }
+                  need:      { type: integer }
+                  got:       { type: integer }
+                  lastClose: { type: string, example: end }
+
+  /api/canvas/qoi:
+    put:
+      tags: [Canvas]
+      summary: Blit a full-panel QOI image (v1.18)
+      description: |
+        A complete frame as a [QOI](https://qoiformat.org) image — typically 3–10× smaller than
+        raw rgb888, decoded on-device in one pass. The image's width and height **must equal the
+        panel's** (from `GET /api/canvas`); alpha is ignored. Auto-takes-over the panel. The
+        compressed body is buffered whole (in PSRAM when available) before decoding.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Frame presented
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:     { type: boolean, example: true }
+                  width:  { type: integer, example: 128 }
+                  height: { type: integer, example: 32 }
+        "400":
+          description: Not a QOI image, or its dimensions do not match the panel
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running, or the decode buffer could not be allocated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: Internal heap is low — the upload is refused rather than risking a reboot; retry shortly
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/anim:
+    put:
+      tags: [Canvas]
+      summary: Upload a looping animation that plays on-device (v1.18)
+      description: |
+        A short loop of full-panel frames, streamed into PSRAM and played back by the gateway at
+        a set fps — the client can disconnect and the animation keeps running until something
+        else takes the panel (or a reboot returns to the wall). The store holds up to 8 MB
+        (~256 rgb565 frames at 256×64); persist the loaded loop with
+        `POST /api/canvas/anim/save` (v2.1) and it survives reboots as a named library entry.
+
+        The body is a **14-byte big-endian header** followed by the frame data:
+
+        | Offset | Size | Field |
+        |---|---|---|
+        | 0 | 4 | Magic `MPGA` |
+        | 4 | 1 | Version, must be `1` |
+        | 5 | 1 | Pixel format: `2` = rgb565 (big-endian), `3` = rgb888 |
+        | 6 | 1 | Playback fps |
+        | 7 | 1 | Flags: bit 0 = loop |
+        | 8 | 2 | Frame width (must equal the panel's) |
+        | 10 | 2 | Frame height (must equal the panel's) |
+        | 12 | 2 | Frame count |
+
+        …then `frames × w × h × bpp` bytes of frame data, frame after frame, row-major.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Animation stored and playing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:     { type: boolean, example: true }
+                  frames: { type: integer, example: 24, description: "Frames loaded" }
+        "400":
+          description: Bad MPGA header (magic/version/dimensions) or truncated upload
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "413":
+          description: Animation exceeds the PSRAM budget
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running, or the frame store could not be allocated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: Internal heap is low — the upload is refused rather than risking a reboot; retry shortly
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/anim/save:
+    post:
+      tags: [Canvas]
+      summary: Persist the loaded animation to the on-device library (v2.1)
+      description: |
+        Writes the animation currently in the PSRAM store — whether it arrived via
+        `PUT /api/canvas/anim`, `PUT /api/canvas/gif` or a previous `anim/play` — to FATFS as
+        `/anim/<name>.mpg`, byte-identical to the `MPGA` wire format. The write is atomic-ish
+        (temp file, then rename), so an interrupted save never corrupts an existing entry.
+        The 23.9 MB FATFS partition holds several full-size loops.
+
+        Names are 1–24 characters of `a-z 0-9 - _`. Saving over an existing name replaces it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: "^[a-z0-9_-]{1,24}$", example: "rainbow" }
+            example: { name: "rainbow" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          description: Bad name (1–24 chars of a-z 0-9 - _)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: Nothing loaded to save — upload an animation first
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Filesystem not mounted
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: Filesystem full or the write failed — nothing replaced
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/anim/play:
+    post:
+      tags: [Canvas]
+      summary: Load a library animation and play it (v2.1)
+      description: |
+        **SD streaming (v3.13):** `{"path":"/movies/x.mpg"}` plays an MPGA straight from
+        the SD card, one frame in memory at a time — no PSRAM size cap, length bounded
+        only by the card. `{"name":…}` keeps playing from the FATFS library store.
+        Loads `/anim/<name>.mpg` into the PSRAM store and starts playback — through the same
+        path an HTTP upload takes, so playback, save and the `bootAnim` config field all behave
+        identically on a library entry and a fresh upload. Takes the panel over like an upload
+        does.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: "^[a-z0-9_-]{1,24}$", example: "rainbow" }
+            example: { name: "rainbow" }
+      responses:
+        "200":
+          description: Animation loaded and playing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:     { type: boolean, example: true }
+                  frames: { type: integer, example: 96, description: "Frames loaded from the file" }
+        "400":
+          description: Bad name, or the file is corrupt/truncated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "404":
+          description: No such animation
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: Quiet Time is active — the panel must stay dark
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "413":
+          description: The file exceeds the animation store limit
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running, filesystem not mounted, or the store could not be allocated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/anim/delete:
+    post:
+      tags: [Canvas]
+      summary: Delete a library animation (v2.1)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: "^[a-z0-9_-]{1,24}$", example: "rainbow" }
+            example: { name: "rainbow" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          description: Bad name (1–24 chars of a-z 0-9 - _)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "404":
+          description: No such animation
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Filesystem not mounted
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: The delete failed
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/anims:
+    get:
+      tags: [Canvas]
+      summary: List the animation library (v2.1)
+      description: >-
+        Every saved animation, with the metadata re-read from each file's header — the list is
+        always the truth on disk. Streamed, so a full library costs no large allocation.
+      responses:
+        "200":
+          description: The library (may be empty)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:   { type: string,  example: "rainbow" }
+                    bytes:  { type: integer, example: 3145742, description: "File size on FATFS" }
+                    frames: { type: integer, example: 96 }
+                    w:      { type: integer, example: 128 }
+                    h:      { type: integer, example: 32 }
+                    fps:    { type: integer, example: 15 }
+                    loop:   { type: boolean, example: true }
+
+  /api/canvas/transition:
+    post:
+      tags: [Canvas]
+      summary: Configure how full-frame canvas PUTs present (v2.1)
+      description: |
+        Sets a transition that subsequent `PUT /api/canvas/frame` uploads present through: the
+        incoming frame is staged in PSRAM, the outgoing frame is captured from the framebuffer,
+        and the tween is rendered on-device. **Persisted since v3.7.2** — saved to NVS and
+        restored at boot (it was runtime-only before, resetting to hard cuts on every
+        reboot); `GET /api/config` reports it as `transitionType`/`transitionMs`. rect, qoi
+        and anim presents are unaffected.
+
+        * `none` — a hard cut (the default).
+        * `crossfade` — blend old → new.
+        * `wipe` — the new frame sweeps in left to right.
+        * `slide` — the new frame pushes the old off to the left.
+
+        `ms` is the tween duration, clamped to 100–2000 (default 400).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type]
+              properties:
+                type: { type: string, enum: [none, crossfade, wipe, slide] }
+                ms:   { type: integer, minimum: 100, maximum: 2000, default: 400 }
+            example: { type: crossfade, ms: 400 }
+      responses:
+        "200":
+          description: Transition configured
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:   { type: boolean, example: true }
+                  type: { type: string, example: crossfade }
+                  ms:   { type: integer, example: 400 }
+        "400":
+          description: type is not one of none|crossfade|wipe|slide
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/atlas:
+    get:
+      tags: [Canvas]
+      summary: List the named atlas library (v3.1)
+      description: |
+        Every sheet the gateway knows: **resident** ones (in PSRAM, blittable right now) and
+        **persisted** ones (`/atlas/<name>.mpta` on FATFS, lazy-loaded on their next bind).
+        A sheet can be both. Content-fingerprint names (e.g. `dash-a1b2c3`) make "name is in
+        this list" mean "exactly these tiles are available" — the gateway does no hashing.
+      responses:
+        "200":
+          description: The library
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:      { type: string,  example: "weather-3fa2" }
+                    tiles:     { type: integer, example: 16 }
+                    w:         { type: integer, example: 16 }
+                    h:         { type: integer, example: 16 }
+                    fmt:       { type: integer, example: 2, description: "2 = rgb565 BE, 3 = rgb888" }
+                    bytes:     { type: integer, example: 8192 }
+                    resident:  { type: boolean, example: true }
+                    persisted: { type: boolean, example: false }
+
+  /api/canvas/atlas/{name}:
+    put:
+      tags: [Canvas]
+      summary: Upload a named sprite tile sheet (v3.1 — replaces the unnamed PUT)
+      description: |
+        One named tile sheet for the ops `sprite` op. Up to **16 resident sheets** share a
+        **4 MB** PSRAM budget (per-sheet cap **2 MB**), least-recently-used sheets evicted
+        when it fills — a persisted victim lazy-reloads on its next bind; a non-persisted one
+        is gone (the client can see the list and re-upload). The upload builds in a fresh
+        allocation and **publishes atomically at commit**, so a bound sheet is never blitted
+        half-written. Name grammar: `[a-z0-9._-]{1,32}` (it is a filename when persisted).
+
+        The body is a **12-byte big-endian header** followed by the tile pixels:
+
+        | Offset | Size | Field |
+        |---|---|---|
+        | 0 | 4 | Magic `MPTA` |
+        | 4 | 1 | Version, must be `1` |
+        | 5 | 1 | Pixel format: `2` = rgb565 (big-endian), `3` = rgb888 |
+        | 6 | 2 | Tile width |
+        | 8 | 2 | Tile height |
+        | 10 | 2 | Tile count |
+
+        …then `tiles × tileW × tileH × bpp` bytes, tile after tile, row-major. **Magenta is
+        transparent** — `0xF81F` in rgb565, `(255, 0, 255)` in rgb888.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[a-z0-9._-]{1,32}$" }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Sheet stored (resident; not persisted until /save)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:    { type: boolean, example: true }
+                  name:  { type: string,  example: "weather-3fa2" }
+                  bytes: { type: integer, example: 8192 }
+        "400":
+          description: Bad name, bad MPTA header, or truncated upload
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "413":
+          description: Sheet exceeds the 2 MB per-sheet cap
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Out of memory
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: Internal heap is low — refused rather than risking a reboot; retry shortly
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    delete:
+      tags: [Canvas]
+      summary: Delete a named sheet — resident and persisted (v3.1)
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404":
+          description: No such atlas anywhere
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/atlas/{name}/save:
+    post:
+      tags: [Canvas]
+      summary: Persist a resident sheet to FATFS (v3.1)
+      description: Writes `/atlas/<name>.mpta` (the raw MPTA image). An LRU-evicted persisted sheet lazy-reloads on its next bind. Nothing preloads at boot.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404":
+          description: No such resident atlas
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: Filesystem full or write failed
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/gif:
+    put:
+      tags: [Canvas]
+      summary: Import a GIF into the animation store (v2.1)
+      description: |
+        Upload an ordinary animated GIF and the gateway decodes it **on-device** into the same
+        animation store `PUT /api/canvas/anim` fills — so it plays immediately, and
+        `POST /api/canvas/anim/save` persists it to the library like any native upload.
+
+        The whole file is buffered in PSRAM (it is compressed), then decoded frame by frame:
+        GIF deltas, transparency and disposal are composited onto a full-panel canvas, a GIF
+        smaller than the panel is **centred on black**, and one larger than the panel is a
+        `400`. Playback fps is derived from the GIF's own frame delays, clamped to 1–30. The
+        upload is capped at 4 MB.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: GIF imported and playing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:     { type: boolean, example: true }
+                  frames: { type: integer, example: 42, description: "Frames decoded into the store" }
+                  fps:    { type: integer, example: 12, description: "Playback rate derived from the GIF's frame delays (1–30)" }
+        "400":
+          description: Not a decodable GIF, larger than the panel, or truncated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "413":
+          description: GIF exceeds the 4 MB upload budget, or its frames exceed the animation store
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running, or a decode buffer could not be allocated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: Internal heap is low — the upload is refused rather than risking a reboot; retry shortly
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/font:
+    put:
+      tags: [Canvas]
+      summary: Upload a custom font into the "custom" slot (v2.1)
+      description: |
+        Installs an `MPFT` font blob — packed from a BDF face by `tools/fontpack.py` — into the
+        gateway's one custom-font slot. On success the face answers to the name **`custom`** in
+        the ticker's `font` field and the ops `text` op; persist it to the on-device library
+        with `POST /api/canvas/font/save`.
+
+        The blob is `"MPFT"(4) ver(1)=1 width(1) height(1) ascent(1)` then **216 CP1252 glyphs**
+        of `height` big-endian uint16 rows each (bit 15 = leftmost column). Faces up to 16 px
+        wide; at most 64 KB.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Font installed as the active custom face
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:     { type: boolean, example: true }
+                  font:   { type: string,  example: "custom" }
+                  w:      { type: integer, example: 8 }
+                  h:      { type: integer, example: 13 }
+                  ascent: { type: integer, example: 11 }
+        "400":
+          description: Bad MPFT header (magic/version/metrics) or a body that is not 8 + 216×height×2 bytes
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "413":
+          description: Font exceeds the 64 KB cap
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: The font table could not be allocated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/font/save:
+    post:
+      tags: [Canvas]
+      summary: Persist the custom font to the on-device library (v2.1)
+      description: >-
+        Writes the loaded custom face to FATFS as `/fonts/<name>.fnt` (the raw MPFT blob).
+        Same naming rule as the animation library — 1–24 characters of `a-z 0-9 - _` — and the
+        same atomic-ish temp-file-then-rename write. A saved face is then usable **by name** in
+        the ticker and ops `text` op, no re-upload needed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: "^[a-z0-9_-]{1,24}$", example: "orbitron8" }
+            example: { name: "orbitron8" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          description: Bad name (1–24 chars of a-z 0-9 - _)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: No custom font loaded — upload one first
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Filesystem not mounted
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: Filesystem full or the write failed — nothing replaced
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/font/delete:
+    post:
+      tags: [Canvas]
+      summary: Delete a library font (v2.1)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: "^[a-z0-9_-]{1,24}$", example: "orbitron8" }
+            example: { name: "orbitron8" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          description: Bad name (1–24 chars of a-z 0-9 - _)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "404":
+          description: No such font
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Filesystem not mounted
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "507":
+          description: The delete failed
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/fonts:
+    get:
+      tags: [Canvas]
+      summary: List the font library (v2.1)
+      description: >-
+        Every saved font, with the metrics re-read from each file's header — the list is always
+        the truth on disk. Streamed, like `/api/canvas/anims`.
+      responses:
+        "200":
+          description: The library (may be empty)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:   { type: string,  example: "orbitron8" }
+                    bytes:  { type: integer, example: 5624, description: "File size on FATFS" }
+                    w:      { type: integer, example: 8 }
+                    h:      { type: integer, example: 13 }
+                    ascent: { type: integer, example: 11 }
+
+  /api/canvas/ticker:
+    post:
+      tags: [Canvas]
+      summary: Scroll one line of text across the panel, rendered on-device (v1.18; overlay v2.1)
+      description: |
+        A right-to-left ticker the gateway renders itself — set it once and disconnect. By
+        default it takes the panel over like an effect; an **empty `text` stops the ticker**
+        (an overlay one included) and hands the panel back to the split-flap wall (allowed even
+        during Quiet Time — starting one is not).
+
+        **`overlay: true` (v2.1) composites instead of taking over**: the ticker is drawn as a
+        lower-third band over **whatever else is presenting** — the flap wall, an effect, an
+        animation, a pushed canvas frame — via a hook on every presented frame. An overlay
+        ticker **survives page and mode changes**; only an explicit stop (`{"text":""}`), Quiet
+        Time, or replacing it with a non-overlay ticker removes it. `band` (default `true`)
+        draws the black band behind the text; `false` scrolls the glyphs straight over the
+        content beneath.
+
+        `font` (v2.1) names a face for the text: `custom` is the uploaded slot
+        (`PUT /api/canvas/font`), any other name loads `/fonts/<name>.fnt` from the library.
+        Absent or unresolvable falls back to the built-in panel-sized face — a missing font
+        scrolls text, it never errors.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:  { type: string, description: "The line to scroll. Empty stops the ticker (overlay included)." }
+                color:
+                  type: array
+                  items: { type: integer, minimum: 0, maximum: 255 }
+                  minItems: 3
+                  maxItems: 3
+                  description: "[r, g, b], default white"
+                speed: { type: integer, minimum: 1, maximum: 20, default: 2 }
+                overlay:
+                  type: boolean
+                  default: false
+                  description: "Composite as a lower-third over whatever is presenting instead of taking the panel over (v2.1)."
+                band:
+                  type: boolean
+                  default: true
+                  description: "Draw the black band behind the text (v2.1). false scrolls the glyphs over the content beneath."
+                font:
+                  type: string
+                  description: "Face for the text (v2.1): \"custom\" or a library name. Unknown names fall back to the built-in face."
+            examples:
+              exclusive:
+                value: { text: "HELLO WORLD", color: [255, 200, 0], speed: 3 }
+              overlay:
+                value: { text: "BREAKING — the flaps keep flapping", color: [255, 255, 255], speed: 2, overlay: true }
+              custom_font:
+                value: { text: "HELLO", font: "orbitron8", speed: 3 }
+              stop:
+                value: { text: "" }
+      responses:
+        "200":
+          description: Ticker started (or stopped, for empty text)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean, example: true }
+                  active:  { type: boolean, example: true }
+                  overlay: { type: boolean, example: false, description: "Present when a ticker was started (v2.1)" }
+        "400":
+          description: Invalid JSON
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: Quiet Time is active — the panel must stay dark
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running (the gateway is headless)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/ops:
+    post:
+      tags: [Canvas]
+      summary: Draw commands — shapes, gradients, sprites, text, scroll (v1.13; 11 ops v1.25; sprite v2.1; 5 ops + styles v3.5)
+      description: |
+        A JSON **array** of drawing ops, applied in order, then the frame is presented. Handy for
+        shapes and labels without composing a whole frame client-side. Auto-takes-over the panel.
+
+        **fw 3.5 additions** (`GET /api/capabilities` `canvas.ops` is authoritative):
+        - `arc` — `{x,y,r,t,start,end,fill}`: arc/annulus segment or pie slice; 0° = 12
+          o'clock, clockwise. `t` = ring thickness (default 2), `fill` draws the slice.
+        - `poly` — closed polygon from `points:[[x,y],…]` (≤16 vertices); `fill` (default
+          true) even-odd scanline, else outline with thickness `t`.
+        - `clip` — `{x,y,w,h}` clips all later ops to the window; bare `{"op":"clip"}`
+          clears. Batch-scoped (reset between batches).
+        - `origin` — `{x,y}` translates every later coordinate (points arrays included);
+          bare form resets. Batch-scoped.
+        - `textbox` — `{x,y,w,h,s,size,font,align,valign,color}`: word-wrapped (explicit
+          `\n` honoured), aligned both axes, clipped to the box.
+        - Thickness `t` on `line`, `polyline`, and `rect`/`circle`/`ellipse` outlines.
+        - `text` styles: `"aa":true` renders smooth Orbitron (sizes 34/24/13 px pick by
+          `size`; charset A–Z 0–9 `:.-+%/`, folded to uppercase); `"outline":[r,g,b]` /
+          `"shadow":[r,g,b]` layer under the bitmap-font path.
+        - `sprite` transforms: `flip:"h"|"v"|"hv"`, `rot:90|180|270`, `scale:1..4`.
+        - **Compositing (fw 3.8):** a colour may carry a 4th alpha element `[r,g,b,a]`
+          (0–255), and `{"op":"blend","mode":"over|add|multiply|screen|max"}` sets a
+          batch-scoped blend mode — `add` is additive LED-glow. Advertised as
+          `canvas.compositing`.
+        - **`aa`:true (fw 3.8)** on `line`/`polyline`/`poly`/`circle` for anti-aliased
+          strokes; **`bezier`** op (`points` of 3=quadratic or 4=cubic, `aa`, `t`).
+        - **Stroke styling (fw 3.8.1):** `cap` (`butt`/`round`/`square`), `join`
+          (`miter`/`round`) and `dash` (`[on,off]`) on `line`/`polyline`/`poly`.
+        - **Transform stack (fw 3.9):** `{"op":"translate","x":,"y":}`,
+          `{"op":"scale","x":,"y":}` (`y` defaults to `x`), `{"op":"rotate","deg":}`
+          compose an affine transform; `{"op":"save"}` / `{"op":"restore"}` push/pop it
+          (depth 8). Point/line ops (`line`, `polyline`, `poly`, `triangle`, `bezier`,
+          `pixel`) transform every vertex, so rotation works; box-anchored fills
+          (`rect`, `circle`, `ellipse`, `roundrect`, `arc`) transform the anchor and scale
+          the size but stay axis-aligned (rotate a sprite via its own `rot`). `origin`
+          is the backward-compatible pure-translate reset. Batch-scoped.
+        - **Offscreen layers (fw 3.9):** `{"op":"layer"}` redirects subsequent draws into
+          a shadow buffer; `{"op":"composite","x":,"y":,"mode":"over|add|multiply|screen|max",
+          "alpha":0-255}` blends that whole group back at an offset with one group blend +
+          opacity (group opacity — the thing per-op alpha can't express). One layer at a
+          time; an unclosed layer is discarded at batch end. Advertised as
+          `canvas.compositing.layers`.
+        - **Ops macros (fw 3.9):** `{"op":"define","name":,"ops":[…]}` registers a reusable
+          op sequence; `{"op":"call","name":,"x":,"y":}` replays it under a pushed transform
+          translated by `(x,y)`. Batch-scoped (≤12 macros), nestable to depth 4. Advertised
+          as `canvas.compositing.macros`.
+        Colours are `[r, g, b]` (0–255), defaulting to white — black for `clear`. Off-panel pixels
+        are dropped. Unknown ops are skipped. The advertised op list is `capabilities.canvas.ops`.
+
+        Ops (everything marked *(v1.25)* was added then):
+        * `{"op":"clear"}` or `{"op":"clear","color":[r,g,b]}` — fill the whole panel
+        * `{"op":"pixel","x":,"y":,"color":[…]}`
+        * `{"op":"hline","x":,"y":,"w":,"color":[…]}` / `{"op":"vline","x":,"y":,"h":,"color":[…]}`
+        * `{"op":"line","x":,"y":,"x1":,"y1":,"color":[…]}` — an arbitrary (Bresenham) line *(v1.25)*
+        * `{"op":"rect","x":,"y":,"w":,"h":,"color":[…],"fill":true|false}`
+        * `{"op":"circle","x":cx,"y":cy,"r":radius,"color":[…],"fill":true|false}` — outline or disc *(v1.25)*
+        * `{"op":"ellipse","x":cx,"y":cy,"rx":,"ry":,"color":[…],"fill":true|false}` — axis-aligned ellipse *(v1.25)*
+        * `{"op":"triangle","x":,"y":,"x1":,"y1":,"x2":,"y2":,"color":[…],"fill":true|false}` — three vertices *(v1.25)*
+        * `{"op":"roundrect","x":,"y":,"w":,"h":,"r":radius,"color":[…],"fill":true|false}` — rounded rect *(v1.25)*
+        * `{"op":"gradient","x":,"y":,"w":,"h":,"from":[…],"to":[…],"dir":"v"|"h"}` — a linear-gradient fill (`dir` default `v`) *(v1.25)*
+        * `{"op":"polyline","points":[[x,y],…],"color":[…]}` — connect the points with lines *(v1.25)*
+        * `{"op":"text","x":,"y":,"s":"HELLO","color":[…],"size":10,"align":"left"|"center"|"right","font":"…"}` —
+          built-in CP1252 font; `size` picks a bundled face height (8, 9, 10, 13, 18, 20), default 10;
+          `align` places the string relative to `x` (default `left`) *(align v1.25)*. An optional
+          `font` *(v2.1)* names an uploaded face — `"custom"` is the slot filled by
+          `PUT /api/canvas/font`, any other name loads `/fonts/<name>.fnt`; unknown names keep
+          the built-in face, never error
+        * `{"op":"image","x":,"y":,"w":,"h":,"fmt":"rgb888"|"rgb565","data":"<base64>"}` — blit a small
+          base64 sprite (≤ 8 KB decoded; use `PUT /api/canvas/frame` for a full panel) *(v1.25)*
+        * `{"op":"atlas","name":"…"}` — *(v3.1)* bind a named sheet (lazy-loading it from
+          FATFS if persisted) for subsequent `sprite` ops. Sticky across batches; binding an
+          unknown name binds nothing — later sprites no-op rather than failing the batch.
+        * `{"op":"sprite","i":N,"x":,"y":}` — blit tile `N` of the **bound** sheet
+          at (x, y), magenta pixels transparent. With nothing bound
+          or `i` out of range the op is skipped and not counted *(v2.1)*
+        * `{"op":"scroll","dx":,"dy":,"color":[…]}` — shift the current frame by (dx, dy), filling the
+          vacated pixels with `color` (black by default). Make it the batch's first op, then draw the
+          newly-revealed edge — a marquee without resending the whole panel *(v1.25)*
+        * `{"op":"show"}` — present mid-batch (otherwise presented once at the end)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { type: object }
+            example:
+              - { op: clear }
+              - { op: rect, x: 0, y: 0, w: 128, h: 32, color: [0, 40, 80], fill: true }
+              - { op: text, x: 4, y: 2, s: "HELLO", color: [255, 255, 0], size: 13 }
+              - { op: pixel, x: 100, y: 20, color: [255, 0, 0] }
+      responses:
+        "200":
+          description: Applied and presented
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean, example: true }
+                  applied: { type: integer, example: 4 }
+        "400":
+          description: Body is not a JSON array
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running (the gateway is headless)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/canvas/effect:
+    post:
+      tags: [Canvas]
+      summary: Run an on-device animated effect (v1.14)
+      description: |
+        Start an animation that the **gateway renders itself**, on the display task, at the panel's
+        native frame rate (~70 fps) — no client and nothing on the network. This is the smooth way
+        to animate: pushing frames over HTTP tops out near 8 fps (one TCP connection per frame),
+        while an on-device effect is limited only by the panel.
+
+        An effect supersedes raw-canvas mode and owns the panel until you stop it. `{"type":"none"}`
+        (or `POST /api/canvas {"active":false}`) hands the panel back to the split-flap wall.
+
+        * `plasma` — flowing rainbow sine-interference field.
+        * `fire` — bottom-up flames through a black→red→orange→yellow→white palette.
+        * `matrix` — falling green streaks with bright heads and fading trails.
+        * `fliporama` — the whole board flips random glyphs, like a live departure board.
+        * `clock` — a digital clock: big anti-aliased HH:MM (JetBrains Mono) in a drifting rainbow,
+          with the date and seconds; uses the gateway's configured timezone.
+        * `life` — Conway's Game of Life, cells coloured by age, reseeded when it settles.
+        * `spectrum` *(fw 3.5, `audio` feature token)* — 16 log-band microphone spectrum
+          analyzer: bars with falling peak caps, bass→treble hue gradient (`hue` rotates it).
+        * `maze` *(fw 3.5)* — a Hunt-and-Kill maze generator, watched live: random-walk
+          carving with a fading trail, a visible hunt sweep, then an animated dead-end-filling
+          solve leaving the corner-to-corner path golden; repeats with a fresh maze.
+        * `ripple` *(fw 3.5, `audio` feature token)* — beat-launched expanding rings,
+          coloured by the dominant frequency band, loudness-scaled, fading as they grow.
+        * `soundwall` *(fw 3.5, `audio` feature token)* — the flap wall itself reacts: each
+          beat flips a loudness-scaled splash of cells to a colour flap picked by the dominant
+          frequency band; ~3 s of quiet settles the wall home. Runs in genuine wall mode
+          (`display/state` stays `mode:"wall"`, the flap preview follows it).
+
+        **Which params each effect takes — with types, ranges, defaults and labels — is
+        machine-readable in capabilities `effectDefs` (fw 3.4); unknown keys in this body are
+        ignored, and declared int params are clamped into their range, so any client/firmware
+        version skew stays safe.** `speed` is `1`–`10` (default keeps the current value). `hue` and `density` (v1.19) are
+        optional per-start overrides of the effect's look; leaving either out keeps the effect's
+        own default. `audio` *(fw 3.4)*: `true` makes `fire`/`matrix`/`plasma` react to the
+        microphones — loudness drives intensity/tempo, beats add sparks/bursts/lurches; explicit
+        per start, and a no-op without the `audio` feature token. Nothing is persisted — a
+        reboot returns to the wall.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                type:    { type: string, enum: [plasma, fire, matrix, fliporama, clock, life, spectrum, soundwall, maze, ripple, scope, spectro, none] }
+                speed:   { type: integer, minimum: 1, maximum: 10 }
+                hue:     { type: integer, minimum: 0, maximum: 255, description: "Base hue override (0–255 colour wheel). Omit to keep the effect's own palette." }
+                density: { type: integer, minimum: 1, maximum: 100, description: "Density override (1–100), e.g. streak count or seeding. Omit for the effect default." }
+                audio:   { type: boolean, description: "fw 3.5: microphone-modulate this effect (fire/matrix/plasma). Requires the audio feature token." }
+            example: { type: plasma, speed: 4, hue: 96 }
+      responses:
+        "200":
+          description: Effect set (or stopped)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean, example: true }
+                  effect:  { type: string, example: plasma }
+                  speed:   { type: integer, example: 4 }
+                  hue:     { type: integer, example: 96, description: "-1 when no override is set" }
+                  density: { type: integer, example: -1, description: "-1 when no override is set" }
+                  audio:   { type: boolean, example: false }
+        "400":
+          description: Invalid JSON
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: Quiet Time is active — starting an effect is refused so the panel stays dark ("none" is still allowed)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: Panel not running (the gateway is headless)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/flap/modules:
+    get:
+      tags: [Modules]
+      summary: List the wall's modules
+      description: |
+        Every module on the wall, in id order. On this firmware the wall is drawn
+        rather than discovered, so this is not a registry of "what has answered":
+        one module exists per grid cell, always, and this reports their live state.
+        The count is always gridRows x gridCols.
+      responses:
+        "200":
+          description: Array of module objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Module"
+
+  /api/flap/char:
+    post:
+      tags: [Modules]
+      summary: Show a character on a module
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, char]
+              properties:
+                id:
+                  type: integer
+                  description: Module ID (0–254), or -1 to broadcast to all
+                char:
+                  type: string
+                  description: >
+                    A single character (UTF-8). The gateway uppercases ASCII
+                    letters — except the seven lowercase colour codes r/o/y/g/b/p/w,
+                    which address the colour flaps and are sent as-is — and transcodes
+                    the character to a single Windows-1252 byte (so € and accented
+                    letters work), then sends m<id>-<char>; the module firmware maps
+                    the byte to a flap index. Characters with no Windows-1252
+                    representation are rejected.
+            example: { id: 5, char: "A" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/flap/index:
+    post:
+      tags: [Modules]
+      summary: Show a flap by index
+      description: >-
+        Sends the ordinary `m<id>+<n>` command — the same one `/api/display/cells` uses. The
+        whole 237-flap drawn reel is addressable, including the lowercase (163–222) and
+        pictograph (223–236) sections that the character path cannot reach.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, index]
+              properties:
+                id:
+                  type: integer
+                  description: Module ID, or -1 to broadcast to all
+                index:
+                  type: integer
+                  minimum: 0
+                  maximum: 236
+                  description: Flap index on the reel. 0 is blank.
+            example: { id: 5, index: 1 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/flap/text:
+    post:
+      tags: [Modules]
+      summary: Send a text string across sequential modules
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text, start]
+              properties:
+                text:
+                  type: string
+                start:
+                  type: integer
+                  description: ID of the first module
+            example: { text: "HELLO", start: 0 }
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  chars: { type: integer }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/flap/home:
+    post:
+      tags: [Modules]
+      summary: Home one or all modules
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: integer
+                  description: Module ID, or -1 to home all
+            examples:
+              single: { value: { id: 5 } }
+              all:    { value: { id: -1 } }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/capabilities:
+    get:
+      tags: [Status]
+      summary: What this wall can actually show
+      description: |
+        One call, made once when a client connects, that answers "what characters can this
+        display show?" without the client having to know which gateway it is talking to. The
+        Split-Flap Gateway and the Matrix Portal Gateway answer this URL with the SAME shape.
+
+        `charset.union` is every character SOME module can show ("can this wall show a Z
+        anywhere?"). `charset.common` is every character EVERY module can show ("can I lay this
+        text across arbitrary cells?"). On a real wall these can differ: if module 1 carries A-Z
+        and module 2 carries 0-9, the union is A-Z0-9 and the common set is EMPTY -- the wall
+        cannot show "HI42" wherever it likes, and only `common` says so. `uniform` is true when
+        every module carries the same reel, which is always the case on the Matrix Portal (one
+        drawn reel, rendered per cell).
+
+        `sets` reports each DISTINCT reel once, with the ids that carry it ("0-44,50"), rather
+        than one entry per module -- so a uniform wall is a few hundred bytes however large it
+        is. The `chars` of a set is the reel VERBATIM, in flap-index order, because a client
+        addressing a flap by index needs the positions rather than the alphabet.
+
+        TWO TRANSLATIONS apply to the character sets, matching what the gateway does when it
+        resolves a frame: the seven colour flaps (r o y g b p w) are reported under `colors` by
+        name and kept OUT of the character sets, and 'q' -- which the classic reel borrows for
+        the double-quote flap -- is reported as '"'.
+
+        On the Split-Flap Gateway a module only reports its reel from firmware v31. `assumed`
+        lists modules too old to report one, whose reel is taken to be the firmware's built-in
+        default; `unknown` lists modules whose reel is genuinely not known yet (the background
+        fill has not reached them, or they are unreachable) and which are excluded from both
+        character sets. Both are always empty on the Matrix Portal -- its modules are drawn
+        and share one reel.
+      responses:
+        "200":
+          description: Wall capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product:  { type: string, example: "Matrix Portal Gateway" }
+                  fw:       { type: string, example: "3.3.0" }
+                  grid:
+                    type: object
+                    properties:
+                      rows: { type: integer, example: 3 }
+                      cols: { type: integer, example: 15 }
+                  modules:  { type: integer, description: "Provisioned modules on the wall", example: 45 }
+                  maxFlaps: { type: integer, description: "Flaps a module can carry (64 real, 237 drawn)", example: 237 }
+                  colors:
+                    type: array
+                    description: "The colour flaps the wall actually has, by name. A custom reel with no colour codes reports none."
+                    items: { type: string }
+                    example: ["red","orange","yellow","green","blue","purple","white"]
+                  charset:
+                    type: object
+                    properties:
+                      union:   { type: string, description: "Every character SOME module can show" }
+                      common:  { type: string, description: "Every character EVERY module can show" }
+                      uniform: { type: boolean, description: "true when every module carries the same reel" }
+                      assumed:
+                        type: array
+                        description: "Module ids whose reel is the firmware default, assumed rather than reported (fw < 31)"
+                        items: { type: integer }
+                      unknown:
+                        type: array
+                        description: "Module ids whose reel is not known; excluded from union and common"
+                        items: { type: integer }
+                  sets:
+                    type: array
+                    description: "Each distinct reel once, with the ids that carry it"
+                    items:
+                      type: object
+                      properties:
+                        flaps:   { type: integer, example: 64 }
+                        source:  { type: string, enum: [reported, assumed, builtin] }
+                        chars:   { type: string, description: "The reel verbatim, in flap-index order" }
+                        modules: { type: string, description: "Compressed id list", example: "0-44,50" }
+                  motion:
+                    type: object
+                    description: >
+                      How the wall MOVES, stated directly so a client never infers motion from
+                      which endpoints exist. On this gateway `kind` is `drawn`: a cell is a
+                      repaint, not a mechanism — a new value can retarget it mid-flip, nothing
+                      queues, so sub-second updates are honest. The Split-Flap gateway answers
+                      the same key with kind `mechanical`.
+                    properties:
+                      kind:     { type: string, enum: [drawn, mechanical], example: drawn }
+                      settleMs: { type: integer, example: 3840, description: "Worst-case flip animation in ms (flapMs × flapMax, both live-configurable). Advisory here — cosmetic pacing, not a physical constraint." }
+                  canvas:
+                    type: object
+                    description: >
+                      Raw-framebuffer support — Matrix only; absent on the Split-Flap gateway,
+                      which has no framebuffer. The panel a client can push frames to via
+                      `PUT /api/canvas/frame` / `POST /api/canvas/ops`, with flags for the
+                      partial-update, delta, stream, animation, ticker and readback endpoints
+                      and the named atlas library's limits.
+                    properties:
+                      formats:  { type: array, items: { type: string }, example: [rgb888, rgb565, qoi] }
+                      width:    { type: integer, example: 128 }
+                      height:   { type: integer, example: 64 }
+                      rect:     { type: boolean, example: true, description: "`PUT /api/canvas/rect` partial updates" }
+                      rects:    { type: boolean, example: true, description: "`PUT /api/canvas/rects` multi-rect deltas (v3.1)" }
+                      stream:   { type: boolean, example: true, description: "`PUT /api/canvas/stream` persistent TLV draw channel (v3.2)" }
+                      opsBin:   { type: boolean, example: true, description: "The binary ops encoding is supported (POST /api/canvas/opsb and stream record 0x06)" }
+                      anim:     { type: boolean, example: true, description: "`PUT /api/canvas/anim` on-device animation" }
+                      ticker:   { type: boolean, example: true, description: "`POST /api/canvas/ticker` scrolling text" }
+                      readback: { type: boolean, example: true, description: "`GET /api/canvas/frame` screenshot readback" }
+                      atlas:
+                        type: object
+                        description: "Named sprite-atlas library limits (v3.1)"
+                        properties:
+                          named:         { type: boolean, example: true }
+                          persist:       { type: boolean, example: true }
+                          maxSheets:     { type: integer, example: 16 }
+                          maxBytes:      { type: integer, example: 4194304 }
+                          maxSheetBytes: { type: integer, example: 2097152 }
+                      ops:
+                        type: array
+                        description: "The draw ops `POST /api/canvas/ops` honours. `sprite` (atlas tile blit) joined in v2.1."
+                        items: { type: string }
+                        example: [clear, pixel, hline, vline, line, rect, circle, ellipse, triangle, roundrect, gradient, polyline, text, image, sprite, scroll, show]
+                  effectDefs:
+                    type: array
+                    description: >
+                      fw 3.5 (`effectDefs` feature token): one entry per effect declaring
+                      exactly the params it consumes — clients build effect UIs from this
+                      instead of hard-coding options. Additive: `effects`/`effectParams`
+                      are unchanged for older clients.
+                    items:
+                      type: object
+                      properties:
+                        id:   { type: string, example: fire, description: "Wire name for POST /api/canvas/effect" }
+                        name: { type: string, example: Fire, description: "Display name, shown verbatim" }
+                        params:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              key:     { type: string, example: audio }
+                              type:    { type: string, enum: [int, bool] }
+                              min:     { type: integer, description: "int params only" }
+                              max:     { type: integer, description: "int params only" }
+                              default: { description: "Absent = omitting the param keeps the effect's own built-in look" }
+                              label:   { type: string, example: Audio reactive }
+                  effects:
+                    type: array
+                    description: >
+                      On-device animated effects the gateway renders itself — Matrix only; absent
+                      on the Split-Flap gateway. Start one with `POST /api/canvas/effect`.
+                    items: { type: string }
+                    example: [plasma, fire, matrix, fliporama, clock, life]
+                  features:
+                    type: array
+                    description: "Capability tokens a client checks instead of sniffing the firmware version. 'canvas', 'effects' and 'ticker' appear on the Matrix gateway only. 'brightness' (v2.2) says the panel brightness is live-settable via GET/POST /api/display/brightness (also persisted as panelBright in POST /api/config/settings, 1..255, applied on the next frame). 'timer' and 'alarms' (v3.14) advertise the countdown timer and the daily alarm slots. 'claps' (microphones) and 'taps' (IMU) advertise gesture detection (v3.15): enable via clapEnabled/tapEnabled; events arrive on the SSE stream as `clap`/`tap` `{count,seq}`; a DOUBLE gesture dismisses a running timer or ringing alarm on-device. Hardware-conditional tokens appear only when the peripheral is present: 'audio' (mics), 'sound' (speaker), 'environment' (SHTC3), 'sd' (mounted microSD card, v3.10)."
+                    items: { type: string }
+                    example: ["cells","colors","index","lowercase","pictographs","quiet","ota","canvas","effects","ticker","brightness","events"]
+
+  /api/status:
+    get:
+      tags: [Status]
+      summary: System status
+      responses:
+        "200":
+          description: Current system status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+
+  /api/quiet:
+    get:
+      tags: [Status]
+      summary: Get quiet-time state
+      responses:
+        "200":
+          description: Current state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  on: { type: boolean, example: false }
+    post:
+      tags: [Status]
+      summary: Enable or disable quiet time
+      description: |
+        **Enabling blanks the display.** Every reel is homed to its blank flap as quiet
+        time is entered -- the same operation as Home All -- so the wall goes empty for
+        the duration.
+
+        While enabled, the gateway still accepts and acknowledges every command, but does
+        not act on display-motion frames (show character, show index, home), so the wall
+        stays dark. There are no calibration commands on this product — the modules are
+        drawn, and any such frames are ignored. Starting an on-device effect or ticker is
+        refused with `409` for the duration. Display tracking is left unchanged.
+
+        **Disabling restores the display.** The reels resync to whatever each module was
+        last asked to show while quiet -- or, if nothing was asked, to what it was showing
+        when quiet time began.
+
+        Always resets to off on reboot (not persisted).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [on]
+              properties:
+                on: { type: boolean }
+            example: { on: true }
+      responses:
+        "200":
+          description: New state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  on: { type: boolean, example: true }
+
+  /api/quiet/schedule:
+    get:
+      tags: [Status]
+      summary: Get the daily quiet-time schedule (v3.0)
+      responses:
+        "200":
+          description: Current schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QuietSchedule" }
+    post:
+      tags: [Status]
+      summary: Set the daily quiet-time schedule (v3.0)
+      description: |
+        When enabled, quiet time is toggled automatically as local time crosses
+        the window (overnight windows supported). Transition-based, so a manual
+        toggle within a window is respected until the next boundary. Persisted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuietSchedule" }
+            example: { enabled: true, start: "22:00", end: "07:00", days: 127 }
+      responses:
+        "200":
+          description: New schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QuietSchedule" }
+
+  # ── Companion app ───────────────────────────────────────────────
+
+  /api/companion:
+    get:
+      tags: [Companion]
+      summary: Get the registered companion app (v3.0)
+      responses:
+        "200":
+          description: Registered companion URL and its last reported status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Companion" }
+    post:
+      tags: [Companion]
+      summary: Register the companion app and heartbeat its status (v3.0)
+      description: |
+        The companion app posts its own URL here so the gateway can show a
+        **Companion** tab linking back to it. The URL is persisted in NVS (and
+        only rewritten when it actually changes, to spare the flash from
+        heartbeats); the status is runtime-only and clears on reboot.
+
+        An empty `url` deregisters the companion. Either field may be sent alone.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Companion" }
+            example: { url: "http://192.168.1.60:8000", status: "Running: Weather" }
+      responses:
+        "200":
+          description: The stored registration after the update
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Companion" }
+
+  /api/companion/settings:
+    get:
+      tags: [Companion]
+      summary: Fetch the companion's stored settings blob (v3.1)
+      description: |
+        Returns the blob exactly as it was stored by `PUT`, byte for byte.
+
+        The body is `gzip(minified JSON)` whose schema belongs entirely to the
+        companion — the gateway never parses it. It is served as
+        `application/gzip` and **not** with `Content-Encoding: gzip`: these bytes
+        are the payload, not a transfer encoding of it, so HTTP clients must not
+        transparently decompress them. The caller decompresses it itself.
+      responses:
+        "200":
+          description: The stored gzipped JSON blob
+          content:
+            application/gzip:
+              schema: { type: string, format: binary }
+        "404":
+          description: Nothing stored yet (or the filesystem is unavailable)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    put:
+      tags: [Companion]
+      summary: Store the companion's settings blob (v3.1)
+      description: |
+        Stores the request body **verbatim** and **atomically**: it streams to a
+        temp file on the FATFS partition and is renamed over the live copy only
+        once the final byte lands, so an interrupted upload can never corrupt
+        settings that were already good. The blob survives OTA firmware updates.
+
+        The body must be `gzip(minified JSON)`, at most 64 KB (real blobs are
+        1–2 KB). The gateway stores whatever bytes it is given and does not
+        validate that they are valid gzip or valid JSON.
+      requestBody:
+        required: true
+        content:
+          application/gzip:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:    { type: boolean, example: true }
+                  bytes: { type: integer, description: "Bytes stored", example: 1284 }
+        "400":
+          description: Empty or truncated body — nothing was changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: Blob larger than 64 KB — nothing was changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: Filesystem not mounted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "507":
+          description: Write failed (storage full or I/O error)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /lang/{code}:
+    get:
+      tags: [UI]
+      summary: One UI translation dictionary (gzipped JSON)
+      description: |
+        Serves the dashboard's translation dictionary for `code` — a JSON object mapping the
+        **English source text** to its translation, e.g. `{"Save Panel": "Panel speichern"}`.
+
+        The dictionaries are baked into the firmware image, one gzipped blob per language, and
+        the browser fetches only the one it is using. **English has no dictionary**: it is the
+        text already in the page, and the per-key fallback for every other language, so a
+        missing key degrades to English rather than breaking the page.
+
+        `Content-Encoding: gzip` is a *transfer* encoding here — the browser inflates the body
+        before `fetch().json()` ever sees it. (This is the opposite of
+        `/api/companion/settings`, where the gzip **is** the payload and the header is
+        deliberately not set.)
+
+        Only the languages this firmware actually ships are routed; any other code 404s.
+        `ETag` changes on every reflash, so a conditional GET normally costs a 304.
+
+        The gateway stores **no** language preference. The dashboard resolves it in the browser:
+        `?lang=` in the URL (a one-off view — not saved), then a Settings override in
+        `localStorage`, then `navigator.languages`, then English.
+      parameters:
+        - name: code
+          in: path
+          required: true
+          description: BCP-47 language tag, as advertised by the page's built-in language list.
+          schema:
+            type: string
+            enum: [en-GB, en-AU, fr, de, es, it, pt, pt-BR, nl, da, sv, nb, fi]
+          example: de
+      responses:
+        "200":
+          description: The dictionary. Body is gzip-compressed JSON.
+          headers:
+            Content-Encoding:
+              schema: { type: string, enum: [gzip] }
+            ETag:
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string, example: no-cache }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: { type: string }
+              example:
+                Save Panel: Panel speichern
+                Panel width (px): Panelbreite (px)
+                Module Wall: Modulwand
+        "304":
+          description: Not modified (the client's `If-None-Match` matches the current build)
+        "404":
+          description: This firmware does not ship that language (English is never routed)
+
+  /api/config:
+    get:
+      tags: [Config]
+      summary: Get current configuration (passwords excluded)
+      responses:
+        "200":
+          description: Current configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Config"
+
+  /api/config/wifi:
+    post:
+      tags: [Config]
+      summary: Save WiFi credentials and reconnect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ssid, pass]
+              properties:
+                ssid: { type: string, example: "MyNetwork" }
+                pass: { type: string, example: "mypassword" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/config/settings:
+    post:
+      tags: [Config]
+      summary: Save any settings in one call
+      description: |
+        The one-call settings sink behind the dashboard's Settings page: send only the fields
+        you want to change. Most take effect immediately (the exceptions say **Reboot to
+        apply**). One field short-circuits — `serialDebug`
+        each save and answer on their own, ignoring anything else in the same body — so send
+        those alone. If WiFi credentials are in the payload the station reconnects after the
+        response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ssid:        { type: string, example: "MyNetwork", description: "WiFi SSID. Saving triggers a reconnect." }
+                pass:        { type: string, example: "mypassword", description: "WiFi password" }
+                posixTZ:     { type: string, example: "EST5EDT,M3.2.0,M11.1.0" }
+                ntpServer:   { type: string, example: "pool.ntp.org", description: "NTP server hostname; blank resets to pool.ntp.org" }
+                gridRows:    { type: integer, minimum: 1, maximum: 64, example: 3,  description: "Display wall rows" }
+                gridCols:    { type: integer, minimum: 1, maximum: 64, example: 15, description: "Display wall columns" }
+                panelW:        { type: integer, example: 128, description: "Panel chain width in px. **Reboot to apply.**" }
+                panelH:        { type: integer, enum: [16, 32, 64], example: 64, description: "Panel height in px. **Reboot to apply.**" }
+                panelBitDepth: { type: integer, minimum: 1, maximum: 6, example: 4, description: "Bitplanes. RAM and refresh rate scale with it. **Reboot to apply.** On 256x64, depth 4 needs `fbPsram:true` (it does not fit internal DMA RAM otherwise, and clamps to 3)." }
+                fbPsram:       { type: boolean, example: false, description: "v3.11 (experimental): put the panel framebuffer in octal PSRAM instead of internal SRAM, lifting the internal-RAM depth cap so 256x64 can run depth 4. Raises the pixel clock to 10 MHz (~80 Hz at depth 4). **Reboot to apply.** Off = the default internal-SRAM path." }
+                dimEnabled:    { type: boolean, description: "Brightness schedule (v3.13): auto-dim daily between dimStart and dimEnd. Quiet Time takes precedence." }
+                dimStart:      { type: string, example: "21:00", description: "Dim window start, user-local HH:MM (shares the quiet schedule's tz offset)" }
+                dimEnd:        { type: string, example: "07:00", description: "Dim window end (may wrap past midnight)" }
+                dimLevel:      { type: integer, minimum: 1, maximum: 255, description: "Panel brightness while dimmed" }
+                dimTzOffsetMin: { type: integer, description: "Browser minutes east of UTC; updates the shared schedule offset" }
+                panelBright:   { type: integer, minimum: 1, maximum: 255, example: 160, description: "Global panel brightness, 1..255. Applies on the next frame, no reboot. Also settable live via GET/POST /api/display/brightness (v2.2), which is the same persisted value." }
+                soundEnabled:  { type: boolean, description: "Master speaker enable (v3.6): false silences the speaker (POST /api/sound -> 403, and disabling mid-play stops the tone)." }
+                soundVolume:   { type: integer, minimum: 0, maximum: 100, description: "Master speaker volume 0..100 (v3.6): scales every POST /api/sound call." }
+                tempOffset:    { type: number, minimum: -30, maximum: 30, description: "Temperature calibration offset in degC (v3.7), added to the SHTC3 reading to correct board self-heating." }
+                panelBGR:
+                  type: boolean
+                  example: true
+                  description: >
+                    The panel is wired **BGR** rather than RGB — its own hardware colour order,
+                    which the firmware cannot detect. On a BGR panel every colour is wrong in a
+                    specific pattern: **red draws blue, blue draws orange, yellow draws cyan,
+                    purple draws pink** — while **green and white look correct** (green is its own
+                    channel, white is all three). That is why it hides: text is white.
+                    Applies on the **next frame**, no reboot, so you can tick it and see the answer.
+                flapMs:        { type: integer, minimum: 2, maximum: 500, example: 60, description: "ms per flap. Next flap." }
+                flapMax:       { type: integer, minimum: 1, maximum: 64, example: 64, description: "Max flips per change. Next change." }
+                hostname:      { type: string, example: "flapwall", description: "1–31 chars of a-z 0-9 '-' (lowercased for you). Empty string reverts to the MAC-derived name. **Reboot to apply.**" }
+                bootAnim:      { type: string, example: "rainbow", description: "Animation-library name autoplayed at boot, before WiFi (v2.1); superseded by the first display command. Empty string disables. Must match the library naming rule (1–24 chars of a-z 0-9 - _); the entry need not exist yet." }
+                serialDebug: { type: boolean, example: true, description: "Short-circuits: send alone." }
+            examples:
+              timezone:
+                value:
+                  posixTZ: "EST5EDT,M3.2.0,M11.1.0"
+              ntp_server:
+                value:
+                  ntpServer: "time.google.com"
+              wifi:
+                value:
+                  ssid: "MyNetwork"
+                  pass: "mypassword"
+              panel:
+                value:
+                  panelW: 128
+                  panelH: 32
+                  panelBright: 160
+              debug_on:
+                value:
+                  serialDebug: true
+      responses:
+        "200":
+          description: Saved. `warn` appears when the requested wall does not fit the panel and will be reduced on reboot.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:   { type: boolean, example: true }
+                  warn: { type: string, description: "Present only when the wall was clamped", example: "a 15x3 wall does not fit a 128x16 panel -- it will be reduced to 15x1 on reboot" }
+        "400":
+          description: Bad request — missing/malformed JSON, or an invalid hostname
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ── Files (v2.2) ────────────────────────────────────────────────
+
+  /api/fs:
+    get:
+      tags: [Files]
+      summary: List the filesystem (v2.2)
+      description: |
+        Totals plus every file on the FATFS partition (recursive), streamed. Sizes are in
+        bytes; `free` is `total - used`. This is the filesystem behind the animation
+        (`/anim`) and font (`/fonts`) libraries and the companion settings blob
+        (`/compset.gz`).
+      responses:
+        "200":
+          description: Filesystem totals and file list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer, description: "Partition size in bytes", example: 25034752 }
+                  free:  { type: integer, description: "Free bytes", example: 22120448 }
+                  files:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        path: { type: string, example: "/anim/sweep.mpg" }
+                        size: { type: integer, description: "Bytes", example: 491534 }
+        "503":
+          description: No filesystem mounted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/fs/file:
+    get:
+      tags: [Files]
+      summary: Download one file (v2.2)
+      description: >-
+        Streams the file at `path` as `application/octet-stream` with a
+        `Content-Disposition: attachment` naming the basename, so a browser saves it under
+        its own name. Paths must be absolute, `a-z 0-9 . _ - /` only, no `..`, at most 48
+        chars — the grammar everything this firmware writes already fits.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string, example: "/anim/sweep.mpg" }
+      responses:
+        "200":
+          description: The file's bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "400":
+          description: Path fails the grammar
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: No such file
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/fs/delete:
+    post:
+      tags: [Files]
+      summary: Delete a file (v2.2)
+      description: >-
+        Deletes the file at `path` (or an empty directory). Deliberately unrestricted —
+        it is the user's flash; the dashboard carries the warnings (deleting
+        `/compset.gz` costs the companion its stored settings).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string, example: "/anim/sweep.mpg" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          description: Path fails the grammar
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: No such file
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "507":
+          description: Remove failed (a non-empty directory, or a filesystem error)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/fs/upload:
+    post:
+      tags: [Files]
+      summary: Upload a file (v2.2; raw body since v3.0)
+      description: |
+        **v3.0 breaking change:** the request body is the file itself (raw bytes, no
+        multipart), and the filename rides the `name` query parameter —
+        `curl --data-binary @sweep.mpg '.../api/fs/upload?name=sweep.mpg'`. The target
+        path comes from that **name**, sanitized — lowercased, characters outside
+        `a-z 0-9 . _ -` dropped; a name that sanitizes to nothing or to more than 40 chars
+        is rejected. Routing is by extension: `.mpg` lands in `/anim/`, `.fnt` in
+        `/fonts/`, anything else in the root — so an uploaded animation is immediately
+        playable by name. The stream goes to a `.tmp` and is renamed on success, so a
+        failed upload never clobbers an existing file. Refused up front (`413`) when the
+        upload would leave less than 64 KB free.
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema: { type: string }
+          description: The filename; sanitized, and its extension decides the target directory.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: The file's bytes, verbatim.
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:    { type: boolean, example: true }
+                  path:  { type: string, example: "/anim/sweep.mpg", description: "Where the file landed" }
+                  bytes: { type: integer, example: 491534 }
+        "400":
+          description: Filename sanitizes to nothing, or to more than 40 chars
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: Not enough free space (64 KB must remain after the upload)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: No filesystem mounted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "507":
+          description: Write failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ── OTA ─────────────────────────────────────────────────────────
+
+  /ota:
+    get:
+      tags: [OTA]
+      summary: Browser-based firmware upload page
+      description: Returns an HTML page with a file picker for uploading a compiled `.bin` file.
+      responses:
+        "200":
+          description: HTML upload page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/ota/upload:
+    post:
+      tags: [OTA]
+      summary: Upload compiled firmware binary (raw body since v3.0)
+      description: |
+        **v3.0 breaking change:** accepts the compiled firmware as the raw request
+        body — `curl --data-binary @firmware.bin .../api/ota/upload` (this is also
+        what the `/ota` page sends; no multipart). The gateway quiesces for the
+        transfer, verifies the image, and reboots automatically on success; on
+        failure it answers `500` and stays on the running firmware. Obtain the
+        binary with a PlatformIO build (`pio run` → `firmware.bin`).
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: The compiled firmware.bin, verbatim.
+      responses:
+        "200":
+          description: Upload successful — gateway rebooting
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "OK"
+        "500":
+          description: Update failed
+          content:
+            text/plain:
+              schema:
+                type: string
+
+# ── Reusable components ──────────────────────────────────────────
+
+components:
+  responses:
+    Ok:
+      description: Success
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              ok:
+                type: boolean
+                example: true
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      description: The error body sent by a failing endpoint.
+      properties:
+        error: { type: string, example: "Settings blob too large" }
+
+    Companion:
+      type: object
+      description: Companion-app registration (v3.0).
+      properties:
+        url:
+          type: string
+          description: "The companion's own base URL. Persisted; blank means no companion is registered. Posting a blank url deregisters it"
+          example: "http://192.168.1.60:8000"
+        status:
+          type: string
+          description: "The companion's last reported running status. Runtime-only -- clears on reboot. Quotes, backslashes and control characters are sanitised"
+          example: "Running: Weather"
+
+    QuietSchedule:
+      type: object
+      description: Daily quiet-time schedule (v3.0).
+      properties:
+        enabled: { type: boolean, example: true }
+        start:   { type: string, description: "Window start HH:MM", example: "22:00" }
+        end:     { type: string, description: "Window end HH:MM (overnight allowed)", example: "07:00" }
+        days:    { type: integer, description: "Active-day bitmask, bit0=Sun … bit6=Sat", example: 127 }
+        offset:  { type: integer, description: "Client UTC offset in minutes east of UTC; the window is evaluated in this local time. The web UI sends it on load.", example: -300 }
+    LogEntry:
+      type: object
+      properties:
+        ts:   { type: integer, description: "Milliseconds since boot", example: 12345 }
+        ep:   { type: integer, description: "UTC epoch at capture (0 if RTC not set); UI renders in browser-local time", example: 1781210380 }
+        wt:   { type: string,  description: "Gateway wall-clock timestamp", example: "2026-06-10 14:32:01" }
+        src:  { type: string,  enum: [R], description: "Command source: R=REST" }
+        text: { type: string,  description: "The command, JSON-safe (control chars stripped, high CP1252 flap bytes shown as their real UTF-8 glyph)", example: "send m5-A" }
+
+    Module:
+      type: object
+      description: >-
+        One module row of `GET /api/flap/modules`. The `sn`, `provisioned` and `fwVersion`
+        fields left in v1.24.0 along with the fake serial numbers and the `v`/`A` protocol
+        queries they answered — no consumer existed.
+      properties:
+        id:          { type: integer, description: "Module ID == its position in the grid", example: 5 }
+        flapIndex:   { type: integer, description: "The flap on show, 0..236. 0 is blank.", example: 1 }
+        flapChar:    { type: string,  description: "The character on show, as a Unicode code point (so pictographs report as themselves). A colour flap reports as its protocol letter: r o y g b p w.", example: "A" }
+
+    Status:
+      type: object
+      properties:
+        uptime:    { type: integer, description: "Seconds since boot", example: 3842 }
+        tx:        { type: integer, description: "Frames transmitted since boot. (`rx` left in v1.24.0 — nothing replies, so nothing is ever received.)", example: 37 }
+        wifi:      { type: boolean, example: true }
+        ip:        { type: string,  example: "192.168.1.105" }
+        apip:      { type: string,  example: "192.168.4.1" }
+        heap:      { type: integer, description: "Free heap bytes", example: 187432 }
+        modules:   { type: integer, example: 45 }
+        time:      { type: string,  description: "Local RTC time", example: "2026-06-10 14:32:01" }
+        ntpSynced: { type: boolean, example: true }
+        quiet:     { type: boolean, description: "true if quiet time is on (flaps do not move for display updates)", example: false }
+        env:       { type: object, description: "SHTC3 temp/humidity (v3.7): {ok, tempC, rh, age}; ok:false when absent or no reading yet" }
+        minheap:   { type: integer, description: "Minimum free heap ever observed (bytes)", example: 98000 }
+        stk:
+          type: object
+          description: >-
+            Per-task minimum-ever free stack in bytes (stack high-water marks).
+            The first key was `rs485` (to v1.19), then `bus` (v1.20–v1.21); it is
+            `frames` since v1.22.0.
+          properties:
+            frames: { type: integer, example: 3100 }
+            web:  { type: integer, example: 5200 }
+            net:  { type: integer, example: 2900 }
+            ota:  { type: integer, example: 2400 }
+            rtc:  { type: integer, example: 900 }
+            disp: { type: integer, example: 1800 }
+        panel:
+          type: object
+          description: "The HUB75 panel and the wall drawn on it"
+          properties:
+            ok:    { type: boolean, description: "true when the panel driver is running", example: true }
+            w:     { type: integer, description: "Panel width in px", example: 128 }
+            h:     { type: integer, description: "Panel height in px", example: 32 }
+            cols:  { type: integer, description: "Wall columns actually drawn", example: 15 }
+            rows:  { type: integer, description: "Wall rows actually drawn", example: 3 }
+            cellW: { type: integer, description: "Cell width in px", example: 8 }
+            cellH: { type: integer, description: "Cell height in px", example: 10 }
+            depth: { type: integer, description: "Effective colour bit depth (may be auto-clamped to fit RAM)", example: 4 }
+            font:  { type: string,  description: "The face the wall is rendered with", example: "6x10" }
+            vmods: { type: integer, description: "Virtual modules on the wall", example: 45 }
+        companion:
+          type: object
+          description: "The registered companion app (v3.0)"
+          properties:
+            url:    { type: string,  example: "http://192.168.1.60:8000" }
+            status: { type: string,  example: "Running: Weather" }
+            age:    { type: integer, description: "Seconds since the companion last checked in; -1 = never / deregistered", example: 12 }
+
+    Config:
+      type: object
+      properties:
+        version:      { type: string,  example: "3.12.0", description: "This firmware's version (same value as fwVersion since v3.12). Key product behaviour on `product` and capability tokens, not version heuristics" }
+        resets:       { type: array, description: "v3.13.2 (in /api/status): the last 8 reboots as [cause, minutesAlive] pairs, newest first, surviving warm reboots in RTC memory. Causes: 1 poweron, 3 sw, 4 panic, 5 int-wdt, 6 task-wdt, 7 wdt, 9 brownout, 11 usb", items: { type: array, items: { type: integer } } }
+        product:      { type: string,  example: "Matrix Portal Gateway" }
+        fwVersion:    { type: string,  example: "2.1.0", description: "This firmware's own version" }
+        wSSID:        { type: string,  example: "MyNetwork" }
+        posixTZ:      { type: string,  example: "EST5EDT,M3.2.0,M11.1.0" }
+        ntpServer:    { type: string,  example: "pool.ntp.org" }
+        gridRows:     { type: integer, example: 3,  description: "Display wall rows" }
+        gridCols:     { type: integer, example: 15, description: "Display wall columns" }
+        serialDebug:  { type: boolean, example: false }
+        hostname:     { type: string,  description: "The effective hostname (mDNS + AP SSID) — MAC-derived when not pinned", example: "matrix-gw-3f2a" }
+        hostnameAuto: { type: boolean, description: "true when the hostname is derived from the MAC rather than pinned", example: true }
+        panelW:        { type: integer, description: "Panel chain width in px", example: 128 }
+        panelH:        { type: integer, description: "Panel height in px", example: 32 }
+        panelBitDepth: { type: integer, description: "Configured colour bitplanes (1–6)", example: 4 }
+        fbPsram:       { type: boolean, description: "Framebuffer in PSRAM (v3.11) — enables depth 4 on 256x64", example: false }
+        panelBGR:      { type: boolean, description: "Panel is wired BGR rather than RGB", example: false }
+        panelBright:   { type: integer, description: "Panel brightness 1–255", example: 160 }
+        soundEnabled:  { type: boolean, description: "Master speaker enable (v3.6)" }
+        soundVolume:   { type: integer, description: "Master speaker volume 0-100 (v3.6)" }
+        tempOffset:    { type: number, description: "Temperature calibration offset, degC (v3.7)" }
+        transitionType: { type: string, enum: [none, crossfade, wipe, slide], description: "Persisted canvas transition (v3.7.2)" }
+        transitionMs:  { type: integer, description: "Persisted transition duration, ms (v3.7.2)" }
+        flapMs:        { type: integer, description: "ms per flap of the flip animation", example: 60 }
+        flapMax:       { type: integer, description: "Max flips per character change", example: 64 }
+        maxFlaps:      { type: integer, description: "Flaps on the drawn reel: glyphs + colours + lowercase + pictographs", example: 237 }
+        bootAnim:      { type: string,  description: "Animation-library name autoplayed at boot (v2.1); empty when none is set", example: "rainbow" }
