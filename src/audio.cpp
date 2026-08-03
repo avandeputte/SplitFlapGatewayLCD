@@ -11,11 +11,13 @@
 // Waveshare's ESP32-S3-RGB-Matrix BSP (MCLK=12 BCLK=43 WS=38 DIN=39).
 
 /* ---- board wiring ---- */
-#define AUD_PIN_MCLK  GPIO_NUM_12
-#define AUD_PIN_BCLK  GPIO_NUM_43
-#define AUD_PIN_WS    GPIO_NUM_38
-#define AUD_PIN_DIN   GPIO_NUM_39
-#define AUD_PIN_DOUT  GPIO_NUM_21
+// Waveshare P4 board wiring (BSP-confirmed): one duplex I2S port serves the ES8311,
+// DOUT feeds its DAC (speaker), DIN returns its ADC (the onboard SMD mic).
+#define AUD_PIN_MCLK  GPIO_NUM_13
+#define AUD_PIN_BCLK  GPIO_NUM_12
+#define AUD_PIN_WS    GPIO_NUM_10
+#define AUD_PIN_DIN   GPIO_NUM_11
+#define AUD_PIN_DOUT  GPIO_NUM_9
 
 #define AUD_RATE      16000
 #define AUD_HOP       128          // samples per DSP hop (also the FFT size): 8 ms

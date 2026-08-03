@@ -1,12 +1,20 @@
 #include "gateway.h"
 #include "sdcard.h"
 #include "SD_MMC.h"
+#include <esp_ldo_regulator.h>   // the TF slot rail (P4 on-chip LDO 4)
 
 // sdcard.cpp -- see sdcard.h. SD_MMC 1-bit mode on the Waveshare-documented pins.
 
-#define SD_PIN_CLK  1
+// ESP32-P4: the TF slot sits on SDMMC SLOT 0's fixed IOMUX pins (BSP-confirmed),
+// wired for the full 4-bit bus, and the slot's power rail comes from the chip's
+// on-board LDO channel 4 -- no LDO, no card.
+#define SD_PIN_CLK  43
 #define SD_PIN_CMD  44
-#define SD_PIN_D0   17
+#define SD_PIN_D0   39
+#define SD_PIN_D1   40
+#define SD_PIN_D2   41
+#define SD_PIN_D3   42
+#define SD_LDO_CHAN 4
 
 static bool        gSdReady = false;
 static const char* gSdType  = "none";
@@ -21,13 +29,22 @@ static const char* cardTypeName(uint8_t t) {
 }
 
 void sdInit() {
+  // Power the slot first: LDO channel 4 at 3.3 V, held for the life of the boot.
+  static esp_ldo_channel_handle_t sdLdo = nullptr;
+  esp_ldo_channel_config_t ldo = {};
+  ldo.chan_id = SD_LDO_CHAN;
+  ldo.voltage_mv = 3300;
+  if (esp_ldo_acquire_channel(&ldo, &sdLdo) != ESP_OK) {
+    printf("[SD] LDO%d acquire failed -- microSD disabled\n", SD_LDO_CHAN);
+    return;
+  }
   // setPins must precede begin; both can fail benignly (no card, bad card, wiring).
-  if (!SD_MMC.setPins(SD_PIN_CLK, SD_PIN_CMD, SD_PIN_D0)) {
+  if (!SD_MMC.setPins(SD_PIN_CLK, SD_PIN_CMD, SD_PIN_D0, SD_PIN_D1, SD_PIN_D2, SD_PIN_D3)) {
     printf("[SD] setPins failed -- microSD disabled\n");
     return;
   }
-  // "/sdcard" mount, 1-bit mode (true), default freq. A missing card returns false here.
-  if (!SD_MMC.begin("/sdcard", true)) {
+  // "/sdcard" mount, 4-bit bus (the slot routes all four data lines).
+  if (!SD_MMC.begin("/sdcard", false)) {
     printf("[SD] no card / mount failed -- microSD disabled\n");
     return;
   }

@@ -14,7 +14,7 @@
 // adc_osr 0x10, dac_osr 0x20.
 
 #define ES8311_ADDR   0x18
-#define PA_ENABLE_PIN GPIO_NUM_11
+#define PA_ENABLE_PIN GPIO_NUM_53   // NS4150B enable on this board (11 was the S3)
 #define SND_RATE      16000
 
 static bool gSoundPresent = false;
