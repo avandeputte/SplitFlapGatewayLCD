@@ -599,7 +599,9 @@ void panelShow() {
   // only the LOGICAL region (at effect scale that is 82 KB, not the buffer's 2 MB).
   static uint32_t tSync = 0, tBlit = 0, nShow = 0, tLast = 0;   // bring-up: frame timing
   const uint32_t t0 = micros();
-  const size_t liveBytes = ((size_t)W * H * sizeof(px_t) + 63u) & ~((size_t)63u);
+  // P4 cache lines are 128 B (the S3 was 64): a sync not aligned to that is REJECTED
+  // outright by esp_cache_msync, not partially done -- the boot log said so.
+  const size_t liveBytes = ((size_t)W * H * sizeof(px_t) + 127u) & ~((size_t)127u);
   if (gPpa) esp_cache_msync(fb[drawBuf], liveBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
   const uint32_t t1 = micros();
   rotateToScanout();
@@ -641,9 +643,9 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   info.width = W; info.height = H;
 
   const size_t fbBytes = (size_t)W * H * sizeof(px_t);
-  gFbBytes = (fbBytes + 63u) & ~((size_t)63u);
+  gFbBytes = (fbBytes + 127u) & ~((size_t)127u);
   for (int b = 0; b < 2; b++) {
-    fb[b] = (px_t*)heap_caps_aligned_alloc(64, gFbBytes, MALLOC_CAP_SPIRAM);
+    fb[b] = (px_t*)heap_caps_aligned_alloc(128, gFbBytes, MALLOC_CAP_SPIRAM);
     if (!fb[b]) {
       printf("[PANEL] %u B of PSRAM unavailable for framebuffer %d\n", (unsigned)gFbBytes, b);
       panelFreeAll(); return false;

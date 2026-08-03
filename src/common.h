@@ -170,8 +170,8 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
    chain two 64x64 panels: an 8x21 cell picks up the 6x13 face. */
 #define DEFAULT_PANEL_W      1280   // landscape: the 800x1280 portrait panel mounted wide
 #define DEFAULT_PANEL_H      800
-#define DEFAULT_GRID_COLS    15     // virtual modules across (85x266 px flaps -- roomy)
-#define DEFAULT_GRID_ROWS    3      // virtual modules down
+#define DEFAULT_GRID_COLS    15     // virtual modules across (85x160 px flap cards)
+#define DEFAULT_GRID_ROWS    5      // virtual modules down -- 75 modules fill the panel
 #define DEFAULT_BIT_DEPTH    16     // bits per pixel now (RGB565); kept for config compatibility
 #define DEFAULT_PANEL_BGR    false  // true if the panel is wired BGR (see panelSetColourOrder)
 #define DEFAULT_BRIGHTNESS   160    // 1..255, scales every colour before output

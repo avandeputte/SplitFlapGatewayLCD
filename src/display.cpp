@@ -3,6 +3,7 @@
 #include "effects.h"
 #include "canvas.h"
 #include "timer.h"     // full-screen countdown/alarm renderer (v3.14)
+#include "fontflap.h"  // the Helvetica flap face for big LCD cells (LCD Gateway)
 
 // display.cpp -- the HUB75 flap wall: geometry, the flap renderer, and the reel task.
 // All output goes through panel.h; this file never sees a pixel format, a bitplane or a
@@ -63,9 +64,8 @@ static void drawFace(int cx, int cy, const FaceSnap& f, Ink ink, int rowFrom, in
 PanelGeometry dispPlan(uint16_t panelW, uint16_t panelH, uint8_t cols, uint8_t rows) {
   PanelGeometry g = {0};
   if (panelW < 32 || panelW > PANEL_MAX_W) panelW = DEFAULT_PANEL_W;
-  // Only 1/8, 1/16 and 1/32 scan heights exist on HUB75, and the address-line
-  // count is log2(height) - 1.
-  if (panelH != 16 && panelH != 32 && panelH != 64) panelH = DEFAULT_PANEL_H;
+  // The DSI panel is one fixed geometry (no HUB75 scan-height rules); clamp to sanity.
+  if (panelH < 16 || panelH > DEFAULT_PANEL_H) panelH = DEFAULT_PANEL_H;
   if (cols < 1) cols = 1;
   if (rows < 1) rows = 1;
 
@@ -84,11 +84,15 @@ PanelGeometry dispPlan(uint16_t panelW, uint16_t panelH, uint8_t cols, uint8_t r
 
   g.panelW  = panelW;  g.panelH = panelH;
   g.cols    = cols;    g.rows   = rows;
-  g.cellW   = (uint8_t)(panelW / cols);
-  g.cellH   = (uint8_t)(panelH / rows);
-  g.originX = (uint8_t)((panelW - g.cellW * cols) / 2);
-  g.originY = (uint8_t)((panelH - g.cellH * rows) / 2);
-  g.font    = font1252Best(g.cellW, g.cellH);
+  g.cellW   = (uint16_t)(panelW / cols);
+  g.cellH   = (uint16_t)(panelH / rows);
+  g.originX = (uint16_t)((panelW - g.cellW * cols) / 2);
+  g.originY = (uint16_t)((panelH - g.cellH * rows) / 2);
+  // The Helvetica flap face when the cell affords it; the bitmap faces otherwise
+  // (they still serve fliporama cells and tiny walls).
+  g.bigFace = (g.cellW >= FONTFLAP_W + 2 && g.cellH >= FONTFLAP_H + 2);
+  g.font    = font1252Best(g.cellW > 255 ? 255 : (uint8_t)g.cellW,
+                           g.cellH > 255 ? 255 : (uint8_t)g.cellH);
   g.ready   = false;
   return g;
 }
@@ -236,16 +240,61 @@ void dispTestPattern() {
 void dispMarkDirty() { dispDirty = true; }
 
 const char* dispFontName() {
-  static char name[8] = "-";
-  if (gPanel.font) snprintf(name, sizeof(name), "%ux%u", gPanel.font->width, gPanel.font->height);
+  static char name[12] = "-";
+  if (gPanel.bigFace) snprintf(name, sizeof(name), "flap%ux%u", FONTFLAP_W, FONTFLAP_H);
+  else if (gPanel.font) snprintf(name, sizeof(name), "%ux%u", gPanel.font->width, gPanel.font->height);
   return name;
 }
 
 // Draw the part of one flap face lying in local rows [rowFrom, rowTo). A colour
 // flap is a solid swatch inset by the seam gutter; a character flap is its glyph,
 // clipped to the same row band.
+// The big-face twin of the loop below: same clipping and row-band contract, but the
+// glyph mask is byte-packed FONTFLAP rows instead of 16-bit font1252 words, blitted
+// as horizontal runs (a 72px row is up to 9 run blits, not 72 guarded pixel writes).
+// The LCD cells are big enough to draw the flap CARD itself, not just its glyph: a
+// dark card face with a gutter around it, the way a real module's flap sits in its
+// housing. A colour flap fills the whole card. The permanent seam -- the split every
+// real flap card has -- is drawn by drawCell over the settled face.
+static const int     CARD_GUTTER = 3;
+static const uint8_t CARD_RGB[3] = {24, 24, 28};   // near-black card, warm-white ink pops
+
+static void drawFaceBig(int cx, int cy, const FaceSnap& f, Ink ink, int rowFrom, int rowTo) {
+  int padX = (gPanel.cellW - FONTFLAP_W) / 2; if (padX < 0) padX = 0;
+  int padY = (gPanel.cellH - FONTFLAP_H) / 2; if (padY < 0) padY = 0;
+  // Card background (band-clipped so the flip animation splits it at the fold too).
+  const int cardX = cx + CARD_GUTTER, cardW = gPanel.cellW - 2 * CARD_GUTTER;
+  {
+    int a = CARD_GUTTER > rowFrom ? CARD_GUTTER : rowFrom;
+    int b = (gPanel.cellH - CARD_GUTTER) < rowTo ? (gPanel.cellH - CARD_GUTTER) : rowTo;
+    if (a < b) {
+      const uint8_t* bg = CARD_RGB;
+      if (f.colour >= 0) { panelFillRect(cardX, cy + a, cardW, b - a, ink.r, ink.g, ink.b); return; }
+      panelFillRect(cardX, cy + a, cardW, b - a, bg[0], bg[1], bg[2]);
+    } else if (f.colour >= 0) return;
+  }
+  if (f.glyph < 0 || f.glyph >= FONTFLAP_N) return;
+  static uint8_t inkRow[FONTFLAP_W * 3];
+  for (int i = 0; i < FONTFLAP_W; i++) { inkRow[i*3] = ink.r; inkRow[i*3+1] = ink.g; inkRow[i*3+2] = ink.b; }
+  const uint8_t* bits = FONTFLAP_BITS[f.glyph];
+  for (int r = 0; r < FONTFLAP_H; r++) {
+    int local = padY + r;
+    if (local < rowFrom || local >= rowTo) continue;
+    const uint8_t* row = bits + r * FONTFLAP_BPR;
+    int c = 0;
+    while (c < FONTFLAP_W) {
+      if (!(row[c >> 3] & (0x80 >> (c & 7)))) { c++; continue; }
+      int run = c;
+      while (run < FONTFLAP_W && (row[run >> 3] & (0x80 >> (run & 7)))) run++;
+      panelBlitRow888(cx + padX + c, cy + local, run - c, inkRow);
+      c = run;
+    }
+  }
+}
+
 static void drawFace(int cx, int cy, const FaceSnap& f, Ink ink, int rowFrom, int rowTo) {
   if (rowFrom >= rowTo) return;
+  if (gPanel.bigFace) { drawFaceBig(cx, cy, f, ink, rowFrom, rowTo); return; }
   const Font1252& fn = *gPanel.font;
   // dispPlan guarantees the face fits, but centring maths on an undersized cell would
   // otherwise produce a negative offset and bleed into the neighbouring module. Clamp
@@ -324,9 +373,15 @@ static void drawCell(int col, int row, const CellSnap& c) {
 
   Ink cur = faceInk(c.cur);
 
-  // Settled: nothing but the face. A real flap shows no fold once it has landed.
+  // Settled. On the LED wall that meant nothing but the face -- no pixels to spare.
+  // The LCD draws the flap CARD, and a real card always shows its split: a permanent
+  // seam across the middle, two dark lines wide, whatever the face shows.
   if (c.phase == 0) {
     drawFace(cx, cy, c.cur, cur, 0, gPanel.cellH);
+    if (gPanel.bigFace) {
+      const int seamY = cy + gPanel.cellH / 2 - 1;
+      panelFillRect(cx + CARD_GUTTER, seamY, gPanel.cellW - 2 * CARD_GUTTER, 2, 0, 0, 0);
+    }
     return;
   }
 
@@ -334,10 +389,11 @@ static void drawCell(int col, int row, const CellSnap& c) {
   // outgoing flap's bottom half is still below it. The fold sits on the glyph's own
   // mid-line, not the cell's, so it reads as the crease across the character however
   // much vertical margin the cell has.
-  const Font1252& fn = *gPanel.font;
-  int padX = (gPanel.cellW - fn.width)  / 2; if (padX < 0) padX = 0;
-  int padY = (gPanel.cellH - fn.height) / 2; if (padY < 0) padY = 0;
-  int seam = padY + fn.height / 2;
+  const int faceW = gPanel.bigFace ? FONTFLAP_W : gPanel.font->width;
+  const int faceH = gPanel.bigFace ? FONTFLAP_H : gPanel.font->height;
+  int padX = (gPanel.cellW - faceW) / 2; if (padX < 0) padX = 0;
+  int padY = (gPanel.cellH - faceH) / 2; if (padY < 0) padY = 0;
+  int seam = padY + faceH / 2;
   if (seam < 1) seam = 1;
   if (seam > gPanel.cellH - 2) seam = gPanel.cellH - 2;
 
@@ -347,7 +403,11 @@ static void drawCell(int col, int row, const CellSnap& c) {
   drawFace(cx, cy, c.cur,  cur, seam + 1, gPanel.cellH);
   // The crease spans the face's own footprint, so it lines up with the glyph box and the
   // colour swatch rather than the full cell.
-  panelHLine(cx + padX, cy + seam, fn.width, fold.r, fold.g, fold.b);
+  if (gPanel.bigFace)
+    panelFillRect(cx + CARD_GUTTER, cy + seam, gPanel.cellW - 2 * CARD_GUTTER, 2,
+                  fold.r / 3, fold.g / 3, fold.b / 3);
+  else
+    panelHLine(cx + padX, cy + seam, faceW, fold.r, fold.g, fold.b);
 }
 
 bool dispRender() {
