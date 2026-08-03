@@ -57,7 +57,7 @@
 // framebuffer and the WiFi stack are already fighting over. At 40 bytes a module that is
 // ~7.7 KB here, which is affordable; it was not when a module carried its own 64-byte flap
 // table (see v1.5).
-#define VM_MAX_MODULES   192
+#define VM_MAX_MODULES   320   // 32x10 wall on the LCD (was 192 on the matrix)
 
 // The reel's colour flaps are addressed by the LOWERCASE letters r o y g b p w on the
 // legacy path, which is exactly why that path never scans the lowercase section -- see

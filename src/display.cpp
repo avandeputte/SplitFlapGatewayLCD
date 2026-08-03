@@ -85,12 +85,21 @@ PanelGeometry dispPlan(uint16_t panelW, uint16_t panelH, uint8_t cols, uint8_t r
   g.panelW  = panelW;  g.panelH = panelH;
   g.cols    = cols;    g.rows   = rows;
   g.cellW   = (uint16_t)(panelW / cols);
+  // A flap card keeps its proportions no matter the row count: height is capped at
+  // FLAP_ASPECT x width, and a wall that does not fill the panel vertically is
+  // letterboxed -- originY centres the rows. (10 rows of 40x80 cards fill exactly.)
   g.cellH   = (uint16_t)(panelH / rows);
+  if (g.cellH > g.cellW * FLAP_ASPECT) g.cellH = (uint16_t)(g.cellW * FLAP_ASPECT);
   g.originX = (uint16_t)((panelW - g.cellW * cols) / 2);
   g.originY = (uint16_t)((panelH - g.cellH * rows) / 2);
-  // The Helvetica flap face when the cell affords it; the bitmap faces otherwise
+  // The largest Helvetica flap face the cell affords, or null for the bitmap faces
   // (they still serve fliporama cells and tiny walls).
-  g.bigFace = (g.cellW >= FONTFLAP_W + 2 && g.cellH >= FONTFLAP_H + 2);
+  g.flap = nullptr;
+  for (int i = 0; i < FONTFLAP_FACE_CNT; i++)
+    if (g.cellW >= FONTFLAP_FACES[i].w + 2 && g.cellH >= FONTFLAP_FACES[i].h + 2) {
+      g.flap = &FONTFLAP_FACES[i];
+      break;
+    }
   g.font    = font1252Best(g.cellW > 255 ? 255 : (uint8_t)g.cellW,
                            g.cellH > 255 ? 255 : (uint8_t)g.cellH);
   g.ready   = false;
@@ -241,7 +250,7 @@ void dispMarkDirty() { dispDirty = true; }
 
 const char* dispFontName() {
   static char name[12] = "-";
-  if (gPanel.bigFace) snprintf(name, sizeof(name), "flap%ux%u", FONTFLAP_W, FONTFLAP_H);
+  if (gPanel.flap) snprintf(name, sizeof(name), "flap%ux%u", gPanel.flap->w, gPanel.flap->h);
   else if (gPanel.font) snprintf(name, sizeof(name), "%ux%u", gPanel.font->width, gPanel.font->height);
   return name;
 }
@@ -260,8 +269,9 @@ static const int     CARD_GUTTER = 3;
 static const uint8_t CARD_RGB[3] = {24, 24, 28};   // near-black card, warm-white ink pops
 
 static void drawFaceBig(int cx, int cy, const FaceSnap& f, Ink ink, int rowFrom, int rowTo) {
-  int padX = (gPanel.cellW - FONTFLAP_W) / 2; if (padX < 0) padX = 0;
-  int padY = (gPanel.cellH - FONTFLAP_H) / 2; if (padY < 0) padY = 0;
+  const FlapFace& ff = *gPanel.flap;
+  int padX = (gPanel.cellW - ff.w) / 2; if (padX < 0) padX = 0;
+  int padY = (gPanel.cellH - ff.h) / 2; if (padY < 0) padY = 0;
   // Card background (band-clipped so the flip animation splits it at the fold too).
   const int cardX = cx + CARD_GUTTER, cardW = gPanel.cellW - 2 * CARD_GUTTER;
   {
@@ -274,18 +284,18 @@ static void drawFaceBig(int cx, int cy, const FaceSnap& f, Ink ink, int rowFrom,
     } else if (f.colour >= 0) return;
   }
   if (f.glyph < 0 || f.glyph >= FONTFLAP_N) return;
-  static uint8_t inkRow[FONTFLAP_W * 3];
-  for (int i = 0; i < FONTFLAP_W; i++) { inkRow[i*3] = ink.r; inkRow[i*3+1] = ink.g; inkRow[i*3+2] = ink.b; }
-  const uint8_t* bits = FONTFLAP_BITS[f.glyph];
-  for (int r = 0; r < FONTFLAP_H; r++) {
+  static uint8_t inkRow[FONTFLAP_MAX_W * 3];
+  for (int i = 0; i < ff.w; i++) { inkRow[i*3] = ink.r; inkRow[i*3+1] = ink.g; inkRow[i*3+2] = ink.b; }
+  const uint8_t* bits = ff.bits + (size_t)f.glyph * ff.h * ff.bpr;
+  for (int r = 0; r < ff.h; r++) {
     int local = padY + r;
     if (local < rowFrom || local >= rowTo) continue;
-    const uint8_t* row = bits + r * FONTFLAP_BPR;
+    const uint8_t* row = bits + r * ff.bpr;
     int c = 0;
-    while (c < FONTFLAP_W) {
+    while (c < ff.w) {
       if (!(row[c >> 3] & (0x80 >> (c & 7)))) { c++; continue; }
       int run = c;
-      while (run < FONTFLAP_W && (row[run >> 3] & (0x80 >> (run & 7)))) run++;
+      while (run < ff.w && (row[run >> 3] & (0x80 >> (run & 7)))) run++;
       panelBlitRow888(cx + padX + c, cy + local, run - c, inkRow);
       c = run;
     }
@@ -294,7 +304,7 @@ static void drawFaceBig(int cx, int cy, const FaceSnap& f, Ink ink, int rowFrom,
 
 static void drawFace(int cx, int cy, const FaceSnap& f, Ink ink, int rowFrom, int rowTo) {
   if (rowFrom >= rowTo) return;
-  if (gPanel.bigFace) { drawFaceBig(cx, cy, f, ink, rowFrom, rowTo); return; }
+  if (gPanel.flap) { drawFaceBig(cx, cy, f, ink, rowFrom, rowTo); return; }
   const Font1252& fn = *gPanel.font;
   // dispPlan guarantees the face fits, but centring maths on an undersized cell would
   // otherwise produce a negative offset and bleed into the neighbouring module. Clamp
@@ -378,7 +388,7 @@ static void drawCell(int col, int row, const CellSnap& c) {
   // seam across the middle, two dark lines wide, whatever the face shows.
   if (c.phase == 0) {
     drawFace(cx, cy, c.cur, cur, 0, gPanel.cellH);
-    if (gPanel.bigFace) {
+    if (gPanel.flap) {
       const int seamY = cy + gPanel.cellH / 2 - 1;
       panelFillRect(cx + CARD_GUTTER, seamY, gPanel.cellW - 2 * CARD_GUTTER, 2, 0, 0, 0);
     }
@@ -389,8 +399,8 @@ static void drawCell(int col, int row, const CellSnap& c) {
   // outgoing flap's bottom half is still below it. The fold sits on the glyph's own
   // mid-line, not the cell's, so it reads as the crease across the character however
   // much vertical margin the cell has.
-  const int faceW = gPanel.bigFace ? FONTFLAP_W : gPanel.font->width;
-  const int faceH = gPanel.bigFace ? FONTFLAP_H : gPanel.font->height;
+  const int faceW = gPanel.flap ? gPanel.flap->w : gPanel.font->width;
+  const int faceH = gPanel.flap ? gPanel.flap->h : gPanel.font->height;
   int padX = (gPanel.cellW - faceW) / 2; if (padX < 0) padX = 0;
   int padY = (gPanel.cellH - faceH) / 2; if (padY < 0) padY = 0;
   int seam = padY + faceH / 2;
@@ -403,7 +413,7 @@ static void drawCell(int col, int row, const CellSnap& c) {
   drawFace(cx, cy, c.cur,  cur, seam + 1, gPanel.cellH);
   // The crease spans the face's own footprint, so it lines up with the glyph box and the
   // colour swatch rather than the full cell.
-  if (gPanel.bigFace)
+  if (gPanel.flap)
     panelFillRect(cx + CARD_GUTTER, cy + seam, gPanel.cellW - 2 * CARD_GUTTER, 2,
                   fold.r / 3, fold.g / 3, fold.b / 3);
   else

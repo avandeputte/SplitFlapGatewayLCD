@@ -39,8 +39,9 @@ struct PanelGeometry {
   uint16_t panelW, panelH;
   uint8_t  cols, rows;
   uint16_t cellW, cellH;         // u16: an 800px panel makes 266px cells (u8 wrapped -- found the hard way)
-  uint16_t originX, originY;     // centring margin
-  bool     bigFace;              // cells big enough for the Helvetica flap face (fontflap.h)
+  uint16_t originX, originY;     // centring margin (rows centre vertically: flap cards
+                                 // keep their aspect, so short walls letterbox)
+  const struct FlapFace* flap;   // Helvetica flap face for these cells, or null (bitmap faces)
   const Font1252* font;
   bool     ready;                // the DMA driver started successfully
 };
