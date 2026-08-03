@@ -34,6 +34,23 @@ display** (800×1280 portrait, mounted landscape 1280×800).
 - Everything above the panel (web, canvas/ops JSON+binary, effects, timer/alarms,
   clap gestures, SD backup, config export/import) compiled untouched.
 
+## Bench findings (2026-08-03, first hardware session)
+
+- Chip is **ECO2 (pre-rev-3.00)** silicon → board def `esp32-p4` (ES), not `_r3`.
+- Boots to `[Boot] Ready`: 32 MB PSRAM + flash detected, all absent peripherals
+  degrade gracefully, ES8311 ACKs at 0x18, web server serves the full API.
+- "4 MB flash ceiling" was a false alarm — it's the app-slot size from the
+  partition table, same as the Matrix boards.
+- **C6 hosted link WORKS** (API served over the fallback AP) but the shipped slave
+  firmware predates the version RPC and **fails WPA auth against S4** → needs the
+  2.12.8 slave image → `POST /api/system/c6ota` added (raw-body, flashes the C6
+  through the P4). macOS won't hold an internet-less AP long enough for the push —
+  the update goes over **Ethernet** once a cable is in.
+- Display: the 0x45 backlight/power controller does not ACK → the panel had no
+  power (separate power lead required beyond the DSI FPC). panelBegin now
+  preflights 0x45 and runs headless instead of hanging in the JD9365 ID read.
+- Ethernet wired in (IP101, IDF-default P4 RMII pins) — silent init, awaiting link.
+
 ## Milestone 1 — first pixels (needs the hardware on the desk)
 
 1. Flash over USB; watch USB-Serial-JTAG console.

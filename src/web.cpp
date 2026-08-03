@@ -9,7 +9,8 @@
 #include "sound.h"           // POST /api/sound + the sound capability token (v3.6)
 #include "sensor.h"          // env fields in status + the environment token (v3.7)
 #include "sdcard.h"
-#include "backup.h"          // microSD info + the sd token (v3.10)
+#include "backup.h"
+#include "esp32-hal-hosted.h"   // C6 co-processor slave OTA (LCD Gateway)          // microSD info + the sd token (v3.10)
 #include "timer.h"           // kitchen timer + alarms (v3.14)
 #include "imu.h"             // tap detection state + the taps token (v3.15)
 #include "SD_MMC.h"          // /api/sd/* file operations
@@ -1692,6 +1693,31 @@ static esp_err_t handleApiGestures(httpd_req_t* r) {
            imuAvailable() ? "true" : "false",  cfg.tapEnabled ? "true" : "false",
            (unsigned long)imuTapTotal(), (long)imuAccelPeakMg());
   return httpxSend(r, 200, "application/json", buf);
+}
+
+/* ---- radio co-processor firmware update (LCD Gateway) ----------------------------
+   The P4 has no radio; WiFi lives on the ESP32-C6 over SDIO (esp-hosted). The C6's
+   slave firmware is field-updatable THROUGH the P4 -- same shape as /api/ota/upload:
+   POST the esp-hosted slave .bin (esp32c6-vX.Y.Z.bin) as the raw body. Born of
+   bring-up reality: the shipped slave predated the host's protocol version and
+   failed WPA auth; this endpoint is how it gets fixed without ever touching the C6's
+   own pins. The hosted link must be up (it is, whenever this server is reachable). */
+static esp_err_t handleApiC6Ota(httpd_req_t* r) {
+  size_t len = r->content_len;
+  if (len < 65536 || len > 4u * 1024u * 1024u) return httpxErr(r, 400, "implausible size for a C6 firmware image");
+  if (!hostedBeginUpdate()) return httpxErr(r, 500, "co-processor update begin failed (hosted link down?)");
+  size_t recvd = 0;
+  while (recvd < len) {
+    int n = httpd_req_recv(r, (char*)httpxBuf, min(len - recvd, (size_t)sizeof(httpxBuf)));
+    if (n <= 0) return httpxErr(r, 500, "upload aborted");
+    if (!hostedWriteUpdate(httpxBuf, (uint32_t)n)) return httpxErr(r, 500, "co-processor write failed");
+    recvd += (size_t)n;
+  }
+  if (!hostedEndUpdate()) return httpxErr(r, 500, "co-processor update verify failed");
+  if (!hostedActivateUpdate()) return httpxErr(r, 500, "co-processor activate failed");
+  printf("[C6] slave firmware updated (%u bytes) -- reboot to run it\n", (unsigned)recvd);
+  sdLog("C6 slave firmware updated: %u bytes", (unsigned)recvd);
+  return httpxSend(r, 200, "application/json", "{\"ok\":true,\"rebootNeeded\":true}");
 }
 
 /* ---- FATFS backup + settings export/import (v3.16) ------------------------------- */
@@ -4104,6 +4130,7 @@ void webInit() {
   httpxOn("/api/canvas/audio",       HTTP_GET,  handleApiCanvasAudio);
   httpxOn("/api/environment",        HTTP_GET,  handleApiEnvironment);
   httpxOn("/api/gestures",           HTTP_GET,    handleApiGestures);
+  httpxOn("/api/system/c6ota",       HTTP_POST,   handleApiC6Ota);
   httpxOn("/api/backup",             HTTP_GET,    handleApiBackup);
   httpxOn("/api/backup",             HTTP_POST,   handleApiBackup);
   httpxOn("/api/config/export",      HTTP_GET,    handleApiConfigExport);

@@ -6,6 +6,7 @@
 #include "backup.h"
 #include "imu.h"
 #include "canvas.h"   // canvasAnimLoadPlay: the boot animation
+#include <ETH.h>      // LCD Gateway: IP101 PHY behind the PoE jack
 #include <esp_ota_ops.h>   // esp_ota_get_running_partition(): which slot are we actually running?
 
 // After this many crash/watchdog reboots in a row, the boot logic reformats FATFS -- a corrupt
@@ -169,6 +170,21 @@ void setup() {
     if (rc) printf("[ANIM] boot animation '%s' failed (%d)\n", cfg.bootAnim, rc);
     else    printf("[ANIM] boot animation '%s' playing\n", cfg.bootAnim);
   }
+
+  // 8a. Ethernet (LCD Gateway): the P4 carries an IP101 PHY behind the PoE jack --
+  // wired is this board's born deployment mode, and it needs no C6 co-processor.
+  // Runs alongside WiFi; DHCP on either interface serves the gateway. Pin facts:
+  // SMI MDC=31 MDIO=52, PHY reset=51, addr 1, RMII data pins via build flags
+  // (IDF-default P4 wiring, matching Waveshare's own ethernetbasic example).
+  Network.onEvent([](arduino_event_id_t ev, arduino_event_info_t info) {
+    if (ev == ARDUINO_EVENT_ETH_GOT_IP)
+      printf("[ETH] up: %s\n", ETH.localIP().toString().c_str());
+    else if (ev == ARDUINO_EVENT_ETH_DISCONNECTED)
+      printf("[ETH] link down\n");
+  });
+  ETH.setHostname(cfgHostname());
+  if (!ETH.begin(ETH_PHY_IP101, 1, 31, 52, 51, EMAC_CLK_EXT_IN))
+    printf("[ETH] init failed (no PHY?)\n");
 
   // 8. WiFi -- MUST be initialised here, on the main Arduino task.
   // The SoftAP is a FALLBACK only: start in station mode and connect to the
