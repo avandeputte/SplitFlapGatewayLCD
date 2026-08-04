@@ -283,6 +283,7 @@ void taskNetwork(void* pv) {
   // very association we are waiting on. Give the stack a full interval to succeed.
   wifiRetryMs = millis();
   static bool wifiSuppressed = false;
+  static unsigned long ntpRetryMs = 0;   // NTP-over-Ethernet retry clock (0 = never tried)
   while (true) {
     // Wired preferred (LCD Gateway): while Ethernet has an IP, power WiFi OFF -- the IP101 MAC is
     // the reliable native path, so the fragile WiFi-over-SDIO C6 link is not run at all (frees
@@ -295,6 +296,13 @@ void taskNetwork(void* pv) {
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
         printf("[WiFi] Ethernet up -- WiFi disabled (wired link preferred)\n");
+      }
+      // NTP over Ethernet: the WiFi-connect path below (which normally kicks the sync) never
+      // runs while wired, so drive it here -- immediately on ETH up, then retried every 60 s
+      // until it lands. Without this the clock stays 00:00:00 on a wired-only board.
+      if (!ntpSynced && (!ntpRetryMs || millis() - ntpRetryMs > 60000UL)) {
+        ntpRetryMs = millis();
+        ntpSynced = rtcNTPSync();
       }
       wdgNetMs = millis();
       vTaskDelay(pdMS_TO_TICKS(250));

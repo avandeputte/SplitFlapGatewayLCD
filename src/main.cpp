@@ -306,12 +306,13 @@ void loop() {
     printf("[WDG] up=%lus heap=%u min=%u maxblk=%u minblk=%u "
            "stk(frames/web/net/httpd/rtc/disp)=%u/%u/%u/%u/%u/%u "
            "tx=%lu psram=%u panel=%d "
-           "wifi=%d ap=%d rssi=%d mods=%d\n",
+           "wifi=%d eth=%d ap=%d rssi=%d mods=%d\n",
            now/1000, freeHeap, minHeap, maxBlk, minBlkEver,
            sFrm, sWeb, sNet, sHtp, sRtc, sDsp,
            txCount,
            (unsigned)ESP.getFreePsram(), (int)gPanel.ready,
            (int)(WiFi.status()==WL_CONNECTED),
+           (int)gEthUp,
            (int)gApActive,
            (WiFi.status()==WL_CONNECTED) ? (int)WiFi.RSSI() : 0,
            vmCount);
