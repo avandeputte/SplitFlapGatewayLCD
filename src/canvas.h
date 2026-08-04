@@ -68,6 +68,11 @@ bool canvasAtlasBlitFrom(int handle, uint16_t i, int x, int y);
 // integer scale 1..4. The plain BlitFrom is the identity-transform shim.
 bool canvasAtlasBlitEx(int handle, uint16_t i, int x, int y,
                        bool flipH, bool flipV, uint16_t rot, uint8_t scale);
+// v0.2: arbitrary (fractional) scale via dest-space nearest sampling -- the icon-forward
+// apps' ask. scale is a float > 0; flip/rotate as above. (The integer BlitEx stays the fast
+// path for 1..4.) (x,y) is the top-left of the scaled sprite.
+bool canvasAtlasBlitScaled(int handle, uint16_t i, int x, int y,
+                           bool flipH, bool flipV, uint16_t rot, float scale);
 int  canvasAtlasSave(const char* name);                    // 0 / 404 / 507 / 503
 int  canvasAtlasDelete(const char* name);                  // 0 / 404
 void canvasAtlasListJson(void (*sink)(const char*));       // [{name,tiles,w,h,fmt,bytes,resident,persisted},…]

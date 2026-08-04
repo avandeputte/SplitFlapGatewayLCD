@@ -2705,6 +2705,8 @@ static int alignIdx(const char* a, const char* mid) {   // "left/top"=0, mid=1, 
                      align 0L/1C/2R, bit2 aa, bit3 has-outline, bit4 has-shadow; text
                      UTF-8, len u8; (x,y) = top-left of the ascent box)
      0x22 BLUR      x y w h radius(u8)           (separable box-blur of the region in place)
+     0x23 SPRITE2   i x y flags scale(u16 8.8)   (arbitrary fractional sprite scale; flags
+                                                  bit0 flipH, bit1 flipV, bits2-3 rot/90)
    Flag bits: CIRCLE flags bit1 = aa outline; POLY flags bit2 = aa outline/polyline. */
 static inline int16_t bops16(const uint8_t* p) { return (int16_t)(((uint16_t)p[0] << 8) | p[1]); }
 
@@ -2971,6 +2973,14 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
         i = q + slen; break; }
       case 0x22: { BOPS_NEED(9); BXY(0);                                            // BLUR
         panelBoxBlur(x, y, xfW(bops16(p+i+4)), xfH(bops16(p+i+6)), p[i+8]); i += 9; break; }
+      case 0x23: { BOPS_NEED(9);                                                   // SPRITE2 (frac scale)
+        const uint16_t ti = (uint16_t)((p[i] << 8) | p[i+1]);
+        const int sxp = xfX(bops16(p+i+2), bops16(p+i+4)), syp = xfY(bops16(p+i+2), bops16(p+i+4));
+        const uint8_t fl = p[i+6];
+        const float sc = (float)(((uint16_t)p[i+7] << 8) | p[i+8]) / 256.0f;       // u16 8.8 fixed
+        canvasAtlasBlitScaled(canvasAtlasBoundHandle(), ti, sxp, syp,
+                              fl & 1, fl & 2, (uint16_t)(((fl >> 2) & 3) * 90), sc);
+        i += 9; break; }
       default: ok = false; break;
     }
     if (!ok) break;
@@ -3049,9 +3059,13 @@ static int canvasOpsRun(JsonArrayConst ops, bool* shownOut, int depth) {
       // transparent pixels skipped. Nothing bound or i out of range: skip, don't count.
       const int ti = op["i"] | -1;
       const char* fl = op["flip"] | "";                  // "h" | "v" | "hv" (v3.5)
-      if (ti < 0 || !canvasAtlasBlitEx(canvasAtlasBoundHandle(), (uint16_t)ti, x, y,
-                                       strchr(fl, 'h') != nullptr, strchr(fl, 'v') != nullptr,
-                                       (uint16_t)(op["rot"] | 0), (uint8_t)(op["scale"] | 1)))
+      const int hnd = canvasAtlasBoundHandle();
+      const bool ih = strchr(fl, 'h') != nullptr, iv = strchr(fl, 'v') != nullptr;
+      const uint16_t rt = (uint16_t)(op["rot"] | 0);
+      const float sc = op["scale"] | 1.0f;               // v0.2: fractional scale allowed
+      const bool useInt = (sc == (float)(int)sc && sc >= 1.0f && sc <= 4.0f);
+      if (ti < 0 || !(useInt ? canvasAtlasBlitEx(hnd, (uint16_t)ti, x, y, ih, iv, rt, (uint8_t)sc)
+                             : canvasAtlasBlitScaled(hnd, (uint16_t)ti, x, y, ih, iv, rt, sc)))
         continue;
     } else if (!strcmp(k, "scroll")) {
       uint8_t r = 0, g = 0, b = 0; canvasColor(op["color"], r, g, b);   // vacated pixels: black default
