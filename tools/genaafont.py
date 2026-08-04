@@ -17,7 +17,7 @@ DATE_CH = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 # v3.5: the ops "text aa" path uses these faces for arbitrary strings, so every face
 # now carries the full set (the clock still only reaches for what it always did).
 AA_CH   = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:.-+%/"
-BIG_YS, MED_YS = 1.60, 1.35         # HH MM vertical stretch (Orbitron is limited by width, so tall is free)
+BIG_YS, MED_YS = 2.00, 1.35         # HH MM vertical stretch (Orbitron is limited by width, so tall is free)
 
 def load(px):
     f = ImageFont.truetype(TTF, px)
@@ -28,7 +28,7 @@ def load(px):
 
 def fit_px(maxw, maxh, ys, ref="2238"):     # largest size whose ref width and stretched digit fit
     best = 10
-    for px in range(10, 150):
+    for px in range(10, 420):
         f = load(px)
         bb = f.getbbox("8")
         if f.getlength(ref) > maxw or (bb[3] - bb[1]) * ys > maxh: break
@@ -37,14 +37,14 @@ def fit_px(maxw, maxh, ys, ref="2238"):     # largest size whose ref width and s
 
 def fit_text(text, maxw):                    # largest size whose whole string fits maxw
     best = 8
-    for px in range(8, 40):
+    for px in range(8, 120):
         if load(px).getlength(text) > maxw: break
         best = px
     return best
 
-BIG_PX   = fit_px(112, 46, BIG_YS)   # tall panel: HH MM digits <=112 wide, stretched cap <=46
-MED_PX   = fit_px(104, 24, MED_YS)   # 128x32 panel
-SMALL_PX = fit_text("SEPTEMBER 16", 122)   # the widest date must fit the panel
+BIG_PX   = fit_px(1150, 420, BIG_YS)   # LCD Gateway: HH MM nearly full width, cap <=420
+MED_PX   = fit_px(700, 140, MED_YS)    # mid face: alerts, ops text
+SMALL_PX = fit_text("SEPTEMBER 16", 1000)   # the widest date must fit the panel
 
 def pack1bit(img):                           # row-padded to bytes, MSB = leftmost, ink where cov >= 128
     w, h = img.width, img.height
@@ -108,8 +108,8 @@ with open(OUT, "w") as f:
             "// BIG/MED = HH MM digits (the clock draws the colon as two dots); SMALL = spelled date.\n"
             "#pragma once\n#include <stdint.h>\n\n"
             "// off is the byte offset of the glyph's packed mask in cov[]; each row is (w+7)/8 bytes.\n"
-            "struct AAGlyph { uint8_t w, h; int8_t xoff, yoff; uint8_t adv; uint16_t off; };\n"
-            "struct AAFont  { uint8_t asc; const AAGlyph* g; const uint8_t* cov; const uint8_t* idx; };\n\n")
+            "struct AAGlyph { uint16_t w, h; int16_t xoff, yoff; uint16_t adv; uint32_t off; };\n"
+            "struct AAFont  { uint16_t asc; const AAGlyph* g; const uint8_t* cov; const uint8_t* idx; };\n\n")
     emit(f, "AAFONT_BIG", big)
     emit(f, "AAFONT_MED", med)
     emit(f, "AAFONT_SMALL", small)

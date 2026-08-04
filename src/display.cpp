@@ -61,6 +61,17 @@ static inline void snapFace(FaceSnap& f, int flap) {
 static void drawCell(int col, int row, const CellSnap& c);
 static void drawFace(int cx, int cy, const FaceSnap& f, Ink ink, int rowFrom, int rowTo);
 
+// Which surface scale an effect renders at. The fluid per-pixel effects were
+// authored for a ~256-wide matrix: they run at 1/EFFECT_RENDER_SCALE and the PPA
+// upscales -- pattern size and frame rate both right, chunky pixels part of the
+// look. The CLOCK is typography: it lays itself out from W/H and the AA faces are
+// generated at LCD size, so it renders native -- 5x-upscaled digits read as jagged
+// (Alex's words) where a plasma blob reads as retro.
+uint8_t effectScaleFor(uint8_t type) {
+  if (type == EFFECT_CLOCK || type == EFFECT_NONE || type == EFFECT_SOUNDWALL) return 1;
+  return EFFECT_RENDER_SCALE;
+}
+
 PanelGeometry dispPlan(uint16_t panelW, uint16_t panelH, uint8_t cols, uint8_t rows) {
   PanelGeometry g = {0};
   if (panelW < 32 || panelW > PANEL_MAX_W) panelW = DEFAULT_PANEL_W;
@@ -514,6 +525,10 @@ void taskDisplay(void* pv) {
     // on the web task's core -- the source of the old cellN=0 divide-by-zero / use-after-free race.
     if (gEffectReq != EFFECT_REQ_IDLE) {
       uint8_t req = gEffectReq; gEffectReq = EFFECT_REQ_IDLE;
+      // Scale BEFORE reset: effectReset sizes per-column/cell state from the live
+      // surface, and seeding matrix rain for a 1280-wide surface scribbled past its
+      // 256-entry arrays (found the hard way: no rain, corrupted neighbours).
+      panelSetScale(effectScaleFor(req));
       effectReset(req);
       gEffect = req;
     }
@@ -525,11 +540,11 @@ void taskDisplay(void* pv) {
     // On-device effect owns the panel: render a frame at the panel's native rate (panelShow
     // inside effectRender paces us to one refresh), instead of the reel wall.
     else if (gEffect != EFFECT_NONE) {
-      // Pixel effects render at their authored scale (see panelSetScale). An alert or
+      // Each effect renders at its authored scale (see effectScaleFor). An alert or
       // canvas interlude resets the surface to native; coming back here re-establishes
       // the scale AND re-resets the effect -- its buffers were sized for the old dims.
-      if (panelGetScale() != EFFECT_RENDER_SCALE) {
-        panelSetScale(EFFECT_RENDER_SCALE);
+      if (panelGetScale() != effectScaleFor(gEffect)) {
+        panelSetScale(effectScaleFor(gEffect));
         effectReset(gEffect);
       }
       effectRender(gEffect);
