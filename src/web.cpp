@@ -3434,7 +3434,18 @@ static esp_err_t handleApiCanvasFrameGet(httpd_req_t* r) {
   // breaker as the large uploads: refuse a preview rather than risk a reboot. A poller just retries.
   if (ESP.getFreeHeap() < CANVAS_MIN_UPLOAD_HEAP) { httpxErr(r, 507, "Low on memory -- try again in a moment"); return ESP_OK; }
   const bool rgb565 = (httpxArg(r, "fmt") == "rgb565");
-  const size_t need = (size_t)gPanel.panelW * gPanel.panelH * (rgb565 ? 2 : 3);
+  const uint8_t bpp = rgb565 ? 2 : 3;
+  // Downscale (v0.2): ?scale=N returns every Nth pixel -> a (W/N)x(H/N) preview. A live
+  // preview of an lcd_ops app (aquarium, games) has no companion-side frame, so the browser
+  // polls this ~1/s; at full res that is a ~2 MB send that blocks the single HTTP worker for
+  // seconds, so control requests (an app switch, /api/status) queue behind it and the wall
+  // reads "offline". A scale-4 preview is 320x200 -- 16x less -- and sends in a blink. The
+  // snapshot is always full-res (fast local copy); only the SENT image shrinks. Default 1.
+  int scale = httpxArg(r, "scale").toInt();
+  if (scale < 1) scale = 1; else if (scale > 16) scale = 16;
+  const int fullW = gPanel.panelW, fullH = gPanel.panelH;
+  const int ow = fullW / scale, oh = fullH / scale;
+  const size_t need = (size_t)fullW * fullH * bpp;   // full-res snapshot buffer
   if (rbCap < need) {
     if (rbBuf) free(rbBuf);
     rbBuf = (uint8_t*)ps_malloc(need);
@@ -3447,14 +3458,29 @@ static esp_err_t handleApiCanvasFrameGet(httpd_req_t* r) {
   // response is sent, so a shared stack buffer made both headers read the LAST value
   // written (the width header said "64" -- the sheared-preview bug).
   static char wv[16], hv[16];
-  snprintf(wv, sizeof(wv), "%u", (unsigned)gPanel.panelW);  httpd_resp_set_hdr(r, "X-Canvas-Width", wv);
-  snprintf(hv, sizeof(hv), "%u", (unsigned)gPanel.panelH);  httpd_resp_set_hdr(r, "X-Canvas-Height", hv);
+  snprintf(wv, sizeof(wv), "%u", (unsigned)ow);  httpd_resp_set_hdr(r, "X-Canvas-Width", wv);
+  snprintf(hv, sizeof(hv), "%u", (unsigned)oh);  httpd_resp_set_hdr(r, "X-Canvas-Height", hv);
   httpd_resp_set_hdr(r, "X-Canvas-Format", rgb565 ? "rgb565" : "rgb888");
   httpd_resp_set_type(r, "application/octet-stream");
-  for (size_t off = 0; off < need; off += 4096) {   // bigger chunks: fewer writes, faster drain
-    size_t c = (need - off < 4096) ? (need - off) : 4096;
-    httpxChunk(r, (const char*)(rbBuf + off), c);
-    wdgWebMs = millis();                              // feed the web watchdog on a ~48 KB send
+  if (scale == 1) {
+    for (size_t off = 0; off < need; off += 4096) {   // full res: stream straight from rbBuf
+      size_t c = (need - off < 4096) ? (need - off) : 4096;
+      httpxChunk(r, (const char*)(rbBuf + off), c);
+      wdgWebMs = millis();
+    }
+  } else {
+    // Downscaled: build each output row by sampling every Nth source pixel, send it.
+    static uint8_t orow[PANEL_MAX_W * 3];
+    for (int oy = 0; oy < oh; oy++) {
+      const uint8_t* srow = rbBuf + (size_t)(oy * scale) * fullW * bpp;
+      uint8_t* d = orow;
+      for (int ox = 0; ox < ow; ox++) {
+        const uint8_t* s = srow + (size_t)(ox * scale) * bpp;
+        for (int k = 0; k < bpp; k++) *d++ = s[k];
+      }
+      httpxChunk(r, (const char*)orow, (size_t)ow * bpp);
+      wdgWebMs = millis();
+    }
   }
   return httpxChunkEnd(r);
 }
