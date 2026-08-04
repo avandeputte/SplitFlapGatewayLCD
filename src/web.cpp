@@ -1529,7 +1529,7 @@ void canvasStreamPump() {
   // The wall/effect/timer took the panel back (dispReturnToWall) while this stream was still
   // open: close it so a client that didn't stand its app down can't keep painting over the
   // newcomer. taskWeb is the one task allowed to touch the socket, so the close happens here.
-  if (gCanvasStreamKill && cs.req) { gCanvasStreamKill = false; csClose(false, "wall takeover"); return; }
+  if (gCanvasStreamKill && cs.req) { gCanvasStreamKill = false; csClose(false, "superseded"); return; }
   if (!cs.req) return;
   if (gOtaInProgress) { csClose(false, "ota"); return; }
   cs.ticks++;
@@ -1987,7 +1987,17 @@ static esp_err_t handleApiCanvasStreamGet(httpd_req_t* r) {
 static esp_err_t handleApiCanvasStream(httpd_req_t* r) {
   if (!gPanel.ready)     return httpxErr(r, 503, "Panel not running");
   if (quietBlocked(r)) return ESP_OK;
-  if (cs.req)            return httpxErr(r, 409, "a stream is already open");
+  // A stream is still open (the previous canvas app's -- its client didn't stand it down): the
+  // NEWCOMER wins. Ask the pump (taskWeb owns the socket) to close the old one and wait briefly
+  // for it, rather than 409'ing and letting the defunct app keep the panel. This is the
+  // canvas->canvas analog of the wall-takeover eviction. The companion closing it first (the
+  // normal path) still works -- cs.req is already clear, so this is skipped.
+  if (cs.req) {
+    gCanvasStreamKill = true;                          // the pump csCloses it on its next ~15 ms tick
+    const uint32_t t0 = millis();
+    while (cs.req && (uint32_t)(millis() - t0) < 400) { wdgWebMs = millis(); vTaskDelay(pdMS_TO_TICKS(10)); }
+    if (cs.req) return httpxErr(r, 409, "previous stream still closing -- retry");
+  }
   if (gOtaInProgress)    return httpxErr(r, 503, "OTA in progress");
   if (ESP.getFreeHeap() < CANVAS_MIN_UPLOAD_HEAP)
     return httpxErr(r, 507, "Low on memory -- try again in a moment");
