@@ -1526,6 +1526,10 @@ static bool csExec() {
 // executes whatever has arrived, up to a per-tick byte budget so taskWeb's other
 // duties (SSE, watchdog cover) keep their cadence.
 void canvasStreamPump() {
+  // The wall/effect/timer took the panel back (dispReturnToWall) while this stream was still
+  // open: close it so a client that didn't stand its app down can't keep painting over the
+  // newcomer. taskWeb is the one task allowed to touch the socket, so the close happens here.
+  if (gCanvasStreamKill && cs.req) { gCanvasStreamKill = false; csClose(false, "wall takeover"); return; }
   if (!cs.req) return;
   if (gOtaInProgress) { csClose(false, "ota"); return; }
   cs.ticks++;
@@ -1998,6 +2002,7 @@ static esp_err_t handleApiCanvasStream(httpd_req_t* r) {
     return httpxErr(r, 503, "async unavailable");
   }
   cs.req = async;                     // the socket now belongs to the pump (taskWeb)
+  gCanvasStreamKill = false;          // a fresh stream: clear any stale wall-takeover request
   csSockBlocking(false);
   canvasEnter(false);
   printf("[CANVAS] stream open\n");

@@ -273,6 +273,7 @@ extern volatile unsigned long gCompanionUrlDirtyMs;
 extern volatile bool gOtaInProgress;
 // Raw-canvas mode: HTTP owns the panel and the reel renderer stands down (see /api/canvas).
 extern volatile bool gCanvasMode;
+extern volatile bool gCanvasStreamKill;   // wall takeover -> close any lingering canvas stream
 // Acknowledgement from taskDisplay that it has parked for canvas/OTA; the take-over waits on it.
 extern volatile bool gDispParked;
 extern volatile bool gOtaRebootPending;
