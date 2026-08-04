@@ -282,7 +282,35 @@ void taskNetwork(void* pv) {
   // re-association fire at an absolute millis() of 15000 -- i.e. it interrupts the
   // very association we are waiting on. Give the stack a full interval to succeed.
   wifiRetryMs = millis();
+  static bool wifiSuppressed = false;
   while (true) {
+    // Wired preferred (LCD Gateway): while Ethernet has an IP, power WiFi OFF -- the IP101 MAC is
+    // the reliable native path, so the fragile WiFi-over-SDIO C6 link is not run at all (frees
+    // internal RAM + CPU, removes the transport-wedge failure mode). Restored the moment Ethernet
+    // drops. WiFi ops stay on this task; the ETH event just flips gEthUp.
+    if (gEthUp) {
+      if (!wifiSuppressed) {
+        wifiSuppressed = true; staWasUp = false;
+        if (gApActive) wifiSetApActive(false);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        printf("[WiFi] Ethernet up -- WiFi disabled (wired link preferred)\n");
+      }
+      wdgNetMs = millis();
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+    if (wifiSuppressed) {                       // Ethernet went away -> WiFi back as the fallback
+      wifiSuppressed = false;
+      if (strlen(cfg.wifiSSID)) {
+        WiFi.mode(WIFI_STA); WiFi.setSleep(false);
+        WiFi.begin(cfg.wifiSSID, cfg.wifiPass);
+        staDownSince = millis(); wifiRetryMs = millis();
+        printf("[WiFi] Ethernet down -- WiFi re-enabled\n");
+      } else {
+        wifiSetApActive(true);
+      }
+    }
     bool staUp = (WiFi.status() == WL_CONNECTED);
     if (staUp && !staWasUp) {
       staWasUp = true;

@@ -59,6 +59,10 @@ volatile bool gOtaRebootPending = false;
 // connects, the AP is dropped and the gateway runs STA-only. Tracks whether the
 // AP is currently up so we only switch WiFi modes on actual state transitions.
 bool gApActive = false;
+// Ethernet has an IP (LCD Gateway). Set from the ETH events; taskNetwork turns WiFi OFF while
+// this is true -- the wired IP101 MAC is the reliable native path, so the fragile WiFi-over-SDIO
+// C6 link is powered down when it isn't needed (frees internal RAM + CPU, removes a failure mode).
+volatile bool gEthUp = false;
 volatile RtcTime rtcNow = {2000,1,1,0,0,0,false};
 // POSIX TZ string used by rtcFormatTime; kept in sync with cfg.posixTZ.
 char gPosixTZ[64] = "UTC0";

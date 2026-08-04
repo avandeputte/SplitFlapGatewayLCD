@@ -278,6 +278,7 @@ extern volatile bool gCanvasStreamKill;   // wall takeover -> close any lingerin
 extern volatile bool gDispParked;
 extern volatile bool gOtaRebootPending;
 extern bool gApActive;
+extern volatile bool gEthUp;   // Ethernet has an IP -> taskNetwork powers WiFi down (wired preferred)
 extern SemaphoreHandle_t timeMutex;
 extern StaticSemaphore_t timeMutexBuf;
 extern volatile unsigned long wdgFramesMs;

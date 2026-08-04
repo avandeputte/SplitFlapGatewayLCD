@@ -179,10 +179,13 @@ void setup() {
   // SMI MDC=31 MDIO=52, PHY reset=51, addr 1, RMII data pins via build flags
   // (IDF-default P4 wiring, matching Waveshare's own ethernetbasic example).
   Network.onEvent([](arduino_event_id_t ev, arduino_event_info_t info) {
-    if (ev == ARDUINO_EVENT_ETH_GOT_IP)
+    if (ev == ARDUINO_EVENT_ETH_GOT_IP) {
       printf("[ETH] up: %s\n", ETH.localIP().toString().c_str());
-    else if (ev == ARDUINO_EVENT_ETH_DISCONNECTED)
+      gEthUp = true;    // taskNetwork powers WiFi down: wired is the reliable native path
+    } else if (ev == ARDUINO_EVENT_ETH_DISCONNECTED || ev == ARDUINO_EVENT_ETH_LOST_IP) {
       printf("[ETH] link down\n");
+      gEthUp = false;   // taskNetwork brings WiFi back as the fallback
+    }
   });
   ETH.setHostname(cfgHostname());
   if (!ETH.begin(ETH_PHY_IP101, 1, 31, 52, 51, EMAC_CLK_EXT_IN))
