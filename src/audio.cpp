@@ -6,9 +6,9 @@
 #include <driver/i2s_std.h>
 #include <math.h>
 
-// audio.cpp -- see audio.h. ES7210 register sequence ported from the esphome es7210
-// driver (MIT), clock coefficients for 16 kHz from the same table; pin map from
-// Waveshare's ESP32-S3-RGB-Matrix BSP (MCLK=12 BCLK=43 WS=38 DIN=39).
+// audio.cpp -- see audio.h. Mic capture + the DSP that feeds the audio-reactive
+// effects. On this board the mic is the ES8311 codec's own ADC (sound.cpp configures
+// the chip); the DSP (FFT, bands, beat, scope) is board-independent.
 
 /* ---- board wiring ---- */
 // Waveshare P4 board wiring (BSP-confirmed): one duplex I2S port serves the ES8311,
@@ -22,37 +22,14 @@
 #define AUD_RATE      16000
 #define AUD_HOP       128          // samples per DSP hop (also the FFT size): 8 ms
 
-/* ---- ES7210 (I2C) ---- */
-static uint8_t es7210Addr = 0;     // 7-bit, discovered by probe (0x40..0x43)
-
-static bool esWrite(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(es7210Addr);
-  Wire.write(reg);
-  Wire.write(val);
-  return Wire.endTransmission(true) == 0;
-}
-static bool esRead(uint8_t reg, uint8_t& val) {
-  Wire.beginTransmission(es7210Addr);
-  Wire.write(reg);
-  if (Wire.endTransmission(true) != 0) return false;
-  if (Wire.requestFrom(es7210Addr, (uint8_t)1) != 1) return false;
-  val = (uint8_t)Wire.read();
-  return true;
-}
-static bool esUpdate(uint8_t reg, uint8_t mask, uint8_t bits) {
-  uint8_t v;
-  if (!esRead(reg, v)) return false;
-  return esWrite(reg, (uint8_t)((v & ~mask) | (bits & mask)));
-}
-
 static bool gAudioPresent   = false;
 static volatile bool gAudioRun = false;   // capture task alive
 static i2s_chan_handle_t rxChan = NULL;
 static i2s_chan_handle_t txChan = NULL;   // speaker path (sound.cpp) -- shared clocks
 
-// The board wires ONE clock set (MCLK 12 / BCLK 43 / WS 38) to BOTH codecs, so the
-// mic (DIN 39, ES7210) and the speaker (DOUT 21, ES8311) must be one full-duplex I2S
-// port: both channels are allocated TOGETHER on first need and then never deleted --
+// The board wires one clock set to the ES8311, so the mic (its ADC -> our DIN) and
+// the speaker (its DAC <- our DOUT) are one full-duplex I2S port: both channels are
+// allocated TOGETHER on first need and then never deleted --
 // enable/disable per side only. (Deleting one side and re-creating it later fights
 // the shared clock; the idle cost is ~6 KB of DMA buffers, cheap post-v3.3.)
 bool audioAcquireI2S() {
@@ -102,14 +79,6 @@ static portMUX_TYPE   gFrameMux = portMUX_INITIALIZER_UNLOCKED;
 // each hop under gFrameMux alongside gFrame. Separate from AudioFrame so the hot per-frame
 // audioRead() copy (spectrum/soundwall) stays lean -- only the scope effect pays for it.
 static int8_t         gScope[AUDIO_SCOPE] = {0};
-// Clap event, published under gFrameMux (v3.15).
-static volatile uint8_t  gClapPending = 0;      // finalised count awaiting pickup (0 = none)
-static volatile uint32_t gClapSeq = 0;
-static volatile uint32_t gClapTotal = 0;      // events since boot (diagnostics)
-// Tuning telemetry (v3.15 bring-up): the loudest hop since last read -- its rms, its
-// high-band fraction, and the floor at that moment. Lets us calibrate the thresholds
-// from REAL claps instead of guessing. Reset on read (/api/gestures?debug=1).
-static volatile float gDbgMaxRms = 0, gDbgBrightAtMax = 0, gDbgFloorAtMax = 0;
 static volatile bool  gBeatLatch = false;
 
 bool audioAvailable() { return gAudioPresent; }
@@ -123,27 +92,10 @@ void audioRead(AudioFrame& out) {
   taskEXIT_CRITICAL(&gFrameMux);
 }
 
-uint32_t audioClapTotal() { return gClapTotal; }
 
-void audioClapDebug(float* maxRms, float* brightAtMax, float* floorAtMax) {
-  taskENTER_CRITICAL(&gFrameMux);
-  *maxRms = gDbgMaxRms; *brightAtMax = gDbgBrightAtMax; *floorAtMax = gDbgFloorAtMax;
-  gDbgMaxRms = 0;
-  taskEXIT_CRITICAL(&gFrameMux);
-}
 
-bool audioClapPoll(uint8_t* countOut, uint32_t* seqOut) {
-  bool has = false;
-  taskENTER_CRITICAL(&gFrameMux);
-  if (gClapPending) {
-    if (countOut) *countOut = gClapPending;
-    if (seqOut)   *seqOut   = gClapSeq;
-    gClapPending = 0;
-    has = true;
-  }
-  taskEXIT_CRITICAL(&gFrameMux);
-  return has;
-}
+
+
 
 void audioReadScope(int8_t* out, int n) {
   if (n > AUDIO_SCOPE) n = AUDIO_SCOPE;
@@ -152,66 +104,17 @@ void audioReadScope(int8_t* out, int n) {
   taskEXIT_CRITICAL(&gFrameMux);
 }
 
-/* ---- ES7210 bring-up (esphome sequence; 16 kHz / MCLK 256x = 4.096 MHz row:
-        adc_div=0x01 doubler=1 dll=1 osr=0x20 lrck=0x0100) ---- */
-static bool es7210Configure() {
-  bool ok = true;
-  ok &= esWrite(0x00, 0xff);              // full reset
-  ok &= esWrite(0x00, 0x32);
-  ok &= esWrite(0x01, 0x3f);              // clocks off during config
-  ok &= esWrite(0x09, 0x30);              // power-up timing
-  ok &= esWrite(0x0A, 0x30);
-  ok &= esWrite(0x23, 0x2a);              // HPF, all channels
-  ok &= esWrite(0x22, 0x0a);
-  ok &= esWrite(0x20, 0x0a);
-  ok &= esWrite(0x21, 0x2a);
-  ok &= esUpdate(0x08, 0x01, 0x00);       // I2S slave (ESP32 is bus master)
-  ok &= esWrite(0x40, 0xC3);              // analog power
-  ok &= esWrite(0x41, 0x70);              // mic bias 2.87 V
-  ok &= esWrite(0x42, 0x70);
-  ok &= esWrite(0x11, 0x60);              // SDP: 16-bit I2S
-  ok &= esWrite(0x12, 0x00);              // mic1/2 -> SDOUT1 (our DIN)
-  // clocking: reg02 = adc_div | doubler<<6 | dll<<7
-  ok &= esWrite(0x02, 0x01 | (0x01 << 6) | (0x01 << 7));
-  ok &= esWrite(0x07, 0x20);              // OSR
-  ok &= esWrite(0x04, 0x01);              // LRCK divider 0x0100 (MCLK/256)
-  ok &= esWrite(0x05, 0x00);
-  // mic gain 33 dB (reg value 11), mics 1+2 (3/4 unpopulated but harmless).
-  // The REG01 update below is LOAD-BEARING: it re-enables the ADC clocks that the
-  // 0x01=0x3f write above turned off for configuration -- omitting it leaves the
-  // ADC silent (all-zero I2S data with a perfectly healthy-looking interface).
-  for (uint8_t r = 0x43; r <= 0x46; r++) ok &= esUpdate(r, 0x10, 0x00);
-  ok &= esUpdate(0x01, 0x0b, 0x00);
-  ok &= esWrite(0x4B, 0x00);
-  ok &= esUpdate(0x43, 0x10, 0x10);
-  ok &= esUpdate(0x43, 0x0f, 11);
-  ok &= esWrite(0x4B, 0x00);
-  ok &= esUpdate(0x44, 0x10, 0x10);
-  ok &= esUpdate(0x44, 0x0f, 11);
-  ok &= esWrite(0x47, 0x08);              // mic power on
-  ok &= esWrite(0x48, 0x08);
-  ok &= esWrite(0x06, 0x04);              // DLL power down
-  ok &= esWrite(0x4B, 0x0F);              // MICBias/ADC/PGA power, ch 1+2
-  ok &= esWrite(0x4C, 0x0F);
-  ok &= esWrite(0x00, 0x71);              // enable
-  ok &= esWrite(0x00, 0x41);
-  return ok;
-}
 
 void audioInit() {
-  // Probe the four ES7210 strap addresses on the shared I2C bus (Wire is already
-  // begun by rtcInit; we are still single-threaded here -- see the header note).
-  for (uint8_t a = 0x40; a <= 0x43; a++) {
-    Wire.beginTransmission(a);
-    if (Wire.endTransmission(true) == 0) { es7210Addr = a; break; }
-  }
-  if (!es7210Addr) {
-    printf("[AUDIO] no ES7210 on I2C 0x40..0x43 -- audio effects disabled\n");
-    return;
-  }
-  gAudioPresent = es7210Configure();
-  printf("[AUDIO] ES7210 at 0x%02x: %s (dual mic, 16 kHz)\n",
-         es7210Addr, gAudioPresent ? "configured" : "CONFIG FAILED");
+  // The ES8311 is a COMBINED codec: sound.cpp drives its DAC (speaker), and its ADC
+  // captures the board's single onboard mic onto the same duplex I2S port (our DIN).
+  // There is no separate ES7210 here -- just confirm the codec answers on I2C; the
+  // register config (DAC and ADC both) is done by sound.cpp's es8311Configure() right
+  // after this, in the same single-threaded boot window. Wire is already begun.
+  Wire.beginTransmission(0x18);
+  gAudioPresent = (Wire.endTransmission(true) == 0);
+  printf("[AUDIO] ES8311 mic %s (codec ADC, 16 kHz)\n",
+         gAudioPresent ? "available" : "NOT FOUND -- audio effects disabled");
 }
 
 /* ---- DSP: 128-point real FFT via iterative radix-2, precomputed tables ---- */
@@ -276,7 +179,6 @@ static bool audioHasConsumer() {
   if (gEffect == EFFECT_SPECTRUM || gEffect == EFFECT_SOUNDWALL ||
       gEffect == EFFECT_RIPPLE  || gEffect == EFFECT_SCOPE ||
       gEffect == EFFECT_SPECTRO) return true;
-  if (cfg.clapEnabled) return true;             // clap detection is a standing consumer (v3.15)
   return gEffectAudioMod && gEffect != EFFECT_NONE;
 }
 
@@ -334,47 +236,6 @@ static void audioTask(void* pv) {
                       (millis() - lastBeatMs > 150);
     if (beat) lastBeatMs = millis();
     bassAvg = 0.984f * bassAvg + 0.016f * bass;
-
-    // Clap detector (v3.15). Runs on the RAW band magnitudes, before normalisation:
-    // attack (rms over the slow floor), broadband-high (upper bands carry the energy),
-    // refractory, then burst counting with a quiet-gap finaliser.
-    if (cfg.clapEnabled) {
-      static float clapFloor = 0.01f;
-      static unsigned long clapLastMs = 0, clapFirstMs = 0;
-      static uint8_t clapN = 0;
-      float lowSum = 0, totSum = 0;
-      for (int b2 = 0; b2 < AUDIO_BANDS; b2++) { totSum += bands[b2]; if (b2 < 3) lowSum += bands[b2]; }
-      const unsigned long cnow = millis();
-      if (rms > gDbgMaxRms) {                                      // tuning telemetry
-        gDbgMaxRms = rms;
-        gDbgBrightAtMax = totSum > 0 ? lowSum / totSum : 0;          // now reports the BASS fraction
-        gDbgFloorAtMax = clapFloor;
-      }
-      const bool attack = rms > 4.5f * clapFloor && rms > 0.035f;
-      // Spectral gate, CALIBRATED FROM REAL CLAPS (2026-08-01): a 1 m clap measured
-      // rms 0.22 with only 8% of its energy in the top bands -- through these mics a
-      // clap is mid-spread, NOT bright. What still separates it from a music thump is
-      // that it is not BASS-dominant: require the bottom three bands under half the
-      // total. (The old "high bands > 35%" gate rejected every real clap.)
-      const bool notBass = totSum > 0.0f && lowSum < 0.5f * totSum;
-      if (attack && notBass && cnow - clapLastMs > 120) {
-        if (clapN == 0) clapFirstMs = cnow;
-        if (clapN < 5) clapN++;
-        clapLastMs = cnow;
-      } else {
-        clapFloor = 0.99f * clapFloor + 0.01f * rms;         // track the room between attacks
-        if (clapFloor < 0.004f) clapFloor = 0.004f;
-      }
-      if (clapN && cnow - clapLastMs > 700) {                // burst over: publish (700 ms:
-                                                             // relaxed double-claps still merge)
-        taskENTER_CRITICAL(&gFrameMux);
-        gClapPending = clapN;
-        gClapSeq = gClapSeq + 1;
-        gClapTotal = gClapTotal + 1;                         // diagnostics (/api/gestures)
-        taskEXIT_CRITICAL(&gFrameMux);
-        clapN = 0; (void)clapFirstMs;
-      }
-    }
 
     // Slow auto-gain: envelopes rise fast, decay slow, so quiet rooms still visualise.
     if (rms > envMax) envMax = rms; else envMax *= 0.9995f;
