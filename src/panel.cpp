@@ -66,6 +66,14 @@ static esp_lcd_dsi_bus_handle_t  gDsiBus  = nullptr;
 static esp_ldo_channel_handle_t  gPhyLdo  = nullptr;
 static void*                     gScanout = nullptr;   // DPI frame buffer (esp_lcd owns it)
 static ppa_client_handle_t       gPpa     = nullptr;   // hardware rotate; null = CPU fallback
+// Serialize the whole present. panelShow() is called from taskDisplay (core 1: wall/effects),
+// taskWeb (core 0: canvas stream + ticker) and the httpd worker (core 0: one-shot frames). The
+// single PPA client is NOT safe for concurrent use -- two presents at once (the window during an
+// app switch, canvas released while a stream is still presenting) corrupt its transaction queue
+// ("exceed maximum pending transactions") and can HARD-HANG the board. This mutex makes presents
+// mutually exclusive across tasks. Recursive because panelBlipService() -> panelShow() re-enters
+// on the same task.
+static SemaphoreHandle_t         gShowMutex = nullptr;
 
 // ---- backlight --------------------------------------------------------------------
 // The display FPC carries a small controller at 0x45: reg 0x95 is the power-up
@@ -700,8 +708,9 @@ static void rotateToScanout() {
 }
 
 void panelShow() {
-  if (sOverlay) sOverlay();   // draw the overlay into the outgoing frame
   if (!info.ok) return;
+  if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY);   // one present at a time
+  if (sOverlay) sOverlay();   // draw the overlay into the outgoing frame
   if (blipUntil && (int32_t)(millis() - blipUntil) < 0) { blipStamp(); liveHasBlip = true; }
   else liveHasBlip = false;
 
@@ -730,6 +739,7 @@ void panelShow() {
   const uint8_t shown = drawBuf;
   drawBuf = liveBuf;
   liveBuf = shown;
+  if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
 }
 
 // ---- bring-up / teardown ----------------------------------------------------------
@@ -741,6 +751,7 @@ static void panelFreeAll() {
 
 bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   (void)depth; (void)fbPsram;                     // HUB75 concepts; the LCD is always RGB565/PSRAM
+  if (!gShowMutex) gShowMutex = xSemaphoreCreateRecursiveMutex();   // serialize presents (see gShowMutex)
   info = {false, width, height, 16, 0, 0};
   // The logical geometry must be the native panel rotated. Anything else (a smaller
   // "window") is representable later; bring-up keeps the 1:1 mapping.
