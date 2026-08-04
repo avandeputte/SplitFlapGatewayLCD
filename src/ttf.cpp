@@ -56,7 +56,11 @@ struct Glyph {
   uint32_t used;       // monotonic LRU stamp
   uint8_t* cov;        // w*h coverage (PSRAM), null for a zero-area glyph (e.g. space)
 };
-static Glyph  gCache[TTF_CACHE_SLOTS];
+// The table lives in PSRAM, not internal .bss: at 2048 slots it is ~48 KB, and internal RAM
+// is the scarce pool the WiFi-over-SDIO RX path draws from -- parking this table there once
+// starved sdio_process_rx under connection churn (rapid app switching) into a TASK_WDT. PSRAM
+// has 25 MB free and the table is only touched from the render path, never an ISR.
+static Glyph*   gCache = nullptr;
 static uint32_t gUseClock = 0, gCacheBytes = 0, gCacheCount = 0;
 
 static inline uint32_t glyphKey(uint8_t face, int size, int cp) {
@@ -65,6 +69,7 @@ static inline uint32_t glyphKey(uint8_t face, int size, int cp) {
 static inline uint32_t keyHash(uint32_t k) { k *= 2654435761u; return (k >> 15) & (TTF_CACHE_SLOTS - 1); }
 
 static void cacheEvictOne() {
+  if (!gCache) return;
   // Evict the least-recently-used occupied slot. Linear scan -- only runs when full/over budget.
   uint32_t best = 0xFFFFFFFF; int bi = -1;
   for (int i = 0; i < TTF_CACHE_SLOTS; i++)
@@ -78,7 +83,7 @@ static void cacheEvictOne() {
 // Find or rasterize the glyph. Returns null only on a hard failure (never for a blank glyph,
 // which returns a valid entry with cov==null and a real advance).
 static Glyph* glyphGet(uint8_t face, int size, int cp) {
-  if (!gFace[face].ready) return nullptr;
+  if (!gFace[face].ready || !gCache) return nullptr;
   const uint32_t key = glyphKey(face, size, cp);
   uint32_t h = keyHash(key);
   int firstFree = -1;
@@ -131,6 +136,10 @@ static Glyph* glyphGet(uint8_t face, int size, int cp) {
 
 // ---- public API -------------------------------------------------------------------------
 bool ttfBegin() {
+  if (!gCache) {   // the glyph-cache table in PSRAM, not internal .bss (see gCache above)
+    gCache = (Glyph*)heap_caps_calloc(TTF_CACHE_SLOTS, sizeof(Glyph), MALLOC_CAP_SPIRAM);
+    if (!gCache) { printf("[TTF] glyph cache alloc failed -- gtext disabled\n"); return false; }
+  }
   const bool okSans = faceInit(gFace[TTF_SANS], ttfSansBold);
 #ifdef TTF_HAVE_MONO
   if (!faceInit(gFace[TTF_MONO], ttfMonoBold)) gFace[TTF_MONO] = gFace[TTF_SANS];
@@ -151,6 +160,7 @@ bool ttfBegin() {
 bool ttfFaceReady(uint8_t face) { return face < TTF_FACES && gFace[face].ready; }
 
 static void cacheClearFace(uint8_t face) {
+  if (!gCache) return;
   for (int i = 0; i < TTF_CACHE_SLOTS; i++)
     if (gCache[i].key && (uint8_t)((gCache[i].key >> 28) & 3) == face) {
       if (gCache[i].cov) { free(gCache[i].cov); gCacheBytes -= (uint32_t)gCache[i].w * gCache[i].h; }
