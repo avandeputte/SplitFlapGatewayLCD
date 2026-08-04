@@ -1157,6 +1157,22 @@ paths:
           description: Internal heap is low — the upload is refused rather than risking a reboot; retry shortly
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
 
+  /api/canvas/jpeg:
+    put:
+      tags: [Canvas]
+      summary: Push a full-panel JPEG (hardware-decoded)
+      description: |
+        A full-panel JPEG, decoded on the P4's hardware JPEG engine. Far smaller on the
+        wire than a raw or QOI frame (a 1280x800 photo is tens of KB, not 2 MB), which is
+        the win over the C6 WiFi link. Dimensions must match the panel. Honours the
+        configured transition. Advertised as the `jpeg` canvas format.
+      requestBody:
+        required: true
+        content:
+          image/jpeg: { schema: { type: string, format: binary } }
+      responses:
+        "200": { description: "{ok,width,height}" }
+        "400": { description: "Not a JPEG matching the panel size" }
   /api/canvas/anim:
     put:
       tags: [Canvas]

@@ -10,6 +10,8 @@
 #include "sensor.h"          // env fields in status + the environment token (v3.7)
 #include "sdcard.h"
 #include "backup.h"
+#include <driver/jpeg_decode.h>   // P4 hardware JPEG decoder (canvas jpeg upload)
+#include <esp_cache.h>
 #include "touch.h"            // GT911 touchscreen (LCD Gateway)
 #include "esp32-hal-hosted.h"   // C6 co-processor slave OTA (LCD Gateway)          // microSD info + the sd token (v3.10)
 #include "timer.h"           // kitchen timer + alarms (v3.14)
@@ -775,7 +777,7 @@ static esp_err_t handleApiCapabilities(httpd_req_t* r) {
                     // TRUNCATED the JSON -- /api/capabilities went invalid, silently. Sized
                     // with headroom and verified below.
     snprintf(cv, sizeof(cv),
-             "\"canvas\":{\"formats\":[\"rgb888\",\"rgb565\",\"qoi\"],\"width\":%u,\"height\":%u,"
+             "\"canvas\":{\"formats\":[\"rgb888\",\"rgb565\",\"qoi\",\"jpeg\"],\"width\":%u,\"height\":%u,"
              "\"rect\":true,\"rects\":true,\"stream\":true,\"opsBin\":true,\"anim\":true,\"ticker\":true,\"readback\":true,"
              "\"atlas\":{\"named\":true,\"persist\":true,\"maxSheets\":%u,"
              "\"maxBytes\":%u,\"maxSheetBytes\":%u},"
@@ -2073,7 +2075,7 @@ static esp_err_t handleApiCanvas(httpd_req_t* r) {
   canvasAtlasStateJson(atlas, sizeof(atlas));
   char buf[560];
   snprintf(buf, sizeof(buf),
-           "{\"active\":%s,\"width\":%u,\"height\":%u,\"formats\":[\"rgb888\",\"rgb565\",\"qoi\"],"
+           "{\"active\":%s,\"width\":%u,\"height\":%u,\"formats\":[\"rgb888\",\"rgb565\",\"qoi\",\"jpeg\"],"
            "\"effect\":\"%s\",\"anim\":%s,\"ticker\":%s,\"atlas\":%s,\"effects\":%s}",
            gCanvasMode ? "true" : "false", (unsigned)gPanel.panelW, (unsigned)gPanel.panelH,
            effectName(gEffect), gAnimActive ? "true" : "false", gTickerActive ? "true" : "false",
@@ -3565,6 +3567,76 @@ static esp_err_t handleApiCanvasQoi(httpd_req_t* r) {
   return httpxSend(r, 200, "application/json", buf);
 }
 
+// PUT /api/canvas/jpeg -- a full-panel JPEG, hardware-decoded on the P4's JPEG engine.
+// JPEG is far smaller on the wire than a raw or QOI frame, which is the win over the
+// remoted-WiFi link (a 1280x800 photo is tens of KB, not 2 MB). Decoded to RGB888 and
+// then handled exactly like the raw frame PUT -- transitions included.
+static jpeg_decoder_handle_t gJpegDec = nullptr;   // created lazily on first use
+static uint8_t* gJpegOut = nullptr;                // decode output (RGB888), jpeg-DMA memory
+static size_t   gJpegOutCap = 0;
+static uint8_t* jpegInBuf = nullptr; static size_t jpegInCap = 0;
+
+static esp_err_t handleApiCanvasJpeg(httpd_req_t* r) {
+  if (csBusy(r)) return ESP_OK;
+  if (quietBlocked(r)) return ESP_OK;
+  if (!gPanel.ready) return httpxErr(r, 503, "Panel not running or out of memory");
+  if (ESP.getFreeHeap() < CANVAS_MIN_UPLOAD_HEAP)
+    return httpxErr(r, 507, "Low on memory -- try again in a moment");
+  const size_t need = (size_t)r->content_len;
+  // A JPEG of a full frame is small; cap it generously but well under an uncompressed frame.
+  if (need < 100 || need > (size_t)gPanel.panelW * gPanel.panelH * 3)
+    return httpxErr(r, 400, "Implausible JPEG size for the panel");
+  if (!gJpegDec) {
+    jpeg_decode_engine_cfg_t ec = {};
+    ec.timeout_ms = 1000;
+    if (jpeg_new_decoder_engine(&ec, &gJpegDec) != ESP_OK)
+      return httpxErr(r, 503, "JPEG engine unavailable");
+  }
+  canvasStandDown();
+  const size_t got = recvWhole(r, &jpegInBuf, &jpegInCap, need);
+  if (!got) { dispReturnToWall(); return httpxErr(r, 503, "Panel not running or out of memory"); }
+
+  jpeg_decode_picture_info_t info = {};
+  if (jpeg_decoder_get_info(jpegInBuf, got, &info) != ESP_OK ||
+      (int)info.width != gPanel.panelW || (int)info.height != gPanel.panelH) {
+    dispReturnToWall();
+    return httpxErr(r, 400, "Not a JPEG matching the panel size");
+  }
+  // Output buffer: RGB888, in JPEG-DMA-capable memory (allocated once, reused).
+  const size_t outNeed = (size_t)gPanel.panelW * gPanel.panelH * 3;
+  if (gJpegOutCap < outNeed) {
+    if (gJpegOut) free(gJpegOut);
+    jpeg_decode_memory_alloc_cfg_t mc = {}; mc.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER;
+    size_t alloc = 0;
+    gJpegOut = (uint8_t*)jpeg_alloc_decoder_mem(outNeed, &mc, &alloc);
+    gJpegOutCap = gJpegOut ? alloc : 0;
+    if (!gJpegOut) { dispReturnToWall(); return httpxErr(r, 503, "Out of memory for JPEG decode"); }
+  }
+  jpeg_decode_cfg_t dc = {};
+  dc.output_format = JPEG_DECODE_OUT_FORMAT_RGB888;
+  dc.rgb_order     = JPEG_DEC_RGB_ELEMENT_ORDER_RGB;
+  uint32_t outSize = 0;
+  if (jpeg_decoder_process(gJpegDec, &dc, jpegInBuf, got, gJpegOut, gJpegOutCap, &outSize) != ESP_OK) {
+    dispReturnToWall();
+    return httpxErr(r, 400, "JPEG decode failed");
+  }
+  // The engine DMA-wrote gJpegOut; drop any stale CPU cache before we read it.
+  esp_cache_msync(gJpegOut, (gJpegOutCap + 127u) & ~((size_t)127u), ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+
+  const int W = gPanel.panelW, H = gPanel.panelH;
+  const bool staged = (gTransType != 0) && canvasStageBegin(3);
+  if (staged) {
+    canvasStageFeed(gJpegOut, (size_t)W * H * 3);    // whole frame into the stage (rgb888)
+    canvasStagePresent();
+  } else {
+    for (int y = 0; y < H; y++) panelBlitRow888(0, y, W, gJpegOut + (size_t)y * W * 3);
+    panelShow();
+  }
+  char jb[96];
+  snprintf(jb, sizeof(jb), "{\"ok\":true,\"width\":%u,\"height\":%u}", (unsigned)W, (unsigned)H);
+  return httpxSend(r, 200, "application/json", jb);
+}
+
 // PUT /api/canvas/anim -- upload a looping animation that plays on-device (client can disconnect).
 // Header (14 B, big-endian): "MPGA"(4) ver(1)=1 fmt(1: 2=rgb565,3=rgb888) fps(1) flags(1: bit0=loop)
 // w(2) h(2) frames(2), then frames*w*h*fmt bytes of frame data. Streamed straight into PSRAM.
@@ -4132,6 +4204,7 @@ void webInit() {
   httpxOn("/openapi.yaml",           HTTP_GET,  handleOpenapiSpec);
   httpxOn("/.well-known/api-catalog", HTTP_GET, handleApiCatalog);
   httpxOn("/api/canvas/qoi",         HTTP_PUT,  handleApiCanvasQoi);
+  httpxOn("/api/canvas/jpeg",        HTTP_PUT,  handleApiCanvasJpeg);
   httpxOn("/api/canvas/anim",        HTTP_PUT,  handleApiCanvasAnim);
   httpxOn("/api/canvas/atlas",        HTTP_GET,    handleApiAtlasList);
   httpxOnPrefix("/api/canvas/atlas/", HTTP_GET,    handleApiAtlasGet);
