@@ -232,3 +232,47 @@ the upload path, `text2.customLoaded` flips to `true`. Not required for the bund
 - `gtext`/`0x21`, `blur`/`0x22`, `sprite` float + `SPRITE2`/`0x23`; `canvas.text2` capability.
 - Faces: CP1252 subset of DejaVuSans-Bold bundled (metrics-preserving); mono falls back to sans
   pending its bundle.
+
+---
+
+## Part 3 — Settings-store capability gating (bug fix)
+
+**Problem.** `supports_settings()` decides whether the gateway can store the companion
+settings blob by GUESSING from the product name / firmware version:
+
+```python
+def supports_settings(gw):
+    if is_matrix_product(gw): return True         # product name contains "matrix"
+    v = gateway_version(gw)
+    return v is not None and v >= (3, 1)           # else needs version >= 3.1
+```
+
+The **LCD Gateway** is named "LCD Gateway" (no "matrix") and is versioned `0.1.0` (a new
+product line), so `(0,1) >= (3,1)` is False → the companion decides it can't store settings
+and falls back to **local-only**. Nothing ever syncs (the board's `GET /api/companion/settings`
+returns 404; no `/compset.gz` on FATFS). This has nothing to do with WiFi.
+
+**Firmware (done, both gateways).** Both the LCD Gateway and the Matrix Gateway now advertise
+an explicit **`"settingsStore"`** token in `GET /api/capabilities` → `features[]`. Both have
+always had the `/api/companion/settings` GET/PUT endpoints; this just makes the capability
+discoverable instead of inferred.
+
+**Companion change.** Gate on the token, not the product/version heuristic:
+
+```python
+def supports_settings(gw, caps=None):
+    feats = (caps or {}).get("features") or []
+    if "settingsStore" in feats:                  # explicit capability -> authoritative
+        return True
+    # legacy fallback for gateways too old to advertise it:
+    if is_matrix_product(gw): return True
+    v = gateway_version(gw)
+    return v is not None and v >= (3, 1)
+```
+
+(Keep the old checks as a fallback for firmware that predates the token.) With this, the LCD
+Gateway is recognized and the `"mirror"` store begins syncing the blob to `/compset.gz`.
+
+**Acceptance.** After the change, with an LCD Gateway on `settings_store: "mirror"`, a settings
+change PUTs a gzipped blob; `GET /api/companion/settings` returns 200 and `/compset.gz` appears
+in the Files list.
