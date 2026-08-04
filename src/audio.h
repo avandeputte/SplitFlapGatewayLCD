@@ -1,15 +1,15 @@
-// audio.h -- the microphone frontend (v3.4): ES7210 dual-mic ADC -> I2S -> DSP.
+// audio.h -- the microphone frontend: the ES8311 codec's ADC -> I2S -> DSP.
 //
-// The Waveshare board carries a dual MEMS microphone array behind an ES7210 4-channel
-// ADC (I2C control on the shared 47/48 bus, audio on I2S: MCLK=12 BCLK=43 WS=38 DIN=39
-// -- the ES8311/speaker side of the same bus is unused). This module feeds the
-// audio-reactive effects (spectrum, soundwall, and the "audio":true modulation of
-// fire/matrix/plasma) with a small per-frame feature block; raw samples never leave
-// the device and are never stored.
+// The Waveshare P4 board carries a single onboard mic on the ES8311 codec's own ADC
+// (I2C control at 0x18 on the shared 7/8 bus, audio on the duplex I2S port: MCLK=13
+// BCLK=12 WS=10, mic in on DIN=11, speaker out on DOUT=9 -- the same chip and port
+// drive the speaker). This module feeds the audio-reactive effects (spectrum,
+// soundwall, and the "audio":true modulation of fire/matrix/plasma) with a small
+// per-frame feature block; raw samples never leave the device and are never stored.
 //
 // Split lifecycle, deliberately:
-//   * audioInit() -- called ONCE from setup(), BEFORE tasks exist: probes the ES7210
-//     and writes its ~30 config registers. rtc.cpp's PCF85063 access uses raw Wire
+//   * audioInit() -- called ONCE from setup(), BEFORE tasks exist: confirms the ES8311
+//     answers (sound.cpp writes its registers, ADC included). rtc.cpp's PCF85063 uses raw Wire
 //     with no bus lock, so all of audio's I2C happens while the system is still
 //     single-threaded; after boot this module never touches I2C again.
 //   * capture starts on demand (an audio effect starting) and self-stops a few
@@ -37,8 +37,8 @@ struct AudioFrame {
   uint32_t seq;                 // increments per DSP hop; stale if it stops moving
 };
 
-void audioInit();                    // probe + configure the ES7210 (setup() only)
-bool audioAvailable();               // ES7210 found and configured
+void audioInit();                    // confirm the ES8311 codec answers (setup() only)
+bool audioAvailable();               // ES8311 mic ADC available
 void audioMaybeStart();              // a consumer exists: ensure capture is running
 void audioRead(AudioFrame& out);     // latest features (zeroed when not capturing)
 void audioReadScope(int8_t* out, int n);  // latest DC-removed mono waveform, auto-gain-scaled to ±127

@@ -1956,7 +1956,7 @@ static esp_err_t handleApiSdDelete(httpd_req_t* r) {
 }
 
 // GET /api/canvas/audio -- microphone frontend state (v3.4 diagnostics + discovery):
-// whether the ES7210 is present, whether capture is running, and the live features.
+// whether the mic (ES8311 ADC) is present, whether capture is running, and the live features.
 // The features are numbers derived from sound, never samples -- nothing recordable.
 static esp_err_t handleApiCanvasAudio(httpd_req_t* r) {
   AudioFrame a;
