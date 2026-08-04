@@ -242,7 +242,12 @@ void setup() {
   // owns the panel -- and the low-priority taskNetwork poller, so the render has core 1
   // largely to itself and core 0 stays responsive. The real WiFi RX/TX is in high-prio
   // IDF tasks that preempt this regardless of core; the present is PPA-serialised (gShowMutex).
-  xTaskCreatePinnedToCore(taskWeb,     "Web",     4096, NULL, 2, &hTaskWeb,   1);
+  // 12 KB, not 4 KB: the canvas STREAM pump runs on this task and executes the full canvas
+  // ops path -- including the deep stb_truetype gtext rasterizer. 4 KB overflowed and tripped
+  // the Core-1 stack-protection panic (boot-loop when a client streamed gtext). The one-shot
+  // ops path already gets 10 KB on the httpd worker (httpx.cpp); the stream pump must match,
+  // with margin, since it is a notch deeper (pump -> record dispatch -> canvasOpsRun -> ttf).
+  xTaskCreatePinnedToCore(taskWeb,     "Web",     12288, NULL, 2, &hTaskWeb,   1);
   xTaskCreatePinnedToCore(taskNetwork, "Network", 6144, NULL, 1, &hTaskNet,   1);
   xTaskCreatePinnedToCore(taskDisplay, "Display", 4096, NULL, 2, &hTaskDisp,  1);
 
