@@ -336,7 +336,8 @@ int canvasAnimSave(const char* name) {
   // Begin accepts -- truncation wrote fps=62 for a 16 ms (60 fps) animation, which the
   // loader then rejected: a 60 fps animation could be saved but never loaded (v3.11.1).
   uint32_t fps = (1000u + animIntervalMs / 2) / (animIntervalMs ? animIntervalMs : 66);
-  if (fps < 1) fps = 1;  if (fps > 60) fps = 60;
+  if (fps < 1) fps = 1;
+  if (fps > 60) fps = 60;
   uint8_t hdr[14] = { 'M','P','G','A', 1, animFmt,
                       (uint8_t)fps,
                       (uint8_t)(animLoop ? 1 : 0),

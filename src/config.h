@@ -32,16 +32,10 @@ struct GwConfig {
   int16_t       quietTzOffsetMin;  // minutes EAST of UTC for the schedule (browser-supplied);
                                    // local = UTC + this. Independent of the gateway posixTZ so the
                                    // user just enters their own local time. See quietScheduleTick.
-  // ---- HUB75 panel (Matrix Portal Gateway) ----
-  // The driver takes its geometry and bit depth at construction, so the first three
-  // only take effect on reboot. panelBright, flapMs and flapMax are live.
-  uint16_t      panelW;        // total chain width in px (32..256, multiple of 32)
-  uint16_t      panelH;        // panel height in px (16 / 32 / 64)
-  uint8_t       panelBitDepth; // bitplanes, 1..6 (RAM and refresh rate scale with it)
-  bool          panelBGR;      // panel wired BGR, not RGB: swap red and blue on output
-  uint8_t       panelBright;   // 1..255, multiplied into every colour before it reaches the panel
-  bool          fbPsram;       // v3.11 (experimental): framebuffer in octal PSRAM, not internal
-                               // SRAM -- lifts the internal-RAM depth cap so 256x64 can run depth 4+
+  // ---- panel ----
+  // The DSI panel is one fixed geometry (1280x800, RGB565); only these knobs are live.
+  bool          panelBGR;      // swap red and blue on output (a BGR-wired panel)
+  uint8_t       panelBright;   // 1..255 backlight level
   uint16_t      flapMs;        // ms per flap step -- the reel's speed
   uint8_t       flapMax;       // flips drawn for one change, 1..FLAP_ANIM_MAX
   bool          soundEnabled;  // master speaker enable (v3.6); false = silent

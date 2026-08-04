@@ -173,7 +173,6 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 #define DEFAULT_GRID_COLS    15     // virtual modules across (80x160 px flap cards)
 #define DEFAULT_GRID_ROWS    5      // virtual modules down; any 10x1..32x10 grid works
 #define FLAP_ASPECT          2      // card height is at most this x width (see dispPlan)
-#define DEFAULT_BIT_DEPTH    16     // bits per pixel now (RGB565); kept for config compatibility
 #define DEFAULT_PANEL_BGR    false  // true if the panel is wired BGR (see panelSetColourOrder)
 #define DEFAULT_BRIGHTNESS   160    // 1..255, scales every colour before output
 // A real module flips a handful of flaps per second, not fifty. This also sets the
@@ -190,29 +189,6 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 //   * pattern perfect but flaps garbled            -> content, not the panel
 #define PANEL_BOOT_TEST      1
 
-// Diagnostic: build with -DPANEL_DISABLE=1 to bring the gateway up with the panel
-// never started -- no framebuffer, no GDMA, no panel current. Isolates the radio
-// from the panel. See the block comment in dispInit().
-#ifndef PANEL_DISABLE
-#define PANEL_DISABLE        0
-#endif
-
-/* How much internal SRAM the panel may take, and how much it must leave behind.
-   dispInit() runs before WiFi.begin() so Protomatter^W panel.cpp gets first claim on
-   the internal DMA pool -- but WiFi and lwIP allocate their RX/TX buffers from that
-   same pool moments later, and nothing else in the firmware defends it. The settings
-   page happily accepts 256x64 at depth 6, which is 242 KB of double-buffered
-   framebuffer plus descriptors; that leaves the network stack on fumes, and the
-   failure does NOT look like a panel fault. It looks like TCP connects failing
-   (MQTT rc=-2), a web UI that stalls, and loop()'s 20 KB heap floor rebooting the
-   board. panelBegin() first clamps the bit depth down until the framebuffer fits
-   (v1.17.1) and refuses outright only if even depth 1 breaches a bound.
-
-   BUDGET is the ceiling on the panel itself; RESERVE is what must still be free
-   afterwards for WiFi/lwIP to come up. Both are internal-DMA-capable bytes.
-   The 128x32 depth-4 default costs ~38.6 KB, so there is room to grow. */
-#define PANEL_RAM_BUDGET     (120u * 1024u)   // most the panel may ever claim
-#define PANEL_RAM_RESERVE    (100u * 1024u)   // must remain free for WiFi + lwIP
 
 // Circuit breaker for the large canvas ops (animation + QOI upload, framebuffer readback). If free
 // internal heap is already below this when one arrives, refuse it with 507 rather than pile its

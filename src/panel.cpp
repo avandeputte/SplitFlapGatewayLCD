@@ -249,8 +249,10 @@ void panelFillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) 
   }
   int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
   int x1 = (x + w > W) ? W : x + w, y1 = (y + h > H) ? H : y + h;
-  if (x0 < clipX0) x0 = clipX0;  if (y0 < clipY0) y0 = clipY0;
-  if (x1 > clipX1) x1 = clipX1;  if (y1 > clipY1) y1 = clipY1;
+  if (x0 < clipX0) x0 = clipX0;
+  if (y0 < clipY0) y0 = clipY0;
+  if (x1 > clipX1) x1 = clipX1;
+  if (y1 > clipY1) y1 = clipY1;
   if (x0 >= x1 || y0 >= y1) return;
   const px_t v = pack565(r, g, b);
   for (int yy = y0; yy < y1; yy++) {

@@ -13,12 +13,8 @@ void cfgSetDefaults() {
   strlcpy(cfg.ntpServer, DEFAULT_NTP_SERVER, sizeof(cfg.ntpServer));
   cfg.gridRows = DEFAULT_GRID_ROWS;
   cfg.gridCols = DEFAULT_GRID_COLS;
-  cfg.panelW        = DEFAULT_PANEL_W;
-  cfg.panelH        = DEFAULT_PANEL_H;
-  cfg.panelBitDepth = DEFAULT_BIT_DEPTH;
   cfg.panelBGR      = DEFAULT_PANEL_BGR;
   cfg.panelBright   = DEFAULT_BRIGHTNESS;
-  cfg.fbPsram       = false;
   cfg.flapMs        = DEFAULT_FLAP_MS;
   cfg.flapMax       = DEFAULT_FLAP_MAX;
   cfg.soundEnabled  = true;
@@ -64,12 +60,8 @@ void loadConfig() {
   cfg.gridCols = (uint8_t)prefs.getInt("gCols", DEFAULT_GRID_COLS);
   if (cfg.gridRows < 1) cfg.gridRows = 1;
   if (cfg.gridCols < 1) cfg.gridCols = 1;
-  cfg.panelW        = (uint16_t)prefs.getInt  ("pW",     DEFAULT_PANEL_W);
-  cfg.panelH        = (uint16_t)prefs.getInt  ("pH",     DEFAULT_PANEL_H);
-  cfg.panelBitDepth =           prefs.getUChar("pDepth", DEFAULT_BIT_DEPTH);
   cfg.panelBGR      =           prefs.getBool ("pBGR",   DEFAULT_PANEL_BGR);
   cfg.panelBright   =           prefs.getUChar("pBright",DEFAULT_BRIGHTNESS);
-  cfg.fbPsram       =           prefs.getBool ("fbPsram",false);
   cfg.flapMs        = (uint16_t)prefs.getInt  ("flapMs", DEFAULT_FLAP_MS);
   cfg.flapMax       =           prefs.getUChar("flapMax",DEFAULT_FLAP_MAX);
   cfg.soundEnabled  =           prefs.getBool ("sndEn",  true);
@@ -92,7 +84,6 @@ void loadConfig() {
     snprintf(k, sizeof(k), "almE%d", i); cfg.almEnabled[i] = prefs.getBool(k, false);
   }
   cfg.transMs       = (uint16_t)prefs.getShort("trMs",   400);
-  if (cfg.panelBitDepth < 1 || cfg.panelBitDepth > 6) cfg.panelBitDepth = DEFAULT_BIT_DEPTH;
   if (cfg.panelBright < 1) cfg.panelBright = DEFAULT_BRIGHTNESS;
   if (cfg.flapMs < 2 || cfg.flapMs > 500) cfg.flapMs = DEFAULT_FLAP_MS;
   if (cfg.flapMax < 1 || cfg.flapMax > FLAP_ANIM_MAX) cfg.flapMax = DEFAULT_FLAP_MAX;
@@ -135,12 +126,8 @@ void saveConfig() {
   prefs.putUChar ("qsDays",    cfg.quietDays);
   prefs.putShort ("qsTzOff",   cfg.quietTzOffsetMin);
   // panel
-  prefs.putInt   ("pW",       cfg.panelW);
-  prefs.putInt   ("pH",       cfg.panelH);
-  prefs.putUChar ("pDepth",   cfg.panelBitDepth);
   prefs.putBool  ("pBGR",     cfg.panelBGR);
   prefs.putUChar ("pBright",  cfg.panelBright);
-  prefs.putBool  ("fbPsram",  cfg.fbPsram);
   prefs.putInt   ("flapMs",   cfg.flapMs);
   prefs.putUChar ("flapMax",  cfg.flapMax);
   prefs.putBool  ("sndEn",    cfg.soundEnabled);
@@ -189,12 +176,8 @@ void cfgExportJson(JsonDocument& doc) {
   doc["quietEnd"]   = cfg.quietEnd;
   doc["quietDays"]  = cfg.quietDays;
   doc["quietTzOffsetMin"] = cfg.quietTzOffsetMin;
-  doc["panelW"]        = cfg.panelW;
-  doc["panelH"]        = cfg.panelH;
-  doc["panelBitDepth"] = cfg.panelBitDepth;
   doc["panelBGR"]      = cfg.panelBGR;
   doc["panelBright"]   = cfg.panelBright;
-  doc["fbPsram"]       = cfg.fbPsram;
   doc["flapMs"]        = cfg.flapMs;
   doc["flapMax"]       = cfg.flapMax;
   doc["soundEnabled"]  = cfg.soundEnabled;
@@ -221,9 +204,7 @@ void cfgExportJson(JsonDocument& doc) {
 // of the file still applies (and `applied` tells the caller how much did).
 bool cfgImportJson(const JsonDocument& doc, int& applied, bool& rebootNeeded) {
   applied = 0;
-  const uint16_t oW = cfg.panelW, oH = cfg.panelH;
-  const uint8_t  oD = cfg.panelBitDepth, oR = cfg.gridRows, oC = cfg.gridCols;
-  const bool     oP = cfg.fbPsram;
+  const uint8_t  oR = cfg.gridRows, oC = cfg.gridCols;
   char oHost[HOSTNAME_MAX]; strlcpy(oHost, cfg.hostname, sizeof(oHost));
 
   #define IMP_STR(key, field) if (doc[key].is<const char*>()) { strlcpy(field, doc[key].as<const char*>(), sizeof(field)); applied++; }
@@ -247,12 +228,8 @@ bool cfgImportJson(const JsonDocument& doc, int& applied, bool& rebootNeeded) {
   IMP_HHMM("quietEnd",   cfg.quietEnd);
   IMP_NUM ("quietDays", cfg.quietDays, 0, 0x7F);
   IMP_NUM ("quietTzOffsetMin", cfg.quietTzOffsetMin, -14*60, 14*60);
-  IMP_NUM ("panelW", cfg.panelW, 32, 256);
-  IMP_NUM ("panelH", cfg.panelH, 16, 64);
-  IMP_NUM ("panelBitDepth", cfg.panelBitDepth, 1, 6);
   IMP_BOOL("panelBGR", cfg.panelBGR);
   IMP_NUM ("panelBright", cfg.panelBright, 1, 255);
-  IMP_BOOL("fbPsram", cfg.fbPsram);
   IMP_NUM ("flapMs", cfg.flapMs, 2, 500);
   IMP_NUM ("flapMax", cfg.flapMax, 1, FLAP_ANIM_MAX);
   IMP_BOOL("soundEnabled", cfg.soundEnabled);
@@ -290,8 +267,7 @@ bool cfgImportJson(const JsonDocument& doc, int& applied, bool& rebootNeeded) {
   strlcpy(gPosixTZ, cfg.posixTZ, sizeof(gPosixTZ));
   cfgApplyTZ();
   saveConfig();
-  rebootNeeded = (oW != cfg.panelW || oH != cfg.panelH || oD != cfg.panelBitDepth ||
-                  oP != cfg.fbPsram || oR != cfg.gridRows || oC != cfg.gridCols ||
+  rebootNeeded = (oR != cfg.gridRows || oC != cfg.gridCols ||
                   strcmp(oHost, cfg.hostname) != 0);
   return true;
 }

@@ -125,34 +125,12 @@ PanelGeometry dispPlan(uint16_t panelW, uint16_t panelH, uint8_t cols, uint8_t r
 void dispInit() {
   // setup() has already planned the geometry (vmInit needs the module count that
   // falls out of it). Re-plan only if something skipped that step.
-  if (!gPanel.cols) gPanel = dispPlan(cfg.panelW, cfg.panelH, cfg.gridCols, cfg.gridRows);
+  if (!gPanel.cols) gPanel = dispPlan(DEFAULT_PANEL_W, DEFAULT_PANEL_H, cfg.gridCols, cfg.gridRows);
 
-#if PANEL_DISABLE
-  /* Diagnostic A/B: bring the whole gateway up with the panel never started -- no
-     framebuffer, no GDMA, no LCD_CAM clock, no panel current draw. Everything else
-     (WiFi, web, the frame link, the 45 virtual modules) runs exactly as
-     normal; the wall is simply not driven.
-
-     This exists to answer one question: is the radio's misbehaviour caused by the
-     panel? The panel's GDMA streams ~20 MB/s continuously out of the same internal
-     SRAM the WiFi stack allocates from, and its current draw sits on top of the
-     radio's TX spikes. Both can produce association failures (4WAY_HANDSHAKE_TIMEOUT)
-     and lost frames at a signal strength that should be flawless.
-
-     If WiFi is solid with this set and flaky without it, the fault is the panel --
-     power first (give it its own 5 V supply, don't feed it from the board's USB),
-     then bandwidth (lower LCD_CLK_HZ in panel.cpp, or cfg.panelBitDepth). If it is
-     flaky BOTH ways, the panel is exonerated and the problem is the AP or the RF
-     environment. Build with -DPANEL_DISABLE=1. */
-  printf("[PANEL] PANEL_DISABLE=1 -- panel not started (WiFi/RF A/B test build)\n");
-  gPanel.ready = false;
-  return;
-#endif
-
-  uint8_t depth = cfg.panelBitDepth;
-  if (depth < 1 || depth > 6) depth = DEFAULT_BIT_DEPTH;
-
-  gPanel.ready = panelBegin(gPanel.panelW, gPanel.panelH, depth, cfg.fbPsram);
+  // The DSI driver fixes geometry to the native panel and always uses RGB565/PSRAM;
+  // the depth/fbPsram parameters are HUB75 vestiges it ignores (kept only so panel.h's
+  // signature stays source-compatible with the Matrix driver).
+  gPanel.ready = panelBegin(gPanel.panelW, gPanel.panelH, 0, false);
   panelSetColourOrder(cfg.panelBGR);   // the panel's own wiring, not something we can detect
   if (!gPanel.ready) {
     // Headless is a legitimate state: the web UI and all the virtual modules still
@@ -219,8 +197,7 @@ void dispResume() {
   // Re-init at the depth that was actually RUNNING (dispInit may have clamped
   // the configured depth to fit RAM; asking for the configured value again
   // could refuse and leave the wall dark).
-  uint8_t d = panelInfo().depth ? panelInfo().depth : cfg.panelBitDepth;
-  if (panelBegin(gPanel.panelW, gPanel.panelH, d, cfg.fbPsram)) {
+  if (panelBegin(gPanel.panelW, gPanel.panelH, 0, false)) {
     panelSetColourOrder(cfg.panelBGR);
     panelSetBrightness(cfg.panelBright);
     gPanel.ready = true;

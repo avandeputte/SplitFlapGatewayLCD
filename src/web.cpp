@@ -938,12 +938,8 @@ static esp_err_t handleApiConfigGet(httpd_req_t* r) {
   // gridRows/gridCols above are the emulated WALL: one virtual module per cell.
   // These describe the LED panel it is drawn on. Additive fields -- the companion
   // ignores anything it does not name.
-  doc["panelW"]        = cfg.panelW;
-  doc["panelH"]        = cfg.panelH;
-  doc["panelBitDepth"] = cfg.panelBitDepth;
   doc["panelBGR"]      = cfg.panelBGR;
   doc["panelBright"]   = cfg.panelBright;
-  doc["fbPsram"]       = cfg.fbPsram;
   doc["dimEnabled"]    = cfg.dimEnabled;
   doc["dimStart"]      = cfg.dimStart;
   doc["dimEnd"]        = cfg.dimEnd;
@@ -1025,25 +1021,13 @@ static esp_err_t handleApiConfigSettings(httpd_req_t* r) {
     DBG("[CFG] Wall set to %dx%d (rows x cols) = %d modules -- reboot to apply\n",
         gr, gc, gr * gc);
   }
-  // ---- panel geometry and reel speed ----
-  // The driver takes width/height/bitDepth at construction, so those need a reboot;
-  // brightness and the flip timing are picked up on the next frame.
-  if (doc["panelW"].is<int>())  { int v = doc["panelW"];
-    if (v >= 32 && v <= PANEL_MAX_W) cfg.panelW = (uint16_t)v; }
-  if (doc["panelH"].is<int>())  { int v = doc["panelH"];
-    if (v == 16 || v == 32 || v == 64) cfg.panelH = (uint16_t)v; }
-  if (doc["panelBitDepth"].is<int>()) { int v = doc["panelBitDepth"];
-    if (v >= 1 && v <= 6) cfg.panelBitDepth = (uint8_t)v; }
-  // Applies to the NEXT FRAME, not on reboot: it is only a decision about which bit a
-  // colour lands on, so there is nothing to re-allocate and no reason to make anyone
-  // power-cycle to find out whether their panel is BGR.
+  // ---- panel: reel speed + backlight ----
+  // The DSI panel is a fixed geometry; only the reel/flip timing, brightness and the
+  // BGR swap are settable (all applied on the next frame -- nothing to re-allocate).
   if (doc["panelBGR"].is<bool>()) {
     cfg.panelBGR = doc["panelBGR"].as<bool>();
     panelSetColourOrder(cfg.panelBGR);
   }
-  // Framebuffer in PSRAM (v3.11): decided once at panelBegin, so like width/height/depth it needs
-  // a reboot to take effect.
-  if (doc["fbPsram"].is<bool>()) cfg.fbPsram = doc["fbPsram"].as<bool>();
   // Brightness schedule (v3.13). dimTzOffsetMin shares cfg.quietTzOffsetMin -- one
   // browser, one local-time offset for both schedules.
   if (doc["dimEnabled"].is<bool>()) cfg.dimEnabled = doc["dimEnabled"].as<bool>();
@@ -1101,11 +1085,11 @@ static esp_err_t handleApiConfigSettings(httpd_req_t* r) {
   // behaviour at boot, but from a settings form it is a trap: a 15x3 wall on a 16px-high
   // panel collapses to 15x1 and you only find out by looking at the LEDs. Say so here.
   char resp[192];
-  PanelGeometry plan = dispPlan(cfg.panelW, cfg.panelH, cfg.gridCols, cfg.gridRows);
+  PanelGeometry plan = dispPlan(DEFAULT_PANEL_W, DEFAULT_PANEL_H, cfg.gridCols, cfg.gridRows);
   if (plan.cols != cfg.gridCols || plan.rows != cfg.gridRows) {
     snprintf(resp, sizeof(resp),
-             "{\"ok\":true,\"warn\":\"a %ux%u wall does not fit a %ux%u panel -- it will be reduced to %ux%u on reboot\"}",
-             cfg.gridCols, cfg.gridRows, cfg.panelW, cfg.panelH, plan.cols, plan.rows);
+             "{\"ok\":true,\"warn\":\"a %ux%u wall does not fit the %ux%u panel -- it will be reduced to %ux%u on reboot\"}",
+             cfg.gridCols, cfg.gridRows, DEFAULT_PANEL_W, DEFAULT_PANEL_H, plan.cols, plan.rows);
   } else {
     strlcpy(resp, "{\"ok\":true}", sizeof(resp));
   }
@@ -2192,7 +2176,10 @@ static void canvasOpGradientEx(int x, int y, int w, int h,
                                uint8_t r1, uint8_t g1, uint8_t b1,
                                int mode, int angleDeg, bool dither) {
   if (w <= 0 || h <= 0) return;
-  const int q = 256 >> panelInfo().depth;                  // one quantisation step
+  // Dither amplitude = one quantisation step of the panel's truncation. The DSI panel
+  // is RGB565: the coarsest channel is 5-bit, step 256>>5 = 8. (On the HUB75 matrix this
+  // was 256>>panelInfo().depth; that depth is 16 here, which gave step 0 -> no dither.)
+  const int q = 8;
   if (mode <= 1 && !dither) {                              // the classic strip fast path
     const bool vertical = (mode == 0);
     const int n = vertical ? h : w, den = (n > 1) ? (n - 1) : 1;

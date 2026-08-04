@@ -137,13 +137,13 @@ void setup() {
   imuInit();     // QMI8658 tap engine -- same single-threaded I2C window (v3.15)
   touchInit();   // GT911 capacitive touch -- same single-threaded I2C window (LCD)
 
-  // 4. Plan the panel geometry. The module grid can be clamped by the panel (a
-  //    15-column wall does not fit 64 px), and the wall IS the module list, so
-  //    the count must come from the plan rather than from the raw config.
-  gPanel = dispPlan(cfg.panelW, cfg.panelH, cfg.gridCols, cfg.gridRows);
+  // 4. Plan the panel geometry. The DSI panel is a fixed size; the module grid is
+  //    clamped to what fits it, and the wall IS the module list, so the module count
+  //    comes from the plan rather than the raw grid config.
+  gPanel = dispPlan(DEFAULT_PANEL_W, DEFAULT_PANEL_H, cfg.gridCols, cfg.gridRows);
   if (gPanel.cols != cfg.gridCols || gPanel.rows != cfg.gridRows)
-    printf("[PANEL] wall %ux%u does not fit a %ux%u panel -- using %ux%u\n",
-           cfg.gridCols, cfg.gridRows, cfg.panelW, cfg.panelH, gPanel.cols, gPanel.rows);
+    printf("[PANEL] wall %ux%u does not fit the %ux%u panel -- using %ux%u\n",
+           cfg.gridCols, cfg.gridRows, DEFAULT_PANEL_W, DEFAULT_PANEL_H, gPanel.cols, gPanel.rows);
 
   // 5. Filesystem, then the thing that restores from it: the virtual modules' own
   //    state (/vmods.dat). Nothing else on this board is sticky.
