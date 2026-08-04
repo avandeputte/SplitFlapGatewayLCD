@@ -231,7 +231,15 @@ void setup() {
   xTaskCreatePinnedToCore(taskFrames,  "Frames",  5120, NULL, 3, &hTaskFrames, 0);
   // v3.0: HTTP requests are served by esp_http_server's own task (httpx.h); taskWeb
   // is just the SSE pump + supervisor now, so its stack shrank from the handler-era 8 KB.
-  xTaskCreatePinnedToCore(taskWeb,     "Web",     4096, NULL, 2, &hTaskWeb,   0);
+  // CORE 1 (LCD, v0.2, was core 0): taskWeb runs the canvas STREAM pump -- the heavy
+  // per-frame render of a busy canvas app (aquarium, games) at 1280x800. On core 0 it
+  // starved the HTTP server (core_id=0) and the WiFi-over-SDIO RX task that share it, so
+  // the board went HTTP-unresponsive while a heavy app streamed and control requests
+  // (an app switch) timed out. Core 1 hosts taskDisplay -- which PARKS while a canvas app
+  // owns the panel -- and the low-priority taskNetwork poller, so the render has core 1
+  // largely to itself and core 0 stays responsive. The real WiFi RX/TX is in high-prio
+  // IDF tasks that preempt this regardless of core; the present is PPA-serialised (gShowMutex).
+  xTaskCreatePinnedToCore(taskWeb,     "Web",     4096, NULL, 2, &hTaskWeb,   1);
   xTaskCreatePinnedToCore(taskNetwork, "Network", 6144, NULL, 1, &hTaskNet,   1);
   xTaskCreatePinnedToCore(taskDisplay, "Display", 4096, NULL, 2, &hTaskDisp,  1);
 
