@@ -344,6 +344,64 @@ void panelBlitCoverRow(int x, int y, int n, const uint8_t* cov, uint8_t r, uint8
   }
 }
 
+void panelBoxBlur(int x, int y, int w, int h, int radius) {
+  if (!info.ok || radius < 1) return;
+  if (x < 0) { w += x; x = 0; }
+  if (y < 0) { h += y; y = 0; }
+  if (x + w > W) w = W - x;
+  if (y + h > H) h = H - y;
+  if (w <= 0 || h <= 0) return;
+  if (radius > w) radius = w;
+  if (radius > h) radius = h;
+  const size_t n = (size_t)w * h * 3;
+  uint8_t* a = (uint8_t*)heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+  uint8_t* b = (uint8_t*)heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+  if (!a || !b) { free(a); free(b); return; }
+  // Read the region into `a` (rgb888).
+  for (int j = 0; j < h; j++)
+    for (int i = 0; i < w; i++) {
+      uint8_t r, g, bl; readPixelRGB(drawBuf, x + i, y + j, r, g, bl);
+      uint8_t* p = a + ((size_t)j * w + i) * 3; p[0] = r; p[1] = g; p[2] = bl;
+    }
+  const int win = 2 * radius + 1;
+  // Horizontal pass a -> b: sliding-window running sum, edges clamped.
+  for (int j = 0; j < h; j++) {
+    const uint8_t* row = a + (size_t)j * w * 3;
+    uint8_t* out = b + (size_t)j * w * 3;
+    int sr = 0, sg = 0, sb = 0;
+    for (int k = -radius; k <= radius; k++) { int c = k < 0 ? 0 : (k >= w ? w - 1 : k); const uint8_t* p = row + c * 3; sr += p[0]; sg += p[1]; sb += p[2]; }
+    for (int i = 0; i < w; i++) {
+      out[i*3] = (uint8_t)(sr / win); out[i*3+1] = (uint8_t)(sg / win); out[i*3+2] = (uint8_t)(sb / win);
+      int rem = i - radius; rem = rem < 0 ? 0 : rem;
+      int add = i + radius + 1; add = add >= w ? w - 1 : add;
+      const uint8_t* pr = row + rem * 3; const uint8_t* pa = row + add * 3;
+      sr += pa[0] - pr[0]; sg += pa[1] - pr[1]; sb += pa[2] - pr[2];
+    }
+  }
+  // Vertical pass b -> a.
+  for (int i = 0; i < w; i++) {
+    int sr = 0, sg = 0, sb = 0;
+    for (int k = -radius; k <= radius; k++) { int c = k < 0 ? 0 : (k >= h ? h - 1 : k); const uint8_t* p = b + ((size_t)c * w + i) * 3; sr += p[0]; sg += p[1]; sb += p[2]; }
+    for (int j = 0; j < h; j++) {
+      uint8_t* p = a + ((size_t)j * w + i) * 3; p[0] = (uint8_t)(sr / win); p[1] = (uint8_t)(sg / win); p[2] = (uint8_t)(sb / win);
+      int rem = j - radius; rem = rem < 0 ? 0 : rem;
+      int add = j + radius + 1; add = add >= h ? h - 1 : add;
+      const uint8_t* pr = b + ((size_t)rem * w + i) * 3; const uint8_t* pa = b + ((size_t)add * w + i) * 3;
+      sr += pa[0] - pr[0]; sg += pa[1] - pr[1]; sb += pa[2] - pr[2];
+    }
+  }
+  // Write `a` back to the region, honoring the clip rect.
+  for (int j = 0; j < h; j++) {
+    const int yy = y + j; if (yy < clipY0 || yy >= clipY1) continue;
+    for (int i = 0; i < w; i++) {
+      const int xx = x + i; if (xx < clipX0 || xx >= clipX1) continue;
+      const uint8_t* p = a + ((size_t)j * w + i) * 3;
+      fb[drawBuf][(size_t)yy * W + xx] = pack565(p[0], p[1], p[2]);
+    }
+  }
+  free(a); free(b);
+}
+
 // Bresenham line from (x0,y0) to (x1,y1). panelPixel clamps, so off-panel endpoints are fine.
 void panelLine(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b) {
   if (!info.ok) return;

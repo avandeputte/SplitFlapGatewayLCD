@@ -786,7 +786,7 @@ static esp_err_t handleApiCapabilities(httpd_req_t* r) {
              "\"triangle\",\"roundrect\",\"gradient\",\"polyline\",\"poly\",\"arc\",\"bezier\","
              "\"clip\",\"origin\",\"save\",\"restore\",\"translate\",\"scale\",\"rotate\","
              "\"layer\",\"composite\",\"define\",\"call\","
-             "\"blend\",\"text\",\"gtext\",\"textbox\",\"image\",\"sprite\",\"scroll\",\"show\"],"
+             "\"blend\",\"text\",\"gtext\",\"blur\",\"textbox\",\"image\",\"sprite\",\"scroll\",\"show\"],"
              "\"compositing\":{\"alpha\":true,\"blendModes\":[\"over\",\"add\",\"multiply\",\"screen\",\"max\"],\"aa\":true,"
              "\"transform\":true,\"layers\":true,\"macros\":true},"
              "\"text2\":{\"scalable\":%s,\"aa\":true,\"maxSize\":%u,\"charset\":\"cp1252\","
@@ -2704,6 +2704,7 @@ static int alignIdx(const char* a, const char* mid) {   // "left/top"=0, mid=1, 
                     (scalable AA TrueType; face 0 sans/1 mono/2 custom; flags: bits0-1
                      align 0L/1C/2R, bit2 aa, bit3 has-outline, bit4 has-shadow; text
                      UTF-8, len u8; (x,y) = top-left of the ascent box)
+     0x22 BLUR      x y w h radius(u8)           (separable box-blur of the region in place)
    Flag bits: CIRCLE flags bit1 = aa outline; POLY flags bit2 = aa outline/polyline. */
 static inline int16_t bops16(const uint8_t* p) { return (int16_t)(((uint16_t)p[0] << 8) | p[1]); }
 
@@ -2968,6 +2969,8 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
         ttfDrawText(x, y, size, face, enc, fl & 0x03, cr, cg, cb, (fl & 0x04) != 0, 0,
                     (fl & 0x08) != 0, orr, org, orb, (fl & 0x10) != 0, shr, shg, shb);
         i = q + slen; break; }
+      case 0x22: { BOPS_NEED(9); BXY(0);                                            // BLUR
+        panelBoxBlur(x, y, xfW(bops16(p+i+4)), xfH(bops16(p+i+6)), p[i+8]); i += 9; break; }
       default: ok = false; break;
     }
     if (!ok) break;
@@ -3140,6 +3143,10 @@ static int canvasOpsRun(JsonArrayConst ops, bool* shownOut, int depth) {
       ttfDrawText(x, y, op["size"] | 24, face, enc, alignIdx(op["align"] | "left", "center"),
                   r, g, b, op["aa"] | true, op["tracking"] | 0,
                   hasOut, orr, org, orb, hasSh, shr, shg, shb);
+    } else if (!strcmp(k, "blur")) {
+      // Box-blur a region of the back buffer in place: {op:"blur",x,y,w,h,r}. The on-device
+      // stand-in for the companion's PIL blur -- darken/soften busy art, then draw text on top.
+      panelBoxBlur(x, y, w, h, op["r"] | (op["radius"] | 4));
     } else if (!strcmp(k, "arc")) {
       // {"op":"arc",x,y,"r":R,"t":T,"start":deg,"end":deg,"fill":bool} -- 0 deg = 12
       // o'clock, clockwise (the gauge convention). fill=true draws the pie slice.
