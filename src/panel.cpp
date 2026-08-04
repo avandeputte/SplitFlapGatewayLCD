@@ -18,14 +18,13 @@
 // (Pixel Processing Accelerator) with a CPU fallback. Flip PANEL_ROT_180 below if
 // the physical mount turns out upside-down.
 //
-// BUFFER MODEL (same contract as the Matrix Gateway)
-// --------------------------------------------------
-// Two PSRAM buffers: drawBuf (the CPU draws) and liveBuf (a CPU-side copy of what
-// is on screen -- panelCloneToBack, panelReadback and panelScroll read it). The DPI
-// scanout buffer is a third, owned by esp_lcd; the CPU never reads it. panelShow
-// copies draw -> scanout (rotating), then swaps the draw/live roles. The copy is
-// synchronous, so unlike the HUB75 driver there is no tear-guard: after show, both
-// CPU buffers are immediately writable.
+// BUFFER MODEL
+// ------------
+// Two logical-landscape PSRAM buffers: drawBuf (the CPU draws) and liveBuf (a CPU-side
+// copy of what is on screen -- panelCloneToBack, panelReadback and panelScroll read it).
+// panelShow PPA-rotates drawBuf into a third compose buffer, then draw_bitmap DMA2D-copies
+// that into one of the DPI panel's TWO internal framebuffers, which swap at vsync (v0.1) --
+// so a present never crosses the raster mid-scan. The draw/live roles swap after each show.
 
 #include "panel.h"
 #include <math.h>          // sqrtf, for the ellipse scanlines
@@ -613,42 +612,39 @@ static void rotateToScanout() {
                   ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 }
 
+// Rotate fb[drawBuf] into the compose buffer, present it (double-buffered draw_bitmap),
+// and swap the draw/live roles. The CPU filled fb[drawBuf] through the cache, so flush it
+// to memory before the PPA rotate reads it.
+static void presentAndSwap() {
+  const size_t liveBytes = ((size_t)W * H * sizeof(px_t) + 127u) & ~((size_t)127u);
+  if (gPpa) esp_cache_msync(fb[drawBuf], liveBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+  rotateToScanout();
+  // draw_bitmap DMA2D-copies the compose buffer into the DPI back buffer and swaps at
+  // the next vsync (double-buffered = tear-free). Wait for the copy before the next
+  // frame reuses the compose buffer.
+  esp_lcd_panel_draw_bitmap(gPanel, 0, 0, PANEL_NATIVE_W, PANEL_NATIVE_H, gScanout);
+  if (gTransDone) xSemaphoreTake(gTransDone, pdMS_TO_TICKS(100));
+  const uint8_t shown = drawBuf;
+  drawBuf = liveBuf;
+  liveBuf = shown;
+}
+
 void panelShow() {
   if (sOverlay) sOverlay();   // draw the overlay into the outgoing frame
   if (!info.ok) return;
   if (blipUntil && (int32_t)(millis() - blipUntil) < 0) { blipStamp(); liveHasBlip = true; }
   else liveHasBlip = false;
 
-  // PPA reads physical PSRAM; the CPU drew through the cache. Flush before the blit --
-  // only the LOGICAL region (at effect scale that is 82 KB, not the buffer's 2 MB).
-  static uint32_t tSync = 0, tBlit = 0, nShow = 0, tLast = 0;   // bring-up: frame timing
+  static uint32_t tShow = 0, nShow = 0, tLast = 0;   // bring-up: frame timing
   const uint32_t t0 = micros();
-  // P4 cache lines are 128 B (the S3 was 64): a sync not aligned to that is REJECTED
-  // outright by esp_cache_msync, not partially done -- the boot log said so.
-  const size_t liveBytes = ((size_t)W * H * sizeof(px_t) + 127u) & ~((size_t)127u);
-  if (gPpa) esp_cache_msync(fb[drawBuf], liveBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-  const uint32_t t1 = micros();
-  rotateToScanout();
-  // Present: draw_bitmap DMA2D-copies the compose buffer into the DPI back buffer and
-  // swaps at the next vsync (double-buffered = tear-free). Wait for the copy to finish
-  // before the next frame reuses the compose buffer.
-  esp_lcd_panel_draw_bitmap(gPanel, 0, 0, PANEL_NATIVE_W, PANEL_NATIVE_H, gScanout);
-  if (gTransDone) xSemaphoreTake(gTransDone, pdMS_TO_TICKS(100));
-  const uint32_t t2 = micros();
-  tSync += t1 - t0; tBlit += t2 - t1; nShow++;
+  presentAndSwap();
+  tShow += micros() - t0; nShow++;
   if (!tLast) tLast = millis();
   if (gSerialDebug && millis() - tLast > 2000 && nShow > 5) {
-    printf("[PANEL] show: %lu fps, msync %lu us, blit %lu us\n",
-           (unsigned long)(nShow * 1000UL / (millis() - tLast)),
-           (unsigned long)(tSync / nShow), (unsigned long)(tBlit / nShow));
-    tSync = tBlit = 0; nShow = 0; tLast = millis();
+    printf("[PANEL] show: %lu fps, %lu us/present\n",
+           (unsigned long)(nShow * 1000UL / (millis() - tLast)), (unsigned long)(tShow / nShow));
+    tShow = 0; nShow = 0; tLast = millis();
   }
-
-  // Swap roles: what we just presented becomes the live copy; the old live buffer is
-  // the new (stale) draw buffer. Synchronous blit -- no tear-guard needed.
-  const uint8_t shown = drawBuf;
-  drawBuf = liveBuf;
-  liveBuf = shown;
 }
 
 // ---- bring-up / teardown ----------------------------------------------------------

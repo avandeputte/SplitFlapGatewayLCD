@@ -7,6 +7,8 @@
 #include "effects.h"
 #include "font1252.h"
 #include <string.h>
+#include <esp_cache.h>
+#include <esp_heap_caps.h>
 #include <FFat.h>
 #include "SD_MMC.h"     // SD animation streaming (v3.13)
 #include "sdcard.h"
@@ -198,12 +200,12 @@ bool canvasStageBegin(uint8_t bpp) {
   const size_t needOld = (size_t)gPanel.panelW * gPanel.panelH * 3;
   if (stageCap < need) {
     if (stageBuf) free(stageBuf);
-    stageBuf = (uint8_t*)ps_malloc(need);
+    stageBuf = (uint8_t*)heap_caps_aligned_alloc(128, (need + 127u) & ~127u, MALLOC_CAP_SPIRAM);
     stageCap = stageBuf ? need : 0;
   }
   if (oldCap < needOld) {
     if (oldBuf) free(oldBuf);
-    oldBuf = (uint8_t*)ps_malloc(needOld);
+    oldBuf = (uint8_t*)heap_caps_aligned_alloc(128, (needOld + 127u) & ~127u, MALLOC_CAP_SPIRAM);
     oldCap = oldBuf ? needOld : 0;
   }
   if (!stageBuf || !oldBuf) return false;
