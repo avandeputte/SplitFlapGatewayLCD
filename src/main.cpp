@@ -5,6 +5,7 @@
 #include "sdcard.h"
 #include "backup.h"
 #include "imu.h"
+#include "touch.h"
 #include "canvas.h"   // canvasAnimLoadPlay: the boot animation
 #include <ETH.h>      // LCD Gateway: IP101 PHY behind the PoE jack
 #include <esp_ota_ops.h>   // esp_ota_get_running_partition(): which slot are we actually running?
@@ -134,6 +135,7 @@ void setup() {
   soundInit();   // ES8311 speaker DAC -- same single-threaded I2C window
   sensorInit();  // SHTC3 temp/humidity -- same single-threaded I2C window
   imuInit();     // QMI8658 tap engine -- same single-threaded I2C window (v3.15)
+  touchInit();   // GT911 capacitive touch -- same single-threaded I2C window (LCD)
 
   // 4. Plan the panel geometry. The module grid can be clamped by the panel (a
   //    15-column wall does not fit 64 px), and the wall IS the module list, so

@@ -10,6 +10,7 @@
 #include "sensor.h"          // env fields in status + the environment token (v3.7)
 #include "sdcard.h"
 #include "backup.h"
+#include "touch.h"            // GT911 touchscreen (LCD Gateway)
 #include "esp32-hal-hosted.h"   // C6 co-processor slave OTA (LCD Gateway)          // microSD info + the sd token (v3.10)
 #include "timer.h"           // kitchen timer + alarms (v3.14)
 #include "imu.h"             // tap detection state + the taps token (v3.15)
@@ -453,63 +454,19 @@ static esp_err_t handleApiModules(httpd_req_t* r) {
  * text cannot name it, the panel draws it fine), or null when there is no module there.
  */
 static esp_err_t handleApiDisplayState(httpd_req_t* r) {
-  const int rows = gPanel.rows ? gPanel.rows : 1;
-  const int cols = gPanel.cols ? gPanel.cols : 1;
-  const int cells = rows * cols;
-
-  static int16_t flap[VM_MAX_MODULES];
-  int n = vmCount;
-  if (n > VM_MAX_MODULES) n = VM_MAX_MODULES;
-  if (vmMutex && xSemaphoreTake(vmMutex, portMAX_DELAY) == pdTRUE) {
-    for (int i = 0; i < n; i++) flap[i] = vmods[i].curIndex;
-    xSemaphoreGive(vmMutex);
-  }
-
-  httpd_resp_set_type(r, "application/json");
-  char head[48];
-  snprintf(head, sizeof(head), "{\"rows\":%d,\"cols\":%d,\"cells\":[", rows, cols);
-  httpxChunkStr(r, head);
-  for (int i = 0; i < cells; i++) {
-    char one[16];
-    if (i >= n) {
-      snprintf(one, sizeof(one), "%snull", i ? "," : "");
-    } else {
-      // Report the CODE POINT, not the byte. A pictograph flap has no CP1252 byte, so a
-      // byte-shaped read renders a heart as '?' -- which is the same blindness that made the
-      // old registry unable to restore one after Quiet Time. A colour flap has no character
-      // at all; it reports as its protocol letter (r o y g b p w), as it always has.
-      const uint32_t cp = vmFlapCodepointAt(flap[i]);
-      if (!cp) {
-        const char c = vmFlapCharAt(flap[i]);                   // a colour flap
-        snprintf(one, sizeof(one), "%s\"%c\"", i ? "," : "", c ? c : ' ');
-      } else {
-        char utf8[8] = "";
-        size_t n8 = utf8Encode(cp, utf8);
-        utf8[n8] = 0;
-        if (cp == '"' || cp == '\\')                            // JSON-escape the two that need it
-          snprintf(one, sizeof(one), "%s\"\\%s\"", i ? "," : "", utf8);
-        else
-          snprintf(one, sizeof(one), "%s\"%s\"", i ? "," : "", utf8);
-      }
-    }
-    httpxChunkStr(r, one);
-    if ((i & 31) == 0) wdgWebMs = millis();
-  }
-  // v3.0.1, both additive: "flaps" is the raw flap INDEX per cell (-1 = no module), the
-  // only way a client can tell a colour flap (156..162) from a lowercase r/o/y/g/b/p/w --
-  // the "cells" letter is identical for both. "mode" says whether the PANEL is currently
-  // showing this wall at all: "pixels" means canvas/effect/animation/ticker owns it, and
-  // a live preview should render GET /api/canvas/frame instead of these cells.
-  httpxChunkStr(r, "],\"flaps\":[");
-  for (int i = 0; i < cells; i++) {
-    char one[12];
-    snprintf(one, sizeof(one), "%s%d", i ? "," : "", i < n ? (int)flap[i] : -1);
-    httpxChunkStr(r, one);
-  }
-  char tail[32];
-  snprintf(tail, sizeof(tail), "],\"mode\":\"%s\"}", dispPixelsMode() ? "pixels" : "wall");
-  httpxChunkStr(r, tail);
-  return httpxChunkEnd(r);
+  // Buffered send with a Content-Length, NOT chunked (v0.1): the wall's cell arrays
+  // grow with the grid (320 cells at 32x10), and a chunked reply that lost a chunk
+  // over the hosted-WiFi link read as a down device to the companion. Build the exact
+  // same JSON the SSE pump uses (dispStateJson) into one PSRAM buffer and send it whole.
+  const size_t cap = 12288;   // >> the ~3.3 KB a full 320-cell wall produces
+  char* buf = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+  if (!buf) buf = (char*)malloc(cap);
+  if (!buf) return httpxErr(r, 503, "out of memory");
+  const size_t len = dispStateJson(buf, cap);
+  esp_err_t rc = len ? httpxSend(r, 200, "application/json", buf, (int)len)
+                     : httpxErr(r, 503, "reels busy");   // lock contended: client retries
+  free(buf);
+  return rc;
 }
 
 // The same display-state JSON, serialized into a buffer for the SSE pump (web.h). The
@@ -684,18 +641,33 @@ static esp_err_t handleApiHome(httpd_req_t* r) {
 // So: accumulate, and flush a kilobyte at a time.
 static char   capBuf[1024];
 static size_t capLen = 0;
+// Optional capture sink (v0.1, the "companion thinks it is down" fix): when set, the
+// whole reply accumulates in one PSRAM buffer and is sent with a Content-Length, not
+// chunked. A chunked /api/capabilities intermittently truncated over the hosted-WiFi
+// link -- and a client reading a short JSON declares the device down. Content-Length
+// is what /api/status always used and never lost. capSinkCap 0 = classic chunked mode.
+static char*  capSink    = nullptr;
+static size_t capSinkLen = 0, capSinkCap = 0;
 
+static void capEmit(const char* str, size_t n) {
+  if (capSink) {                                   // buffered mode
+    if (capSinkLen + n < capSinkCap) { memcpy(capSink + capSinkLen, str, n); capSinkLen += n; }
+    // silently drop past cap -- callers size the buffer with headroom; verified below
+    return;
+  }
+  httpxChunkStr(gStreamReq, str);
+}
 static void capFlush() {
   if (!capLen) return;
   capBuf[capLen] = 0;
-  httpxChunkStr(gStreamReq, capBuf);
+  capEmit(capBuf, capLen);
   capLen = 0;
   wdgWebMs = millis();
 }
 static void capPut(const char* str) {
   size_t n = strlen(str);
   if (capLen + n >= sizeof(capBuf) - 1) capFlush();
-  if (n >= sizeof(capBuf) - 1) { httpxChunkStr(gStreamReq, str); return; }   // never truncate a caller
+  if (n >= sizeof(capBuf) - 1) { capEmit(str, n); return; }   // never truncate a caller
   memcpy(capBuf + capLen, str, n);
   capLen += n;
 }
@@ -721,9 +693,13 @@ static esp_err_t handleApiCapabilities(httpd_req_t* r) {
   const int rows = gPanel.rows ? gPanel.rows : 1;
   const int cols = gPanel.cols ? gPanel.cols : 1;
 
-  httpd_resp_set_type(r, "application/json");
+  // Buffered send (not chunked): the whole document goes out with a Content-Length so
+  // a client can never mistake a truncated read for a down device (see capEmit).
   gStreamReq = r;
   capLen = 0;
+  capSinkCap = 8192; capSinkLen = 0;
+  capSink = (char*)heap_caps_malloc(capSinkCap, MALLOC_CAP_SPIRAM);
+  if (!capSink) capSink = (char*)malloc(capSinkCap);
 
   char head[320];
   snprintf(head, sizeof(head),
@@ -827,16 +803,24 @@ static esp_err_t handleApiCapabilities(httpd_req_t* r) {
     snprintf(ft, sizeof(ft),
              "\"features\":[\"cells\",\"colors\",\"index\",\"lowercase\",\"pictographs\","
              "\"quiet\",\"ota\",\"canvas\",\"effects\",\"ticker\",\"brightness\",\"events\","
-             "\"effectDefs\",\"timer\",\"alarms\"%s%s%s%s%s%s]}",
+             "\"effectDefs\",\"timer\",\"alarms\"%s%s%s%s%s%s%s]}",
              audioAvailable() ? ",\"audio\"" : "",
              soundAvailable() ? ",\"sound\"" : "",
              sensorAvailable() ? ",\"environment\"" : "",
              sdReady() ? ",\"sd\"" : "",
              audioAvailable() ? ",\"claps\"" : "",
-             imuAvailable() ? ",\"taps\"" : "");
+             imuAvailable() ? ",\"taps\"" : "",
+             touchAvailable() ? ",\"touch\"" : "");
     capPut(ft); }
   capFlush();
-  return httpxChunkEnd(r);
+  esp_err_t rc;
+  if (capSink) {
+    rc = httpxSend(r, 200, "application/json", capSink, (int)capSinkLen);
+    free(capSink); capSink = nullptr; capSinkCap = capSinkLen = 0;
+  } else {
+    rc = httpxChunkEnd(r);   // sink alloc failed: fall back to the chunked path
+  }
+  return rc;
 }
 
 // The status JSON, shared by GET /api/status and the SSE `status` event (v3.2).
@@ -1068,6 +1052,7 @@ static esp_err_t handleApiConfigSettings(httpd_req_t* r) {
   if (doc["dimTzOffsetMin"].is<int>()) cfg.quietTzOffsetMin = (int16_t)doc["dimTzOffsetMin"].as<int>();
   if (doc["clapEnabled"].is<bool>()) cfg.clapEnabled = doc["clapEnabled"].as<bool>();
   if (doc["tapEnabled"].is<bool>())  cfg.tapEnabled  = doc["tapEnabled"].as<bool>();
+  if (doc["touchEnabled"].is<bool>()) cfg.touchEnabled = doc["touchEnabled"].as<bool>();
   if (doc["backupEnabled"].is<bool>()) cfg.backupEnabled = doc["backupEnabled"].as<bool>();
   if (doc["panelBright"].is<int>())   { int v = doc["panelBright"];
     // Apply now, not just on the next wall repaint: an effect or raw canvas owns the panel while
@@ -1693,17 +1678,21 @@ static esp_err_t handleApiEnvironment(httpd_req_t* r) {
 // GET /api/gestures -- hardware presence + enables. Events ride SSE ("clap"/"tap"
 // {count,seq}); this is the discovery/diagnostic view.
 static esp_err_t handleApiGestures(httpd_req_t* r) {
-  char buf[256];   // 160 truncated once peakMg joined -- clients got unparseable JSON
+  char buf[360];
   float mr, br, fl;
   audioClapDebug(&mr, &br, &fl);
+  uint16_t tx = 0, ty = 0; const bool tdown = touchPoint(&tx, &ty);
   snprintf(buf, sizeof(buf),
            "{\"claps\":{\"available\":%s,\"enabled\":%s,\"total\":%lu,"
            "\"peakRms\":%.4f,\"peakBright\":%.2f,\"peakFloor\":%.4f},"
-           "\"taps\":{\"available\":%s,\"enabled\":%s,\"total\":%lu,\"peakMg\":%ld}}",
+           "\"taps\":{\"available\":%s,\"enabled\":%s,\"total\":%lu,\"peakMg\":%ld},"
+           "\"touch\":{\"available\":%s,\"enabled\":%s,\"total\":%lu,\"down\":%s,\"x\":%u,\"y\":%u}}",
            audioAvailable() ? "true" : "false", cfg.clapEnabled ? "true" : "false",
            (unsigned long)audioClapTotal(), mr, br, fl,
            imuAvailable() ? "true" : "false",  cfg.tapEnabled ? "true" : "false",
-           (unsigned long)imuTapTotal(), (long)imuAccelPeakMg());
+           (unsigned long)imuTapTotal(), (long)imuAccelPeakMg(),
+           touchAvailable() ? "true" : "false", cfg.touchEnabled ? "true" : "false",
+           (unsigned long)touchTotal(), tdown ? "true" : "false", (unsigned)tx, (unsigned)ty);
   return httpxSend(r, 200, "application/json", buf);
 }
 

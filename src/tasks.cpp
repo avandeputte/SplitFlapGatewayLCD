@@ -4,7 +4,8 @@
 #include "panel.h"    // panelSetBrightness: the brightness schedule (v3.13)
 #include "timer.h"    // alarmTick: daily alarms fire from taskRTC (v3.14)
 #include "audio.h"    // audioClapPoll + capture re-arm for clap detection (v3.15)
-#include "imu.h"      // QMI8658 tap engine poll -- I2C stays on taskRTC (v3.15)
+#include "imu.h"
+#include "touch.h"    // GT911 touchscreen taps (LCD Gateway); I2C stays on taskRTC
 #include "sdcard.h"   // sdLog: gesture-dismissal audit trail (v3.15)
 
 
@@ -143,6 +144,7 @@ void taskRTC(void* pv) {
   uint32_t lastSched = 0, lastEnv = 0, lastSec = 0;
   while (true) {
     if (cfg.tapEnabled) imuTapTick();
+    if (cfg.touchEnabled) touchTick();   // GT911 poll (taskRTC: the I2C rule)
     panelBacklightService();   // pending backlight writes land here (the I2C rule)     // QMI8658 tap status, ~100 ms (v3.15)
     if (lastSec == 0 || millis() - lastSec >= 1000UL) {
       lastSec = millis();
@@ -196,7 +198,7 @@ void taskWeb(void* pv) {
       // the companion, which sets its own bar. For taps, the chip's own double-tap
       // window is stricter than human rhythm, so two single-tap EVENTS within 1.5 s
       // also count as a double (live-tested: real double-taps arrived as 2 singles).
-      static unsigned long lastTapEvMs = 0, lastClapEvMs = 0;
+      static unsigned long lastTapEvMs = 0, lastClapEvMs = 0, lastTouchEvMs = 0;
       // Pair window 1.0 s (was 1.5): deliberate doubles land ~0.3-0.6 s apart, but desk
       // activity (typing bursts) could pair two accidental singles inside 1.5 s -- the
       // 2026-08-01 false dismissal. Every dismissal is SD-logged with its channel so a
@@ -212,6 +214,14 @@ void taskWeb(void* pv) {
         lastTapEvMs = millis();
         if (dbl && timerAlarmGestureDismiss()) sdLog("gesture dismiss: tap x%u", (unsigned)(gc >= 2 ? gc : 2));
         else { sseBroadcastGesture("tap", gc, gs); panelGestureBlip(255, 140, 0); }    // amber = tap
+      }
+      // Touchscreen tap: same contract -- a DOUBLE-tap dismisses a timer/alarm, a
+      // single reaches the companion as a "touch" event with {count,seq}.
+      if (touchPoll(&gc, &gs)) {
+        const bool dbl = (gc >= 2) || (millis() - lastTouchEvMs < 1000);
+        lastTouchEvMs = millis();
+        if (dbl && timerAlarmGestureDismiss()) sdLog("gesture dismiss: touch x%u", (unsigned)(gc >= 2 ? gc : 2));
+        else { sseBroadcastGesture("touch", gc, gs); panelGestureBlip(0, 255, 120); }  // green = touch
       } }
     panelBlipService();
 

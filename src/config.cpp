@@ -36,6 +36,7 @@ void cfgSetDefaults() {
   }
   cfg.clapEnabled = false;
   cfg.tapEnabled  = false;
+  cfg.touchEnabled = true;
   cfg.backupEnabled = true;
   cfg.hostname[0] = 0;          // blank -> derived from the MAC
   cfg.serialDebug = false;
@@ -83,6 +84,7 @@ void loadConfig() {
   if (cfg.dimLevel < 1) cfg.dimLevel = 40;
   cfg.clapEnabled = prefs.getBool("clapEn", false);
   cfg.tapEnabled  = prefs.getBool("tapEn",  false);
+  cfg.touchEnabled = prefs.getBool("touchEn", true);
   cfg.backupEnabled = prefs.getBool("bakEn", true);
   for (int i = 0; i < 4; i++) {
     char k[8];
@@ -153,6 +155,7 @@ void saveConfig() {
   prefs.putUChar ("dimLvl",   cfg.dimLevel);
   prefs.putBool  ("clapEn",   cfg.clapEnabled);
   prefs.putBool  ("tapEn",    cfg.tapEnabled);
+  prefs.putBool  ("touchEn",  cfg.touchEnabled);
   prefs.putBool  ("bakEn",    cfg.backupEnabled);
   for (int i = 0; i < 4; i++) {
     char k[8];
@@ -213,6 +216,7 @@ void cfgExportJson(JsonDocument& doc) {
   }
   doc["clapEnabled"]   = cfg.clapEnabled;
   doc["tapEnabled"]    = cfg.tapEnabled;
+  doc["touchEnabled"]  = cfg.touchEnabled;
   doc["backupEnabled"] = cfg.backupEnabled;
 }
 
@@ -278,6 +282,7 @@ bool cfgImportJson(const JsonDocument& doc, int& applied, bool& rebootNeeded) {
   }
   IMP_BOOL("clapEnabled", cfg.clapEnabled);
   IMP_BOOL("tapEnabled",  cfg.tapEnabled);
+  IMP_BOOL("touchEnabled", cfg.touchEnabled);
   IMP_BOOL("backupEnabled", cfg.backupEnabled);
 
   #undef IMP_STR

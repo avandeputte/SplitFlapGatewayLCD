@@ -64,6 +64,7 @@ struct GwConfig {
   bool          almEnabled[4];
   bool          clapEnabled;   // clap detection (v3.15): keeps the mic capturing; SSE "clap" events
   bool          tapEnabled;    // IMU tap detection (v3.15): QMI8658 tap engine; SSE "tap" events
+  bool          touchEnabled;  // GT911 touchscreen taps (LCD Gateway): SSE "touch" events; default on
   bool          backupEnabled; // v3.16: nightly FATFS->SD mirror at 03:30 local (backup.h)
 };
 
