@@ -27,7 +27,17 @@ import genfont  # cp1252_printable() + EXTRA_GLYPHS: the single source of glyph 
 
 from PIL import Image, ImageDraw, ImageFont
 
-FACES = [("BIG", 72, 100), ("MED", 32, 46)]   # (name, box_w, box_h), largest first
+# The face ladder covers every card the 10x1..32x10 grid range produces (cards are
+# aspect-locked 1:2, so width 40px at 32 columns up to 128px at 10): the picker takes
+# the largest face that fits, so each rung is sized to fill its card band.
+FACES = [
+    ("F110", 110, 154),   # 128px cards (10 cols)
+    ("F90",   90, 126),   # ~100px cards (10x4, 12 cols)
+    ("F72",   72, 100),   # ~85px cards (15 cols)
+    ("F56",   56,  78),   # ~64px cards (18-20 cols)
+    ("F44",   44,  62),   # ~52px cards (24 cols)
+    ("F32",   32,  46),   # 40px cards (32 cols)
+]
 HELV = "/System/Library/Fonts/Helvetica.ttc"
 SYMS = "/System/Library/Fonts/Apple Symbols.ttf"
 OUT_CPP = os.path.join(ROOT, "src", "fontflap.cpp")

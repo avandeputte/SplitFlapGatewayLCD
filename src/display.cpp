@@ -84,12 +84,17 @@ PanelGeometry dispPlan(uint16_t panelW, uint16_t panelH, uint8_t cols, uint8_t r
 
   g.panelW  = panelW;  g.panelH = panelH;
   g.cols    = cols;    g.rows   = rows;
-  g.cellW   = (uint16_t)(panelW / cols);
-  // A flap card keeps its proportions no matter the row count: height is capped at
-  // FLAP_ASPECT x width, and a wall that does not fill the panel vertically is
-  // letterboxed -- originY centres the rows. (10 rows of 40x80 cards fill exactly.)
-  g.cellH   = (uint16_t)(panelH / rows);
-  if (g.cellH > g.cellW * FLAP_ASPECT) g.cellH = (uint16_t)(g.cellW * FLAP_ASPECT);
+  // A flap card keeps its 1:FLAP_ASPECT proportions no matter the grid: whichever
+  // axis is the constraint decides the card size, and a wall that does not fill the
+  // panel is centred on both axes (originX/originY margins). 32x10 of 40x80 cards
+  // fills exactly; 32x5 letterboxes; 5x10 pillarboxes.
+  {
+    uint16_t w = (uint16_t)(panelW / cols);
+    const uint16_t hMax = (uint16_t)(panelH / rows);
+    if (w * FLAP_ASPECT > hMax) w = (uint16_t)(hMax / FLAP_ASPECT);
+    g.cellW = w;
+    g.cellH = (uint16_t)(w * FLAP_ASPECT);
+  }
   g.originX = (uint16_t)((panelW - g.cellW * cols) / 2);
   g.originY = (uint16_t)((panelH - g.cellH * rows) / 2);
   // The largest Helvetica flap face the cell affords, or null for the bitmap faces

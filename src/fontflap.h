@@ -8,8 +8,8 @@
 #include <stdint.h>
 
 #define FONTFLAP_N        230
-#define FONTFLAP_FACE_CNT 2
-#define FONTFLAP_MAX_W    72
+#define FONTFLAP_FACE_CNT 6
+#define FONTFLAP_MAX_W    110
 
 struct FlapFace {
   uint16_t       w, h, bpr;   // glyph box and bytes per packed row
