@@ -33,7 +33,13 @@ volatile uint8_t gEffectReq   = EFFECT_REQ_IDLE;   // pending start, picked up b
 volatile int     gEffectHue     = -1;              // -1 = effect default; else 0..255 (see effects.h)
 volatile int     gEffectDensity = -1;              // -1 = effect default; else 1..100
 
-#define FX_MAXW      256                  // widest panel the firmware supports
+// Effects render at 1/EFFECT_RENDER_SCALE of the native width, so the per-column and
+// per-cell scratch arrays below are sized for that reduced width. The static_assert ties
+// the two together: changing EFFECT_RENDER_SCALE alone (e.g. to 4 -> width 320) would
+// otherwise silently overrun mHead/mSpeed/Life's xm/xp. Bump FX_MAXW if you widen.
+#define FX_MAXW      256                  // = ceil(PANEL_NATIVE_H / EFFECT_RENDER_SCALE)
+static_assert((1280 + EFFECT_RENDER_SCALE - 1) / EFFECT_RENDER_SCALE <= FX_MAXW,
+              "FX_MAXW too small for the effect render width (PANEL_NATIVE_H / EFFECT_RENDER_SCALE)");
 #define FX_MAXCELLS  260                  // most flap cells (>= any wall grid)
 
 static bool     fxReady = false;          // LUTs built

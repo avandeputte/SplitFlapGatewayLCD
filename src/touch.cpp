@@ -92,7 +92,7 @@ void touchTick() {
       if (!gDown && (uint32_t)(now - gLastTapMs) > 120) {
         gLastTapMs = now;
         taskENTER_CRITICAL(&touchMux);
-        gPending = 1; gSeq++; gTotal++;
+        gPending = 1; gSeq = gSeq + 1; gTotal = gTotal + 1;
         gPubX = lx; gPubY = ly;
         taskEXIT_CRITICAL(&touchMux);
       }

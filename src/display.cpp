@@ -265,7 +265,7 @@ void dispTestPattern() {
 void dispMarkDirty() { dispDirty = true; }
 
 const char* dispFontName() {
-  static char name[12] = "-";
+  static char name[16] = "-";
   if (gPanel.flap) snprintf(name, sizeof(name), "flap%ux%u", gPanel.flap->w, gPanel.flap->h);
   else if (gPanel.font) snprintf(name, sizeof(name), "%ux%u", gPanel.font->width, gPanel.font->height);
   return name;

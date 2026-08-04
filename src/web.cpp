@@ -399,12 +399,16 @@ static esp_err_t handleApiDisplayCells(httpd_req_t* r) {
  * and disappear on a physical wire. Nothing here appears or disappears.)
  */
 static esp_err_t handleApiModules(httpd_req_t* r) {
-  // setConnectionTimeout(), NOT setTimeout(): the latter sets Stream's *read* timeout and
-  // leaves SO_SNDTIMEO at its 3 s default. This loop does one socket write per module, so on
-  // a wedged client 160 modules x 3 s is far past the 120 s web watchdog, which would reboot
-  // the board. Bound each write instead.
-  httpd_resp_set_type(r, "application/json");
-  httpxChunkStr(r, "[");
+  // Buffered Content-Length send, NOT chunked: this is companion-reachable and grows
+  // with the wall (320 rows at 32x10), so a lost chunk over the hosted-WiFi link would
+  // read as a "device down" -- the same class already fixed for capabilities and
+  // display/state. One PSRAM buffer, ~50 B/row, sent whole.
+  const size_t cap = 24576;
+  char* out = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+  if (!out) out = (char*)malloc(cap);
+  if (!out) return httpxErr(r, 503, "out of memory");
+  size_t o = 0;
+  out[o++] = '[';
 
   const int n = vmCount;
   for (int i = 0; i < n; i++) {
@@ -431,15 +435,16 @@ static esp_err_t handleApiModules(httpd_req_t* r) {
       if (c) { utf8[0] = c; utf8[1] = 0; }
     }
 
-    char row[96];
-    snprintf(row, sizeof(row),
-             "%s{\"id\":%u,\"flapIndex\":%d,\"flapChar\":\"%s\"}",
-             i ? "," : "", (unsigned)id, flap, utf8);
-    httpxChunkStr(r, row);
-    wdgWebMs = millis();
+    if (o + 96 < cap)
+      o += (size_t)snprintf(out + o, cap - o,
+               "%s{\"id\":%u,\"flapIndex\":%d,\"flapChar\":\"%s\"}",
+               i ? "," : "", (unsigned)id, flap, utf8);
+    if ((i & 31) == 0) wdgWebMs = millis();
   }
-  httpxChunkStr(r, "]");
-  return httpxChunkEnd(r);
+  out[o++] = ']';
+  esp_err_t rc = httpxSend(r, 200, "application/json", out, (int)o);
+  free(out);
+  return rc;
 }
 
 
@@ -990,7 +995,6 @@ static esp_err_t handleApiConfigSettings(httpd_req_t* r) {
     saveConfig();
     printf("[CFG] Serial debug %s\n", cfg.serialDebug ? "enabled" : "disabled");
     return httpxSend(r, 200, "application/json", "{\"ok\":true}");
-    return ESP_OK;
   }
   if (doc["posixTZ"].is<const char*>()) {
     strlcpy(cfg.posixTZ, doc["posixTZ"] | "UTC0", sizeof(cfg.posixTZ));
@@ -1698,15 +1702,22 @@ static esp_err_t handleApiC6Ota(httpd_req_t* r) {
   size_t len = r->content_len;
   if (len < 65536 || len > 4u * 1024u * 1024u) return httpxErr(r, 400, "implausible size for a C6 firmware image");
   if (!hostedBeginUpdate()) return httpxErr(r, 500, "co-processor update begin failed (hosted link down?)");
+  // Hold gOtaInProgress for the whole transfer -- exactly like the app OTA: it exempts
+  // loop()'s heap-floor reboot and stands the panel down, so a slow 1.3 MB C6 image
+  // over the remoted WiFi can't self-reboot the host MID-FLASH and brick the C6 slave.
+  // httpxRecv (not raw httpd_req_recv) feeds the web watchdog and applies heap
+  // backpressure per chunk, so taskWeb never reads this as a stall.
+  gOtaInProgress = true;
   size_t recvd = 0;
   while (recvd < len) {
-    int n = httpd_req_recv(r, (char*)httpxBuf, min(len - recvd, (size_t)sizeof(httpxBuf)));
-    if (n <= 0) return httpxErr(r, 500, "upload aborted");
-    if (!hostedWriteUpdate(httpxBuf, (uint32_t)n)) return httpxErr(r, 500, "co-processor write failed");
+    int n = httpxRecv(r, (char*)httpxBuf, min(len - recvd, (size_t)sizeof(httpxBuf)));
+    if (n <= 0)                                  { gOtaInProgress = false; return httpxErr(r, 500, "upload aborted"); }
+    if (!hostedWriteUpdate(httpxBuf, (uint32_t)n)) { gOtaInProgress = false; return httpxErr(r, 500, "co-processor write failed"); }
     recvd += (size_t)n;
   }
-  if (!hostedEndUpdate()) return httpxErr(r, 500, "co-processor update verify failed");
-  if (!hostedActivateUpdate()) return httpxErr(r, 500, "co-processor activate failed");
+  const bool ok = hostedEndUpdate() && hostedActivateUpdate();
+  gOtaInProgress = false;
+  if (!ok) return httpxErr(r, 500, "co-processor update verify/activate failed");
   printf("[C6] slave firmware updated (%u bytes) -- reboot to run it\n", (unsigned)recvd);
   sdLog("C6 slave firmware updated: %u bytes", (unsigned)recvd);
   return httpxSend(r, 200, "application/json", "{\"ok\":true,\"rebootNeeded\":true}");
