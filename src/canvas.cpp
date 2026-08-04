@@ -235,15 +235,20 @@ static inline void stagePx(int x, int y, uint8_t& r, uint8_t& g, uint8_t& b) {
 void canvasStagePresent() {
   const int W = gPanel.panelW, H = gPanel.panelH;
   const uint8_t type = gTransType;
-  // Steps at ~30 fps for the configured duration, bounded sane.
-  int steps = (int)((uint32_t)gTransMs / 33);
-  if (steps < 2) steps = 2;
-  if (steps > 30) steps = 30;
   uint8_t r, g, b;
   static uint8_t rowBuf[PANEL_MAX_W * 3];   // one composed rgb888 row (v3.1: row blits)
+  // Time-DRIVEN, not step-counted: a full-frame present is ~12 ms on 1280x800 (the PPA
+  // rotate floor) plus the per-pixel blend, so a fixed 30-step transition took ~1 s and
+  // blew past gTransMs. Instead drive the tween by elapsed/gTransMs and stop when the
+  // budget is spent -- the step count self-adjusts to what the hardware can do, and the
+  // transition always finishes on time. (A bigger win, PPA hardware blend, is a
+  // separate change; this just stops multiplying the present floor.)
+  const uint32_t dur = gTransMs ? gTransMs : 1;
+  const uint32_t t0 = millis();
+  uint32_t el;
   if (type == 1) {                        // crossfade
-    for (int s = 1; s <= steps; s++) {
-      const int t = 255 * s / steps;
+    while ((el = millis() - t0) < dur) {
+      const int t = 255 * (int)el / (int)dur;
       for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
           const uint8_t* o = oldBuf + ((size_t)y * W + x) * 3;
@@ -259,24 +264,24 @@ void canvasStagePresent() {
     }
   } else if (type == 2) {                 // wipe, left to right
     panelCloneToBack();                   // keep the old frame under the un-wiped part
-    for (int s = 1; s <= steps; s++) {
-      const int xTo = W * s / steps;
+    while ((el = millis() - t0) < dur) {
+      const int xTo = W * (int)el / (int)dur;
       for (int y = 0; y < H; y++) {
         for (int x = 0; x < xTo; x++) {
           stagePx(x, y, r, g, b);
           rowBuf[x * 3] = r; rowBuf[x * 3 + 1] = g; rowBuf[x * 3 + 2] = b;
         }
-        panelBlitRow888(0, y, xTo, rowBuf);
+        if (xTo > 0) panelBlitRow888(0, y, xTo, rowBuf);
       }
       panelShow();
       panelCloneToBack();
       wdgWebMs = millis();
     }
   } else if (type == 3) {                 // slide: new frame pushes the old off to the left
-    for (int s = 1; s <= steps; s++) {
-      const int dx = W * s / steps;       // how far everything has moved left
+    while ((el = millis() - t0) < dur) {
+      const int dx = W * (int)el / (int)dur; // how far everything has moved left
       for (int y = 0; y < H; y++) {
-        memcpy(rowBuf, oldBuf + ((size_t)y * W + dx) * 3, (size_t)(W - dx) * 3);
+        if (W - dx > 0) memcpy(rowBuf, oldBuf + ((size_t)y * W + dx) * 3, (size_t)(W - dx) * 3);
         for (int x = W - dx; x < W; x++) {
           stagePx(x - (W - dx), y, r, g, b);
           rowBuf[x * 3] = r; rowBuf[x * 3 + 1] = g; rowBuf[x * 3 + 2] = b;

@@ -466,6 +466,16 @@ void panelCloneToBack() {
 void panelReadback(uint8_t* out, bool rgb565) {
   if (!info.ok || !out) return;
   const uint8_t buf = liveBuf;
+  // Fast path: the live buffer already holds native-LE RGB565 (what the panel scans
+  // out), so an rgb565 screenshot on an RGB panel is just a big-endian byte swap of
+  // it -- no per-pixel unpack/repack. The BGR case still goes per-pixel to undo the
+  // wiring swap into logical colours.
+  if (rgb565 && !bgrOrder) {
+    const px_t* src = fb[buf];
+    const size_t n = (size_t)W * H;
+    for (size_t i = 0; i < n; i++) { px_t v = src[i]; out[i*2] = (uint8_t)(v >> 8); out[i*2+1] = (uint8_t)v; }
+    return;
+  }
   size_t o = 0;
   for (int y = 0; y < H; y++)
     for (int x = 0; x < W; x++) {

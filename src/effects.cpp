@@ -314,10 +314,23 @@ static void aaGlyph(int px, int by, const AAFont* f, char c, uint8_t r, uint8_t 
   const uint8_t* bits = f->cov + gl->off;
   const int stride = (gl->w + 7) >> 3;                 // bytes per glyph row
   const int ox = px + gl->xoff, oy = by + gl->yoff;
+  // The masks are 1-bit (drawn hard, no AA), so collapse each row's set-bit runs into
+  // row blits -- same as dispDrawGlyph1252. On the clock the BIG face is 210x420 px x4
+  // digits/frame; per-pixel panelPixel was ~140k guarded writes/frame, run-blit is a
+  // few per row. inkRow is sized for the widest glyph the LCD faces reach.
+  static uint8_t inkRow[512 * 3];
+  const int gw = gl->w > 512 ? 512 : gl->w;
+  for (int i = 0; i < gw; i++) { inkRow[i*3] = r; inkRow[i*3+1] = g; inkRow[i*3+2] = b; }
   for (int yy = 0; yy < gl->h; yy++) {
     const uint8_t* row = bits + yy * stride;
-    for (int xx = 0; xx < gl->w; xx++)
-      if (row[xx >> 3] & (0x80 >> (xx & 7))) panelPixel(ox + xx, oy + yy, r, g, b);
+    int xx = 0;
+    while (xx < gw) {
+      if (!(row[xx >> 3] & (0x80 >> (xx & 7)))) { xx++; continue; }
+      int run = xx;
+      while (run < gw && (row[run >> 3] & (0x80 >> (run & 7)))) run++;
+      panelBlitRow888(ox + xx, oy + yy, run - xx, inkRow);
+      xx = run;
+    }
   }
 }
 // One glyph centred inside a fixed slotW-wide slot at slotX -- so proportional (Orbitron) digits
