@@ -14,6 +14,7 @@
 #include <driver/jpeg_decode.h>   // P4 hardware JPEG decoder (canvas jpeg upload)
 #include <esp_cache.h>
 #include "touch.h"            // GT911 touchscreen (LCD Gateway)
+#include <ETH.h>              // ETH.localIP() for the status Ethernet IP (LCD Gateway)
 #include "esp32-hal-hosted.h"   // C6 co-processor slave OTA (LCD Gateway)          // microSD info + the sd token (v3.10)
 #include "timer.h"           // kitchen timer + alarms (v3.14)
 #include "SD_MMC.h"          // /api/sd/* file operations
@@ -845,7 +846,7 @@ static float envCompRH(float rawT, float rawRH, float offC) {
 size_t statusJson(char* outBuf, size_t outCap) {
   // Use snprintf to avoid JsonDocument heap allocation (called every 3s by browser)
   char rtcBuf[24]; rtcFormatTime(rtcBuf, sizeof(rtcBuf));
-  IPAddress lip = WiFi.localIP(), aip = WiFi.softAPIP();
+  IPAddress lip = WiFi.localIP(), aip = WiFi.softAPIP(), eip = ETH.localIP();
   // Per-task minimum-ever free stack (bytes). A value trending toward 0 is an
   // early warning of the stack-canary crash class.
   unsigned stkFrm = hTaskFrames ? uxTaskGetStackHighWaterMark(hTaskFrames) : 0;
@@ -885,7 +886,7 @@ size_t statusJson(char* outBuf, size_t outCap) {
   else snprintf(sdf, sizeof(sdf), "{\"ok\":false}");
   size_t n = (size_t)snprintf(outBuf, outCap,
     "{\"uptime\":%lu,\"tx\":%lu,"
-    "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
+    "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\",\"eth\":\"%d.%d.%d.%d\","
     "\"heap\":%u,\"minheap\":%u,\"modules\":%d,"
     "\"stk\":{\"frames\":%u,\"web\":%u,\"net\":%u,\"httpd\":%u,\"rtc\":%u,\"disp\":%u},"
     "\"panel\":{\"ok\":%s,\"w\":%u,\"h\":%u,\"cols\":%u,\"rows\":%u,"
@@ -896,6 +897,7 @@ size_t statusJson(char* outBuf, size_t outCap) {
     (WiFi.status()==WL_CONNECTED)?"true":"false",
     lip[0],lip[1],lip[2],lip[3],
     aip[0],aip[1],aip[2],aip[3],
+    eip[0],eip[1],eip[2],eip[3],
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
     vmCount,
     stkFrm, stkWeb, stkNet, stkHtp, stkRtc, stkDsp,
