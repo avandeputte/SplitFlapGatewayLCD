@@ -1,4 +1,5 @@
 #include "gateway.h"
+#include "ttf.h"     // scalable AA TrueType text faces (v0.2)
 #include "audio.h"
 #include "sound.h"
 #include "sensor.h"
@@ -161,6 +162,7 @@ void setup() {
   //    framebuffer to octal PSRAM instead -- v3.11.)
   dispInit();
   dispMarkDirty();
+  ttfBegin();          // scalable AA TrueType faces (v0.2): parse the bundled TTF; cache is lazy
 
   // 7. Boot animation (v2.1): if a library animation is configured, play it now --
   //    before WiFi -- so the wall is alive seconds after power-on. The first

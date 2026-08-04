@@ -304,6 +304,46 @@ void panelBlitRow565(int x, int y, int n, const uint8_t* be565) {
   }
 }
 
+void panelBlitCoverRow(int x, int y, int n, const uint8_t* cov, uint8_t r, uint8_t g, uint8_t b) {
+  if (!info.ok || y < 0 || y >= H || y < clipY0 || y >= clipY1) return;
+  // An open layer or a non-'over' blend mode: route each covered pixel through the general
+  // path so group compositing and add/multiply/screen stay correct. Coverage folds into the
+  // op's own alpha. Rare for text (it usually draws 'over'), so the per-pixel setBlend is fine.
+  if (gLayerBuf || (gBlendActive && gBlendMode != 0)) {
+    const uint8_t sMode = gBlendMode, sAlpha = gBlendAlpha; const bool sActive = gBlendActive;
+    for (int i = 0; i < n; i++) {
+      uint16_t a = cov[i];
+      if (!a) continue;
+      if (sActive) a = (uint16_t)(a * sAlpha / 255);
+      if (!a) continue;
+      panelSetBlend(sMode, (uint8_t)a);
+      panelPixel(x + i, y, r, g, b);
+    }
+    gBlendMode = sMode; gBlendAlpha = sAlpha; gBlendActive = sActive;   // restore batch state
+    return;
+  }
+  // Fast path: composite 'over' straight into the back buffer, honoring clip + batch alpha.
+  const uint8_t ba = gBlendActive ? gBlendAlpha : 255;   // gBlendMode == 0 here
+  int i0 = 0, i1 = n;
+  if (x + i0 < clipX0) i0 = clipX0 - x;
+  if (x + i0 < 0)      i0 = -x;
+  if (x + i1 > W)      i1 = W - x;
+  if (x + i1 > clipX1) i1 = clipX1 - x;
+  px_t* row = fb[drawBuf] + (size_t)y * W;
+  for (int i = i0; i < i1; i++) {
+    uint16_t a = cov[i];
+    if (!a) continue;
+    if (ba != 255) a = (uint16_t)(a * ba / 255);
+    if (!a) continue;
+    const int px = x + i;
+    if (a >= 255) { row[px] = pack565(r, g, b); continue; }
+    uint8_t dr, dg, db; readPixelRGB(drawBuf, px, y, dr, dg, db);
+    row[px] = pack565(blendCh(0, r, dr, (uint8_t)a),
+                      blendCh(0, g, dg, (uint8_t)a),
+                      blendCh(0, b, db, (uint8_t)a));
+  }
+}
+
 // Bresenham line from (x0,y0) to (x1,y1). panelPixel clamps, so off-panel endpoints are fine.
 void panelLine(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b) {
   if (!info.ok) return;

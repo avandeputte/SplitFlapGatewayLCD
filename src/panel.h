@@ -57,6 +57,11 @@ void panelFillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b);
 // path for frame-shaped draws. 565 is big-endian, as every wire format here is.
 void panelBlitRow888(int x, int y, int n, const uint8_t* rgb);
 void panelBlitRow565(int x, int y, int n, const uint8_t* be565);
+// AA coverage run (v0.2, scalable text): composite one solid colour over n pixels at (x,y)
+// using cov[i] (0..255) as per-pixel alpha -- the primitive the TrueType rasterizer blits
+// glyph coverage through. Honors the clip, any open layer, and the batch blend mode/alpha
+// (mode 0 = over, the common path, is a tight direct composite). cov==0 pixels are skipped.
+void panelBlitCoverRow(int x, int y, int n, const uint8_t* cov, uint8_t r, uint8_t g, uint8_t b);
 void panelLine(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b);   // Bresenham
 void panelCircle(int cx, int cy, int rad, bool fill, uint8_t r, uint8_t g, uint8_t b);  // outline/disc
 void panelTriangle(int x0, int y0, int x1, int y1, int x2, int y2, bool fill, uint8_t r, uint8_t g, uint8_t b);

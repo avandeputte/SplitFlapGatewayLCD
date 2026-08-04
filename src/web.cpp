@@ -2,6 +2,7 @@
 #include "panel.h"   // panelSetColourOrder: a BGR panel is a runtime fact, not a build one
 #include "effects.h"
 #include "canvas.h"
+#include "ttf.h"     // scalable AA TrueType text: the "gtext" op / 0x21 (v0.2)
 #include "sse.h"     // GET /api/events: the live-preview push stream (v3.0)
 #include "web_ui.h"
 #include <mbedtls/base64.h>   // the canvas "image" op decodes a base64 sprite
@@ -773,7 +774,7 @@ static esp_err_t handleApiCapabilities(httpd_req_t* r) {
   // hand out, and answers this URL without these keys. Stated here so the companion lights up
   // canvas/effect controls from capabilities, not from a firmware-version sniff: `canvas` is the
   // framebuffer a client would push frames to, `effects` the on-device animation set.
-  { char cv[1120];   // v3.1: the atlas descriptor + rects flag overflowed 480 and snprintf
+  { char cv[1400];   // v3.1: the atlas descriptor + rects flag overflowed 480 and snprintf
                     // TRUNCATED the JSON -- /api/capabilities went invalid, silently. Sized
                     // with headroom and verified below.
     snprintf(cv, sizeof(cv),
@@ -785,13 +786,17 @@ static esp_err_t handleApiCapabilities(httpd_req_t* r) {
              "\"triangle\",\"roundrect\",\"gradient\",\"polyline\",\"poly\",\"arc\",\"bezier\","
              "\"clip\",\"origin\",\"save\",\"restore\",\"translate\",\"scale\",\"rotate\","
              "\"layer\",\"composite\",\"define\",\"call\","
-             "\"blend\",\"text\",\"textbox\",\"image\",\"sprite\",\"scroll\",\"show\"],"
+             "\"blend\",\"text\",\"gtext\",\"textbox\",\"image\",\"sprite\",\"scroll\",\"show\"],"
              "\"compositing\":{\"alpha\":true,\"blendModes\":[\"over\",\"add\",\"multiply\",\"screen\",\"max\"],\"aa\":true,"
-             "\"transform\":true,\"layers\":true,\"macros\":true}},"
+             "\"transform\":true,\"layers\":true,\"macros\":true},"
+             "\"text2\":{\"scalable\":%s,\"aa\":true,\"maxSize\":%u,\"charset\":\"cp1252\","
+             "\"outline\":true,\"shadow\":true,\"faces\":[\"sans\",\"mono\",\"custom\"],\"customLoaded\":%s}},"
              "\"effects\":%s,",
              (unsigned)gPanel.panelW, (unsigned)gPanel.panelH,
              (unsigned)ATLAS_MAX_SHEETS, (unsigned)ATLAS_TOTAL_BUDGET,
-             (unsigned)ATLAS_MAX_SHEET_BYTES, effectListJson());
+             (unsigned)ATLAS_MAX_SHEET_BYTES,
+             ttfFaceReady(TTF_SANS) ? "true" : "false", (unsigned)TTF_MAX_SIZE,
+             ttfFaceReady(TTF_CUSTOM) ? "true" : "false", effectListJson());
     // A truncated canvas block would be INVALID JSON for every client; make it loud.
     if (strlen(cv) >= sizeof(cv) - 1) printf("[WEB] capabilities canvas block TRUNCATED -- enlarge cv[]\n");
     capPut(cv); }
@@ -2695,6 +2700,10 @@ static int alignIdx(const char* a, const char* mid) {   // "left/top"=0, mid=1, 
                                                   nestable to depth 4, state-scoped)
      0x1F BEZIER    n t flags rgb n*(x y)        (n 3|4; flags bit0 = aa)
      0x20 AALINE    x y x1 y1 rgb                (1 px anti-aliased)
+     0x21 GTEXT     x y size(u16) face flags rgb [outline rgb] [shadow rgb] len bytes
+                    (scalable AA TrueType; face 0 sans/1 mono/2 custom; flags: bits0-1
+                     align 0L/1C/2R, bit2 aa, bit3 has-outline, bit4 has-shadow; text
+                     UTF-8, len u8; (x,y) = top-left of the ascent box)
    Flag bits: CIRCLE flags bit1 = aa outline; POLY flags bit2 = aa outline/polyline. */
 static inline int16_t bops16(const uint8_t* p) { return (int16_t)(((uint16_t)p[0] << 8) | p[1]); }
 
@@ -2941,6 +2950,24 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
       case 0x20: { BOPS_NEED(11); BXY(0);                                            // AALINE
         canvasAALine(x, y, xfX(bops16(p+i+4), bops16(p+i+6)), xfY(bops16(p+i+4), bops16(p+i+6)),
                      p[i+8], p[i+9], p[i+10]); i += 11; break; }
+      case 0x21: { BOPS_NEED(10); BXY(0);                                            // GTEXT (scalable AA)
+        const uint16_t size = (uint16_t)((p[i+4] << 8) | p[i+5]);   // px, widened from the bitmap op's u8
+        const uint8_t  face = p[i+6], fl = p[i+7];
+        const uint8_t  cr = p[i+8], cg = p[i+9], cb = p[i+10];
+        size_t q = i + 11;
+        uint8_t orr = 0, org = 0, orb = 0, shr = 0, shg = 0, shb = 0;
+        if (fl & 0x08) { if (q + 3 > len) { ok = false; break; } orr = p[q]; org = p[q+1]; orb = p[q+2]; q += 3; }
+        if (fl & 0x10) { if (q + 3 > len) { ok = false; break; } shr = p[q]; shg = p[q+1]; shb = p[q+2]; q += 3; }
+        if (q + 1 > len) { ok = false; break; }
+        const uint8_t slen = p[q]; q += 1;
+        if (q + slen > len) { ok = false; break; }
+        char txt[256];
+        const uint8_t keep = slen < sizeof(txt) - 1 ? slen : (uint8_t)(sizeof(txt) - 1);
+        memcpy(txt, p + q, keep); txt[keep] = 0;
+        char enc[256]; utf8ToCp1252(txt, enc, sizeof(enc));
+        ttfDrawText(x, y, size, face, enc, fl & 0x03, cr, cg, cb, (fl & 0x04) != 0, 0,
+                    (fl & 0x08) != 0, orr, org, orb, (fl & 0x10) != 0, shr, shg, shb);
+        i = q + slen; break; }
       default: ok = false; break;
     }
     if (!ok) break;
@@ -3098,6 +3125,21 @@ static int canvasOpsRun(JsonArrayConst ops, bool* shownOut, int depth) {
         }
         canvasText(tx, y, s, r, g, b, f);
       }
+    } else if (!strcmp(k, "gtext")) {
+      // Scalable AA TrueType text (v0.2): {op,x,y,s,size,face,color,align,aa,outline,shadow,tracking}.
+      // "face": "sans"|"mono"|"custom" (default sans). size is px (1..maxSize). (x,y) = top-left.
+      uint8_t r = 255, g = 255, b = 255; canvasColor(op["color"], r, g, b);
+      char enc[256];
+      utf8ToCp1252(op["s"] | "", enc, sizeof(enc));
+      const char* fn = op["face"] | (op["font"] | "sans");
+      uint8_t face = TTF_SANS;
+      if (!strcmp(fn, "mono")) face = TTF_MONO; else if (!strcmp(fn, "custom")) face = TTF_CUSTOM;
+      uint8_t orr, org, orb, shr, shg, shb;
+      const bool hasOut = canvasColorGet(op["outline"], orr, org, orb);
+      const bool hasSh  = canvasColorGet(op["shadow"], shr, shg, shb);
+      ttfDrawText(x, y, op["size"] | 24, face, enc, alignIdx(op["align"] | "left", "center"),
+                  r, g, b, op["aa"] | true, op["tracking"] | 0,
+                  hasOut, orr, org, orb, hasSh, shr, shg, shb);
     } else if (!strcmp(k, "arc")) {
       // {"op":"arc",x,y,"r":R,"t":T,"start":deg,"end":deg,"fill":bool} -- 0 deg = 12
       // o'clock, clockwise (the gauge convention). fill=true draws the pie slice.
