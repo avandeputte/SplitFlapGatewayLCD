@@ -64,7 +64,17 @@ static esp_lcd_panel_handle_t    gPanel   = nullptr;
 static esp_lcd_panel_io_handle_t gDbiIo   = nullptr;
 static esp_lcd_dsi_bus_handle_t  gDsiBus  = nullptr;
 static esp_ldo_channel_handle_t  gPhyLdo  = nullptr;
-static void*                     gScanout = nullptr;   // DPI frame buffer (esp_lcd owns it)
+// Tear-free present (v0.2): the DPI panel runs num_fbs=2 -- the driver ping-pongs two internal
+// framebuffers and swaps at vsync, so a present can never cross the raster mid-scan (the single-fb
+// path PPA-blitted straight into the live scanout and tore at effect frame rates). We keep TWO
+// compose buffers that PPA rotates into; draw_bitmap DMA2D-copies the current one into the driver's
+// free back fb. Ping-ponging two of them means a compose buffer is never reused while its copy may
+// still be in flight -- so we register NO on_color_trans_done callback. That is the whole fix: the
+// earlier attempt registered ours and stole the driver's own fb-recycle signal, wedging the next
+// draw_bitmap under sustained load (see commit 867262b "Back out the scanout double-buffer").
+static void*                     gCompose[2] = {nullptr, nullptr};
+static uint8_t                   gComposeIdx = 0;
+static void*                     gScanout = nullptr;   // == gCompose[gComposeIdx] for this frame
 static ppa_client_handle_t       gPpa     = nullptr;   // hardware rotate; null = CPU fallback
 // Serialize the whole present. panelShow() is called from taskDisplay (core 1: wall/effects),
 // taskWeb (core 0: canvas stream + ticker) and the httpd worker (core 0: one-shot frames). The
@@ -723,7 +733,14 @@ void panelShow() {
   const size_t liveBytes = ((size_t)W * H * sizeof(px_t) + 127u) & ~((size_t)127u);
   if (gPpa) esp_cache_msync(fb[drawBuf], liveBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
   const uint32_t t1 = micros();
-  rotateToScanout();
+  gScanout = gCompose[gComposeIdx];            // rotate into this frame's compose buffer
+  rotateToScanout();                            // PPA (or CPU fallback) fb[drawBuf] -> gScanout
+  // Present: hand the compose buffer to the DPI driver. With num_fbs=2 + use_dma2d it copies it
+  // into the free back fb and swaps at the next vsync -- tear-free. draw_bitmap blocks until a back
+  // fb is free (the driver's OWN trans-done sync), which serializes the copies; that, plus ping-
+  // ponging two compose buffers, is why reuse is safe with no callback of ours (867262b).
+  esp_lcd_panel_draw_bitmap(gPanel, 0, 0, PANEL_NATIVE_W, PANEL_NATIVE_H, gScanout);
+  gComposeIdx ^= 1;
   const uint32_t t2 = micros();
   tSync += t1 - t0; tBlit += t2 - t1; nShow++;
   if (!tLast) tLast = millis();
@@ -746,6 +763,9 @@ void panelShow() {
 static void panelFreeAll() {
   for (int b = 0; b < 2; b++)
     if (fb[b]) { heap_caps_free(fb[b]); fb[b] = nullptr; }
+  for (int i = 0; i < 2; i++)
+    if (gCompose[i]) { heap_caps_free(gCompose[i]); gCompose[i] = nullptr; }
+  gScanout = nullptr;
   panelLayerDiscard();
 }
 
@@ -832,7 +852,8 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   // IDF 5.5 takes in_color_format (the legacy pixel_format field is a separate,
   // unread member here); and Waveshare's own 5.5 configs do NOT enable use_dma2d.
   dpiCfg.in_color_format = LCD_COLOR_FMT_RGB565;
-  dpiCfg.num_fbs = 1;
+  dpiCfg.num_fbs = 2;                              // double-buffered: swap at vsync, no mid-raster tear
+  dpiCfg.flags.use_dma2d = true;                   // draw_bitmap DMA2D-copies our compose buffer in
   dpiCfg.video_timing.h_size = PANEL_NATIVE_W;
   dpiCfg.video_timing.v_size = PANEL_NATIVE_H;
   dpiCfg.video_timing.hsync_back_porch = 20;
@@ -859,12 +880,18 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   }
   esp_lcd_panel_disp_on_off(gPanel, true);
 
-  // The DPI engine scans its own frame buffer continuously; get its address so the
-  // rotate-blit can target it directly.
-  if (esp_lcd_dpi_panel_get_frame_buffer(gPanel, 1, &gScanout) != ESP_OK || !gScanout) {
-    printf("[PANEL] DPI frame buffer unavailable\n");
-    panelFreeAll(); return false;
+  // Two compose buffers (the driver owns its two internal scanout fbs; these are our PPA rotate
+  // targets that draw_bitmap copies in). 128-aligned PSRAM for the DMA2D read + P4 cache line.
+  // Deliberately NO on_color_trans_done callback: the driver needs that event to recycle its own
+  // fbs, and stealing it deadlocked the next draw_bitmap under load (867262b). Ping-ponging two
+  // compose buffers makes reuse safe without it.
+  const size_t scanBytes = ((size_t)PANEL_NATIVE_W * PANEL_NATIVE_H * sizeof(px_t) + 127u) & ~((size_t)127u);
+  for (int i = 0; i < 2; i++) {
+    gCompose[i] = heap_caps_aligned_alloc(128, scanBytes, MALLOC_CAP_SPIRAM);
+    if (!gCompose[i]) { printf("[PANEL] compose buffer %d alloc failed\n", i); panelFreeAll(); return false; }
+    memset(gCompose[i], 0, scanBytes);
   }
+  gComposeIdx = 0; gScanout = gCompose[0];
 
   // PPA client for the hardware rotate. Optional: on failure the CPU path serves.
   ppa_client_config_t ppaCfg = {};
