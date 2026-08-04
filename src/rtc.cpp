@@ -75,29 +75,30 @@ void rtcRead() {
 bool rtcNTPSync() {
   const char* ntpSrv = cfg.ntpServer[0] ? cfg.ntpServer : DEFAULT_NTP_SERVER;
   DBG("[NTP] syncing (UTC) via %s...\n", ntpSrv);
-  configTime(0, 0, ntpSrv);
+  configTime(0, 0, ntpSrv);          // sets the system clock to UTC -- and clobbers the TZ env
   // Wait for a REAL SNTP completion -- NOT getLocalTime(), which returns true for any
   // plausible-looking clock (a lesson from the Matrix boards, whose RTC chip seeded a
   // plausible-but-wrong clock the old loop accepted instantly).
   unsigned long start = millis();
+  bool ok = true;
   while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED) {
-    if (millis() - start > NTP_TIMEOUT_MS) {
-      DBG("[NTP] timed out\n");
-      return false;
-    }
+    if (millis() - start > NTP_TIMEOUT_MS) { DBG("[NTP] timed out\n"); ok = false; break; }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
-  struct tm info;
-  getLocalTime(&info, 10);           // now guaranteed fresh: format for the log below
-  rtcRead();
-  // configTime(0,0,..) resets the TZ env to UTC to keep the system clock in UTC -- but that also
-  // clobbers the zone we set from cfg.posixTZ at boot, so every NTP sync silently reverted the
-  // whole gateway (command-log timestamps, the clock effect, HA) to UTC. Restore the configured zone
-  // so rtcFormatTime's localtime_r shows LOCAL time (cfgApplyTZ serialises setenv/tzset).
+  // ALWAYS restore the configured zone -- configTime(0,0,..) just reset the TZ env to UTC,
+  // and leaving it there makes every localtime_r (the clock effect, the status time, the
+  // command log) show UTC. This MUST run on the timeout path too: the bug was that a
+  // FAILED re-sync returned here without restoring TZ, so one timed-out sync silently
+  // flipped a correctly-zoned clock to UTC and it stayed there. (cfgApplyTZ serialises
+  // setenv/tzset under timeMutex.)
   cfgApplyTZ();
+  if (!ok) return false;
+  struct tm info;
+  getLocalTime(&info, 10);           // TZ is restored above, so this is LOCAL time now
+  rtcRead();
   char tbuf[32];
   strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &info);
-  printf("[NTP] clock set: %s UTC\n", tbuf);
+  printf("[NTP] clock set: %s (local)\n", tbuf);
   return rtcNow.valid;
 }
 
