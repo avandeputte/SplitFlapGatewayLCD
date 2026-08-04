@@ -116,9 +116,9 @@ void vmInit(int count) {
   if (count > VM_MAX_MODULES) count = VM_MAX_MODULES;
   // INTERNAL RAM, deliberately -- not gwPsramAlloc like the large buffers.
   // taskDisplay walks this array a hundred times a second (vmTick). The
-  // Waveshare board's octal PSRAM is far faster than the MatrixPortal's quad
+  // This board's octal PSRAM @200MHz is fast, but this array is walked ~100x/s
   // part that set this rule, but the array is tiny (~16 B/module) and hot, so
-  // there is nothing to win by moving it. The command log and the MQTT queue
+  // and there is nothing to win by moving it. The command log and the large
   // stay in PSRAM -- nothing on the display path touches them.
   size_t vmBytes = sizeof(VModule) * (size_t)count;
   vmods = (VModule*) heap_caps_malloc(vmBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);

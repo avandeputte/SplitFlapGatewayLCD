@@ -1,31 +1,23 @@
-// display.h -- the HUB75 panel: geometry, the flap renderer, and the reel task.
+// display.h -- the flap wall: geometry, the flap renderer, and the reel task.
 //
-// Output goes through panel.h. Nothing in this file knows a pixel format, a bitplane
-// or a brightness value -- see panel.h for why that seam is where it is.
+// Output goes through panel.h. Nothing in this file knows a pixel format or a
+// brightness value -- see panel.h for why that seam is where it is.
 //
-// Geometry falls out of the panel size and the module grid:
-//
-//     cellW = panelW / gridCols        cellH = panelH / gridRows
-//
-// and the renderer then asks font1252Best() for the roomiest CP1252 face that
-// fits with a one-pixel gutter. A 15x3 wall on a 128x32 chain gives 8x10 cells and
-// the 6x9 face; the same wall on a 128x64 gives 8x21 cells and the 6x13 face.
-// Any leftover pixels become an even margin, so the wall is centred. The gutter
-// keeps neighbouring glyphs from touching; nothing is drawn in it.
+// Geometry falls out of the fixed panel size (1280x800) and the module grid:
+// a flap card keeps a 1:FLAP_ASPECT proportion, whichever axis constrains sets the
+// card size, and the wall is centred on both axes (short walls letterbox/pillarbox).
+// The renderer then picks the largest Helvetica flap face that fits the cell
+// (fontflap.h), falling back to the small CP1252 bitmap faces for tiny cells.
 //
 // Each cell draws one flap face. A flap is either a glyph or, at reel indices
-// [colourBase, colourBase+colourCount), a solid colour swatch. A settled flap is
-// just its face -- no seam, no bezel. Mid-flip the cell shows the top half of the *incoming* flap above
-// the bottom half of the outgoing one, split by a bright fold -- which is exactly
-// what a split-flap does, and why the reel animation reads correctly even in an
-// 8x10 cell.
+// [colourBase, colourBase+colourCount), a solid colour swatch. On the LCD a cell is
+// big enough to draw the flap CARD -- a dark card face with a permanent split seam;
+// mid-flip the incoming flap's top half sits above the outgoing flap's bottom half,
+// split by a fold, exactly as a real split-flap module reads.
 //
-// PSRAM is not an option for the framebuffer, even the Waveshare board's fast
-// octal part: the LCD_CAM GDMA chain streams from internal SRAM, and putting a
-// continuous 5 MHz pixel read on the PSRAM/cache bus WiFi also uses is the
-// contention this driver exists to avoid. That bounds bitDepth and panel size
-// together. panel.cpp allocates with MALLOC_CAP_DMA, which is internal by
-// definition, so this is no longer something a careless malloc() can get wrong.
+// The framebuffer lives in PSRAM (panel.cpp allocates MALLOC_CAP_SPIRAM): the DSI
+// scanout is fed by the DPI engine, not a CPU/GDMA stream out of internal SRAM, so
+// the S3's internal-only constraint does not apply on the P4.
 
 #ifndef MPGW_DISPLAY_H
 #define MPGW_DISPLAY_H

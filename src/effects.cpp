@@ -55,7 +55,7 @@ static int      fxCap = 0;
 
 // Row-blit scratch (v3.10): the full-screen effects (plasma, fire) touch every pixel every
 // frame. Assembling one RGB888 row and handing it to panelBlitRow888 -- the fill/blit fast
-// path, one quantise + one word-loop per bitplane -- replaces W*H branchy panelPixel calls
+// path, one quantise + one packed-word write per pixel -- replaces W*H branchy panelPixel calls
 // (~4-6x faster per the panel driver notes), which buys headroom for the audio effects.
 static uint8_t fxRow[PANEL_MAX_W * 3];
 
@@ -307,7 +307,7 @@ static const AAGlyph* aaFind(const AAFont* f, char c) {
 static int aaAdvance(const AAFont* f, char c) { const AAGlyph* g = aaFind(f, c); return g ? g->adv : 0; }
 static int aaTextW(const AAFont* f, const char* s) { int w = 0; for (; *s; s++) w += aaAdvance(f, *s); return w; }
 // One glyph, pen baseline at (px,by), from its 1-bit packed mask (row padded to whole bytes, MSB
-// = leftmost). A pixel is either lit or off -- grayscale AA reads as muddy on the few bitplanes.
+// = leftmost). A pixel is either lit or off -- the 1-bit masks are drawn hard, no AA.
 static void aaGlyph(int px, int by, const AAFont* f, char c, uint8_t r, uint8_t g, uint8_t b) {
   const AAGlyph* gl = aaFind(f, c);
   if (!gl || !gl->w) return;

@@ -37,8 +37,8 @@ static char     sfBootNote[128];              // boot line, written to the SD lo
 //     because a cell too small to hold a glyph is not a module.
 //   * sfFsInit() must precede vmInit(), which restores /vmods.dat.
 //   * vmInit() must precede dispInit(), which reads vmCount.
-//   * dispInit() runs before WiFi so the panel driver gets first claim on the
-//     internal SRAM its default framebuffer needs (fbPsram moves it to PSRAM, v3.11).
+//   * dispInit() runs before WiFi mostly for a lit panel early in boot; the DSI
+//     framebuffer is in PSRAM, so it does not compete with WiFi for internal SRAM.
 
 void setup() {
   // 1. Mutexes first -- must exist before any task touches shared data

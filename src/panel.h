@@ -1,12 +1,13 @@
-// panel.h -- the HUB75 output layer.
+// panel.h -- the LCD output layer.
 //
-// One implementation: panel.cpp, a direct ESP32-S3 LCD_CAM + GDMA driver. All thirteen
-// HUB75 signals live in the 16-bit data word and GDMA walks a circular descriptor chain,
-// so nothing in the refresh path runs on the CPU -- no ISR for WiFi or a flash write to
-// delay -- the usual cause of HUB75 shimmer.
+// One implementation: panel.cpp, an ESP32-P4 MIPI-DSI driver. It keeps a linear
+// RGB565 framebuffer in PSRAM; the JD9365 controller and the P4's DPI engine own the
+// refresh, and panelShow() rotates the logical landscape frame into the native
+// portrait scanout via the PPA (hardware) each present. (This file's API is the same
+// one the Matrix boards' HUB75 driver implemented -- the whole point of the seam.)
 //
 // The API takes 8-bit RGB and hides everything else. In particular the CALLER never
-// applies brightness: panelSetBrightness() is the OE duty cycle inside the driver, so
+// applies brightness: panelSetBrightness() drives the panel's real backlight, so
 // dimming the wall costs no colour levels.
 
 #ifndef MPGW_PANEL_H

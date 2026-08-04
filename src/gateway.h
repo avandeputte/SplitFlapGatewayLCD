@@ -12,8 +12,8 @@
 //   font1252.*  GENERATED bitmap glyphs for the 216 printable CP1252 flaps
 //   frames.*    frame sanitization, TX choke point, command log
 //   vmodule.*   the virtual split-flap modules: protocol, reel, persistence
-//   display.*   HUB75 panel geometry and the flap renderer
-//   panel.*     the HUB75 driver itself (LCD_CAM + GDMA)
+//   display.*   flap-wall geometry and the flap renderer
+//   panel.*     the panel driver itself (ESP32-P4 MIPI-DSI)
 //   modules.*   high-level protocol send helpers (text/char/home) + FATFS mount
 //   web.*       HTTP server: dashboard page (web_ui.h) + REST API handlers
 //   ota.*       firmware update: raw-body browser/curl upload + mDNS
@@ -22,7 +22,7 @@
 //
 // Note the two "module" layers: modules.* is the gateway side (it builds and
 // sends protocol frames), vmodule.* is what answers them. They talk only through
-// protocol frames -- the same seam the physical gateway has with real modules.
+// protocol frames -- the seam a physical split-flap gateway has with real modules.
 
 #ifndef MPGW_GATEWAY_H
 #define MPGW_GATEWAY_H

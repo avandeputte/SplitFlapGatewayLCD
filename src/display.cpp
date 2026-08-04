@@ -5,9 +5,9 @@
 #include "timer.h"     // full-screen countdown/alarm renderer (v3.14)
 #include "fontflap.h"  // the Helvetica flap face for big LCD cells (LCD Gateway)
 
-// display.cpp -- the HUB75 flap wall: geometry, the flap renderer, and the reel task.
-// All output goes through panel.h; this file never sees a pixel format, a bitplane or a
-// brightness value. panel.cpp is the one driver (LCD_CAM + GDMA).
+// display.cpp -- the flap wall: geometry, the flap renderer, and the reel task.
+// All output goes through panel.h; this file never sees a pixel format or a brightness
+// value. panel.cpp is the one driver (ESP32-P4 MIPI-DSI).
 
 PanelGeometry gPanel = {0};
 

@@ -917,10 +917,9 @@ static esp_err_t handleApiStatus(httpd_req_t* r) {
 // GET /api/config
 static esp_err_t handleApiConfigGet(httpd_req_t* r) {
   JsonDocument doc;
-  // "version" is the GATEWAY API level, not this firmware's version. The
-  // companion parses MAJOR.MINOR out of it and enables its gateway-stored
-  // settings on >= 3.1; this firmware implements that surface exactly, so it
-  // must answer 3.1.0. "product" and "fwVersion" are what tell the two apart.
+  // One honest version: "version" == "fwVersion" == FW_VERSION. The old API-level
+  // masquerade (answering a fixed "3.1.0" so a companion could gate on it) is gone --
+  // clients key on "product" + the capability tokens instead. See common.h.
   doc["version"]   = FW_VERSION;
   doc["product"]   = PRODUCT_NAME;
   doc["fwVersion"] = FW_VERSION;

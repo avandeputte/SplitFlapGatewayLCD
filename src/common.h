@@ -2,16 +2,15 @@
 #define MPGW_COMMON_H
 
 /*
- * Matrix Portal Gateway
- * Firmware for the Waveshare ESP32-S3-RGB-Matrix driver board driving a HUB75
- * RGB LED matrix. (Originally built on the Adafruit MatrixPortal S3; that
- * board's final version, v1.25.0, lives on the `matrixportal` git branch.)
+ * LCD Gateway
+ * Firmware for the Waveshare ESP32-P4-WIFI6-POE-ETH board driving a 10.1"
+ * MIPI-DSI IPS touch panel (JD9365, 1280x800 landscape). A fork of the Matrix
+ * Portal Gateway (ESP32-S3 + HUB75 LED matrix); that lineage traces back through
+ * the Adafruit MatrixPortal S3 to the Split-Flap Gateway.
  *
- * A port of the Split-Flap Gateway (v3.1) that keeps the entire gateway -- web UI,
- * REST API, OTA, command monitor -- and replaces
- * the physical gateway's serial transceiver with an in-process frame link and
- * a panel full of *virtual* split-flap modules. Nothing is wired to a real reel: every module the gateway
- * drives is emulated in firmware and drawn as a flap cell on the LED matrix.
+ * It keeps the entire gateway -- web UI, REST API, OTA, command monitor -- and
+ * drives a panel full of *virtual* split-flap modules. Nothing is wired to a real
+ * reel: every module is emulated in firmware and drawn as a flap card on the LCD.
  *
  * The emulation is at the PROTOCOL level, not the API level. Commands are framed,
  * sanitized and "transmitted" exactly as before; the virtual modules parse those
@@ -45,11 +44,12 @@
  *   is likewise unmodelled. All such frames pass the sanitizer untrimmed and
  *   the virtual modules silently ignore them, like any unknown command.
  *
- * Board: Waveshare ESP32-S3-RGB-Matrix (32MB octal flash @1.8V, 16MB octal
- *        PSRAM, PCF85063 battery RTC, TF slot, QMI8658 IMU, ES8311 audio --
- *        of which this firmware uses the RTC; the rest is future headroom)
- * Libraries: none for the panel -- see panel.cpp, a direct LCD_CAM + GDMA driver.
- *            ArduinoJson.
+ * Board: Waveshare ESP32-P4-WIFI6-POE-ETH (dual RISC-V @400MHz, 32MB flash,
+ *        32MB octal PSRAM @200MHz, WiFi6/BLE via an ESP32-C6 over SDIO, IP101
+ *        Ethernet + PoE, MIPI-DSI, GT911 touch, ES8311 codec + onboard mic, TF
+ *        slot). No RTC chip and no IMU (NTP clock; touch replaces tap gestures).
+ * Libraries: for the panel, the vendored JD9365 esp_lcd driver (see panel.cpp);
+ *            ArduinoJson; AnimatedGIF.
  */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -89,44 +89,22 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
  *  Everything needed to retarget this firmware to a different board, panel, or
  *  default setup lives in this single block.
  *
- *  Default config is for the Waveshare ESP32-S3-RGB-Matrix driver board.
+ *  Default config is for the Waveshare ESP32-P4 + 10.1" DSI panel.
  * ==========================================================================*/
 
-/* ---- HUB75 matrix pins ----
-   Waveshare's own map for this board (shipped in their patched
-   ESP32-HUB75-MatrixPanel-DMA example: esp32s3-default-pins.hpp + the .ino's
-   gpio.e override). The octal PSRAM consumes GPIO 33-37, so nothing here may
-   touch that range -- and none of these collide with the board's I2C (47/48),
-   I2S audio (12/21/38/39/43), SD (1/14/17/44) or BOOT button (0).
-
-   The address list carries all five lines; the panel height decides how many
-   are actually clocked, so a 1/16-scan 32-row panel simply never drives E.
-
-   All 13 signals route through the GPIO matrix into one LCD_CAM data word
-   (panel.cpp), so the map is arbitrary as far as the driver is concerned. */
-// ---- Waveshare ESP32-P4-WIFI6-POE-ETH: the display is MIPI-DSI (2-lane), so there
-// is no parallel pin map -- the DSI PHY has dedicated pins. What the board DOES route:
+// ---- Display: MIPI-DSI (2-lane) on the ESP32-P4 -- no parallel pin map, the DSI PHY
+// has dedicated pins. What the board DOES route on ordinary GPIO:
 #define DSI_RESET_PIN   -1       // panel reset: TODO confirm from the board schematic (-1 = none)
 #define LCD_BL_I2C_ADDR 0x45     // backlight/power controller on the display FPC (regs 0x95/0x96)
 
 
-/* ---- Other Waveshare ESP32-S3-RGB-Matrix hardware ---- */
+/* ---- Other on-board hardware (Waveshare ESP32-P4) ---- */
 #define I2C_SDA_PIN     7        // shared bus: display backlight ctrl (0x45), GT9xx touch,
 #define I2C_SCL_PIN     8        // ES8311 codec control -- Waveshare P4 demo wiring
 
 /* ---- Time ----
-   This board carries a battery-backed PCF85063 RTC (addr 0x51) on the I2C bus.
-   The SYSTEM clock remains the single source of truth downstream -- everything
-   reads it exactly as before -- but the chip now (a) SEEDS the system clock at
-   boot when it holds a plausible time, so the wall clock is valid seconds after
-   power-on with no network, and (b) is written back on every NTP sync. With no
-   backup cell fitted the chip loses time on power-off and boot falls back to
-   the old wait-for-NTP path; rtcEpochNow() returns 0 until then, which every
-   consumer already handles. */
-#define PCF85063_ADDR     0x51
-#define PCF85063_CTRL1    0x00
-#define PCF85063_SEC_REG  0x04
-#define RTC_YEAR_OFFSET   2000   // PCF85063 reg 6 is 0-99 = 2000-2099
+   No RTC chip on this board: the system clock is invalid until the first NTP sync,
+   and rtcEpochNow() returns 0 until then (every consumer handles it). See rtc.cpp. */
 
 /* ---- Firmware identity ---- */
 // ONE honest version: FW_VERSION is reported as "version"/"fwVersion" by GET /api/config
@@ -159,15 +137,11 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 #define NTP_TIMEOUT_MS       8000UL
 
 /* ---- Panel defaults ----
-   Runtime-configurable (Settings -> Panel; applied on reboot, since the driver
-   takes its geometry at construction). The grid is the emulated wall: one virtual
-   split-flap module per cell, IDs assigned row-major from 0.
-
-   The default is a 15 x 3 wall on a 128x32 chain, which lands on an 8x10 pixel
-   cell -- the smallest that still fits a fully-accented CP1252 glyph (6x9 plus a
-   one-pixel gutter). 15 columns need 120 px, so a 64-wide panel cannot host this
-   wall; chain two 64x32 panels (or use a native 128x32). For a roomy version,
-   chain two 64x64 panels: an 8x21 cell picks up the 6x13 face. */
+   The panel geometry is fixed (the 800x1280 DSI panel mounted landscape, 1280x800).
+   The grid is the emulated wall -- one virtual split-flap module per cell, IDs
+   row-major from 0 -- and is runtime-configurable (Settings -> Module Wall, applied
+   on reboot). The default 15x5 gives 80x160 px flap cards; anything from 10x1 to
+   32x10 works, cards always 1:FLAP_ASPECT, wall centred (see dispPlan in display.cpp). */
 #define DEFAULT_PANEL_W      1280   // landscape: the 800x1280 portrait panel mounted wide
 #define DEFAULT_PANEL_H      800
 #define DEFAULT_GRID_COLS    15     // virtual modules across (80x160 px flap cards)
@@ -182,10 +156,9 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 // Draw a geometry test pattern for four seconds at boot, before any flap content. It is
 // on by default: it costs four seconds and it tells you which layer is wrong the moment
 // the wall looks scrambled, without a rebuild.
-//   * border broken, doubled, or only half-height  -> scan / address lines (addrBits)
-//   * diagonal duplicated or stair-stepped         -> row mapping, wrong panel height
-//   * gap or swapped halves at x = panelW/2        -> the chain, not the firmware
-//   * corner colours not R/G/B/W clockwise from TL -> RGB pin order
+//   * corner colours not R/G/B/W clockwise from TL -> RGB order / rotation (panelBGR,
+//     PANEL_ROT_180 in panel.cpp)
+//   * pattern skewed, stretched or offset          -> DSI timing / geometry
 //   * pattern perfect but flaps garbled            -> content, not the panel
 #define PANEL_BOOT_TEST      1
 
@@ -193,12 +166,13 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 // Circuit breaker for the large canvas ops (animation + QOI upload, framebuffer readback). If free
 // internal heap is already below this when one arrives, refuse it with 507 rather than pile its
 // transient (PSRAM alloc + panel takeover, or a ~48 KB response stream) onto a stressed heap and
-// risk loop()'s 20 KB reboot floor. 2x the floor: a genuinely-low signal, not a normal dip. A big
-// panel (256x64) sits near this under companion load; a small one never does.
+// risk loop()'s 20 KB reboot floor. 2x the floor: a genuinely-low signal, not a normal dip.
+// (Conservative on the P4, where the framebuffer is in PSRAM and internal heap stays
+// healthy -- this rarely engages; kept as a floor for the network-buffer transient.)
 #define CANVAS_MIN_UPLOAD_HEAP  (40u * 1024u)
 
 #define PANEL_MAX_W          1280
-#define EFFECT_RENDER_SCALE  5     // effects draw at 1/5 (256x160); the PPA scales up (panel.h)   // panel height is validated by the enumerated 16/32/64 set
+#define EFFECT_RENDER_SCALE  5     // effects draw at 1/5 (256x160); the PPA scales up (panel.h)
 
 /* ---- Flip animation ----
    Changing the displayed flap cascades forward through the reel, which is what

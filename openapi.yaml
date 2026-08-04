@@ -1,16 +1,14 @@
 openapi: 3.1.0
 info:
-  title: Matrix Portal Gateway API
-  version: "3.16"
+  title: LCD Gateway API
+  version: "0.1.0"
   description: |
-    REST API for the **Matrix Portal Gateway** firmware, running on a
-    Waveshare ESP32-S3-RGB-Matrix driver board. It emulates a wall of split-flap modules on a
-    HUB75 LED matrix and speaks the Split-Flap Gateway's API, so existing clients work unchanged.
-
-    **Firmware 2.0 changed the target board, not the API.** Versions up to 1.25.0 ran on the
-    Adafruit MatrixPortal S3 (that final build lives on the `matrixportal` git branch); the port
-    is hardware-only, so every endpoint, schema and behaviour documented here is identical on
-    both boards.
+    REST API for the **LCD Gateway** firmware, running on a Waveshare
+    ESP32-P4-WIFI6-POE-ETH board driving a 10.1" MIPI-DSI touch LCD (1280x800). It emulates a
+    wall of split-flap modules on the LCD and speaks the Split-Flap Gateway's API, so existing
+    clients work unchanged. A fork of the Matrix Portal Gateway (ESP32-S3 + HUB75); the API is
+    the same seam, so most endpoints and schemas carry over -- HUB75-only knobs (bit depth,
+    framebuffer placement) are gone, and this board adds `touch` and Ethernet.
 
     **One honest version since v3.12**: `GET /api/config` reports the firmware's real version
     in both `version` and `fwVersion` (the old fixed `3.1.0` "API level" masquerade is gone).
@@ -511,7 +509,7 @@ paths:
   /api/gestures:
     get:
       tags: [Status]
-      summary: Gesture detection state (v3.15, `claps`/`taps` tokens)
+      summary: Touch state (`touch` token)
       description: |
         Clap (microphone transient) and tap (QMI8658 hardware tap engine) detection.
         Enable via `clapEnabled`/`tapEnabled` in `POST /api/config/settings` (both default
@@ -525,7 +523,7 @@ paths:
         carries tuning telemetry (peak mic RMS + spectral fraction, peak accel deviation
         in milli-g, reset on read) and lifetime event counters.
       responses:
-        "200": { description: "{claps:{available,enabled,total,peakRms,peakBright,peakFloor}, taps:{available,enabled,total,peakMg}}" }
+        "200": { description: "{touch:{available,enabled,total,down,x,y}}" }
   /api/timer:
     get:
       tags: [Status]
@@ -728,7 +726,7 @@ paths:
       tags: [Canvas]
       summary: Raw-canvas state and panel size (v1.13)
       description: |
-        The raw-canvas API is unique to the Matrix gateway: it hands you the HUB75 panel as a
+        The raw-canvas API hands you the panel as a
         plain framebuffer, bypassing the split-flap wall entirely. While a canvas is **active**
         the reel renderer stands down (the same way it does during an OTA) and these endpoints
         own every pixel; releasing it repaints the wall from the modules' current state. Nothing
@@ -2099,14 +2097,14 @@ paths:
       description: |
         One call, made once when a client connects, that answers "what characters can this
         display show?" without the client having to know which gateway it is talking to. The
-        Split-Flap Gateway and the Matrix Portal Gateway answer this URL with the SAME shape.
+        The physical Split-Flap Gateway and the drawn gateways answer this URL with the SAME shape.
 
         `charset.union` is every character SOME module can show ("can this wall show a Z
         anywhere?"). `charset.common` is every character EVERY module can show ("can I lay this
         text across arbitrary cells?"). On a real wall these can differ: if module 1 carries A-Z
         and module 2 carries 0-9, the union is A-Z0-9 and the common set is EMPTY -- the wall
         cannot show "HI42" wherever it likes, and only `common` says so. `uniform` is true when
-        every module carries the same reel, which is always the case on the Matrix Portal (one
+        every module carries the same reel, which is always the case here (one
         drawn reel, rendered per cell).
 
         `sets` reports each DISTINCT reel once, with the ids that carry it ("0-44,50"), rather
@@ -2123,7 +2121,7 @@ paths:
         lists modules too old to report one, whose reel is taken to be the firmware's built-in
         default; `unknown` lists modules whose reel is genuinely not known yet (the background
         fill has not reached them, or they are unreachable) and which are excluded from both
-        character sets. Both are always empty on the Matrix Portal -- its modules are drawn
+        character sets. Both are always empty here -- the modules are drawn
         and share one reel.
       responses:
         "200":
@@ -2133,7 +2131,7 @@ paths:
               schema:
                 type: object
                 properties:
-                  product:  { type: string, example: "Matrix Portal Gateway" }
+                  product:  { type: string, example: "LCD Gateway" }
                   fw:       { type: string, example: "3.3.0" }
                   grid:
                     type: object
@@ -2250,7 +2248,7 @@ paths:
                     example: [plasma, fire, matrix, fliporama, clock, life]
                   features:
                     type: array
-                    description: "Capability tokens a client checks instead of sniffing the firmware version. 'canvas', 'effects' and 'ticker' appear on the Matrix gateway only. 'brightness' (v2.2) says the panel brightness is live-settable via GET/POST /api/display/brightness (also persisted as panelBright in POST /api/config/settings, 1..255, applied on the next frame). 'timer' and 'alarms' (v3.14) advertise the countdown timer and the daily alarm slots. 'claps' (microphones) and 'taps' (IMU) advertise gesture detection (v3.15): enable via clapEnabled/tapEnabled; events arrive on the SSE stream as `clap`/`tap` `{count,seq}`; a DOUBLE gesture dismisses a running timer or ringing alarm on-device. Hardware-conditional tokens appear only when the peripheral is present: 'audio' (mics), 'sound' (speaker), 'environment' (SHTC3), 'sd' (mounted microSD card, v3.10)."
+                    description: "Capability tokens a client checks instead of sniffing the firmware version. 'canvas', 'effects' and 'ticker' appear on the Matrix gateway only. 'brightness' (v2.2) says the panel brightness is live-settable via GET/POST /api/display/brightness (also persisted as panelBright in POST /api/config/settings, 1..255, applied on the next frame). 'timer' and 'alarms' (v3.14) advertise the countdown timer and the daily alarm slots. 'touch' advertises the capacitive touchscreen: taps arrive on the SSE stream as `touch` `{count,seq}`, and a DOUBLE-tap dismisses a running timer or ringing alarm on-device. Hardware-conditional tokens appear only when the peripheral is present: 'audio' (mics), 'sound' (speaker), 'environment' (SHTC3), 'sd' (mounted microSD card, v3.10)."
                     items: { type: string }
                     example: ["cells","colors","index","lowercase","pictographs","quiet","ota","canvas","effects","ticker","brightness","events"]
 
@@ -2935,7 +2933,7 @@ components:
             disp: { type: integer, example: 1800 }
         panel:
           type: object
-          description: "The HUB75 panel and the wall drawn on it"
+          description: "The panel and the wall drawn on it"
           properties:
             ok:    { type: boolean, description: "true when the panel driver is running", example: true }
             w:     { type: integer, description: "Panel width in px", example: 128 }
@@ -2960,7 +2958,7 @@ components:
       properties:
         version:      { type: string,  example: "3.12.0", description: "This firmware's version (same value as fwVersion since v3.12). Key product behaviour on `product` and capability tokens, not version heuristics" }
         resets:       { type: array, description: "v3.13.2 (in /api/status): the last 8 reboots as [cause, minutesAlive] pairs, newest first, surviving warm reboots in RTC memory. Causes: 1 poweron, 3 sw, 4 panic, 5 int-wdt, 6 task-wdt, 7 wdt, 9 brownout, 11 usb", items: { type: array, items: { type: integer } } }
-        product:      { type: string,  example: "Matrix Portal Gateway" }
+        product:      { type: string,  example: "LCD Gateway" }
         fwVersion:    { type: string,  example: "2.1.0", description: "This firmware's own version" }
         wSSID:        { type: string,  example: "MyNetwork" }
         posixTZ:      { type: string,  example: "EST5EDT,M3.2.0,M11.1.0" }

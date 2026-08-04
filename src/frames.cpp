@@ -3,16 +3,16 @@
 
 // frames.cpp -- the protocol frame layer.
 // Owns the single send choke point (frameSend: strips/re-frames every outbound
-// command, enforces Quiet Time, and mirrors the frame to MQTT) and the
-// PSRAM-backed command log.
+// command and enforces Quiet Time) and the PSRAM-backed command log.
 // Frame-classification helpers here are file-private. frameSend is serialized by
 // txMutex across tasks.
 //
-// The wire protocol is unchanged from the physical Split-Flap Gateway -- framing,
-// sanitization, the MQTT mirror are all identical, which is exactly why the
-// companion app cannot tell. The only difference is the last few inches: where
-// the physical gateway wrote bytes to a UART, this hands them to vmDispatch()
-// and the virtual modules parse them.
+// The wire protocol is unchanged from the physical Split-Flap Gateway -- framing
+// and sanitization are identical, which is exactly why the companion app cannot
+// tell. The only difference is the last few inches: where the physical gateway
+// wrote bytes to a UART, this hands them to vmDispatch() and the virtual modules
+// parse them. (There is no MQTT here; the physical gateway mirrored every frame
+// to a broker, this firmware does not.)
 // ---- file-private forward declarations ----
 static bool sfFrameIsDisplayMotion(const uint8_t* data, size_t len);
 static char sfFrameCmd(const uint8_t* data, size_t len, int* outAddr);
@@ -21,11 +21,9 @@ static void sfQuietCapturePending(const uint8_t* data, size_t len);
 
 // Allocate a large buffer in PSRAM (preferred) or internal RAM (fallback),
 // zeroed. Logs where it landed. Returns NULL only if both allocations fail.
-// NOTE: the panel framebuffer must NOT come from here even on this board's fast
-// octal PSRAM -- the LCD_CAM GDMA chain reads internal SRAM, and sharing the
-// PSRAM/cache bus with WiFi under a continuous 5 MHz pixel stream is exactly
-// the contention panel.cpp exists to avoid. The driver allocates DMA-capable
-// internal RAM itself, so this is a note for future callers, not a live hazard.
+// (On the P4 the DSI framebuffer lives in PSRAM too -- fed by the DPI engine,
+// not a CPU/GDMA stream out of internal SRAM -- so the S3's "keep the framebuffer
+// internal" caveat no longer applies. panel.cpp allocates its own buffers.)
 void* gwPsramAlloc(const char* name, size_t bytes) {
   void* p = NULL;
   if (psramFound()) p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
@@ -123,7 +121,7 @@ void logDrainTo(void (*sink)(const char* frag)) {
   int i = logPollCursor;
   while (i != head) {
     const GwLogEntry& e = logRing[i];
-    // Render through the shared helper, exactly as the MQTT mirror does.
+    // Render through the shared helper.
     // The hand-rolled loop this replaces escaped only " and \ -- but a logged frame
     // carries its terminator ("send m00-A\n"), and a RAW NEWLINE inside a JSON string
     // is invalid JSON. The browser's r.json() therefore threw on any poll that caught
@@ -230,7 +228,7 @@ static void sfQuietCapturePending(const uint8_t* data, size_t len) {
 // collapses to "m4v" instead of leaning on the module to ignore the junk. This is
 // grammar ENFORCEMENT, not guessing: each command's payload shape is fixed by the
 // (frozen) protocol. Only the commands this product actually speaks are modelled
-// ('-', '+', 'h' -- what the companion, the web UI and MQTT emit); everything
+// ('-', '+', 'h' -- what the companion and the web UI emit); everything
 // else -- the physical gateway's calibration/dump family, the removed 'v'/'A'
 // queries, by-serial "mX.." frames, any unrecognized command -- returns the full
 // length UNCHANGED and reaches the modules untrimmed, which ignore it. The
@@ -280,9 +278,9 @@ void frameSend(const uint8_t* data, size_t len, bool raw) {
   //      the junk (see sfKnownCommandLen), then
   //   3) re-add exactly one '\n' terminator. (The physical wire's one exception
   //      -- the bare direct version query -- left with the 'v' command in v1.24.)
-  // Raw path (raw==true -- {"raw":true} on the REST/MQTT send): transmit the
+  // Raw path (raw==true -- {"raw":true} on the REST send): transmit the
   // caller's exact bytes verbatim, with no trim and no terminator change -- a
-  // deliberate debugging escape hatch. Quiet Time, tracking, and the MQTT
+  // deliberate debugging escape hatch. Quiet Time and tracking are
   // mirror still apply.
   size_t bare;
   bool   appendNL;
@@ -312,7 +310,7 @@ void frameSend(const uint8_t* data, size_t len, bool raw) {
   // always released. Lock order is txMutex -> vmMutex, never inverted: nothing
   // takes txMutex while holding vmMutex -- which is exactly why no caller may
   // hold vmMutex across frameSend. (v3.0 note: `appendNL` shaped only what the
-  // removed MQTT wire mirror recorded; the flag stays so the sanitizer's
+  // removed MQTT wire mirror once recorded; the flag stays so the sanitizer's
   // callers read unchanged, but nothing consumes it any more.)
   if (txMutex) xSemaphoreTake(txMutex, portMAX_DELAY);
   // Deliver the finished frame to the virtual modules. They strip any trailing

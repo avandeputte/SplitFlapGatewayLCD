@@ -9,7 +9,7 @@ void taskFrames(void* pv);    // drains queued module replies (was: the UART)
 void taskRTC(void* pv);
 void taskWeb(void* pv);
 void taskNetwork(void* pv);
-void taskDisplay(void* pv);   // reel animation + HUB75 repaint (display.cpp)
+void taskDisplay(void* pv);   // reel animation + panel repaint (display.cpp)
 
 // True if the quiet schedule is enabled AND the current user-local time is inside
 // its window. Shared by the schedule tick, the /api/quiet/schedule readout, and

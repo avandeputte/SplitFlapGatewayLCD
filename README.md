@@ -1,4 +1,4 @@
-# Matrix Portal Gateway
+# LCD Gateway
 
 > ### 📖 [SplitFlap Wiki — the comprehensive documentation](https://github.com/avandeputte/SplitFlapGateway/wiki)
 > Quick start · choosing a configuration · provisioning & calibration · the SplitFlap and
@@ -8,32 +8,31 @@
 
 A split-flap display with no split flaps.
 
-This is the [Split-Flap Gateway](../../SplitFlapGateway/3.1) v3.1 firmware, ported to a
-**Waveshare ESP32-S3-RGB-Matrix driver board** driving a HUB75 RGB LED matrix. (Versions
-up to v1.25.0 ran on the Adafruit MatrixPortal S3; that final MatrixPortal build lives on
-the `matrixportal` git branch.) The physical gateway's
-serial transceiver is gone. In its place is a wall of *virtual* split-flap modules, each one
+This is a fork of the [Matrix Portal Gateway](../MatrixPortalGateway/1.0) firmware, ported to a
+**Waveshare ESP32-P4-WIFI6-POE-ETH board** driving a **10.1" MIPI-DSI touch LCD** (JD9365,
+1280×800 landscape). That lineage traces back through the ESP32-S3 + HUB75 Matrix boards to
+the [Split-Flap Gateway](../../SplitFlapGateway/3.1). The physical gateway's serial
+transceiver is gone. In its place is a wall of *virtual* split-flap modules, each one
 receiving the same protocol frames a real module would, acting on the display commands
-(`-`, `+`, `h`), and rendering itself as a flapping character cell on the panel.
+(`-`, `+`, `h`), and rendering itself as a flapping character card on the panel.
 
 Everything above the protocol seam is unchanged: the web UI, the REST API, OTA, the
-command log. (MQTT and Home Assistant support existed through v2.2 and were removed in
-v3.0 — unused here, and every byte of RAM counts on this board.) The
-[companion app](../../SplitFlapGatewayCompanion) drives it without modification and cannot
-tell the difference. (One thing above the seam is *gone* rather than unchanged — the sticky
-module registry, which has no meaning on a wall that exists by construction.)
+command log. The [companion app](../../SplitFlapGatewayCompanion) drives it without
+modification and cannot tell the difference. This board adds a **capacitive touchscreen**
+(double-tap to dismiss timers/alarms) and **Ethernet + PoE**; it has no RTC chip (NTP clock)
+and no IMU (touch replaces tap gestures).
 
 ```
      ┌──────────────────────────────────────────────┐
-     │  web UI · REST API · OTA · command log       │   from Gateway 3.1 (MQTT/HA removed in 3.0)
+     │  web UI · REST API · OTA · command log       │   carried over
      ├──────────────────────────────────────────────┤
      │  frameSend()  framing · sanitization · Quiet  │   unchanged
      ├──────────────────────────────────────────────┤
-     │  vmodule      45 virtual split-flap modules   │   new
+     │  vmodule      virtual split-flap modules      │
      ├──────────────────────────────────────────────┤
-     │  display      HUB75 flap renderer             │   new
+     │  display      flap-card renderer              │
      ├──────────────────────────────────────────────┤
-     │  panel        LCD_CAM + GDMA HUB75 driver     │   new  (no external library)
+     │  panel        ESP32-P4 MIPI-DSI driver + PPA  │   (vendored JD9365 esp_lcd driver)
      └──────────────────────────────────────────────┘
 ```
 
@@ -63,7 +62,7 @@ Per-release history — features, breaking changes, certification results — li
 ## What it does
 
 On boot the firmware creates one virtual split-flap module per cell of the module wall
-(15 × 3 = **45 modules** by default), with IDs `0`…`44` fixed by wall position. There is no
+(15 × 5 = **75 modules** by default), with IDs `0`…`74` fixed by wall position. There is no
 discovery, because there is nothing to discover: every module exists by construction, and the
 array of them *is* the state of the wall. Nobody has to ask, and (since v1.24) nobody *can*
 ask over the protocol — the wall self-describes through `/api/display/state`,
@@ -94,11 +93,12 @@ specified in [openapi.yaml](openapi.yaml) and the
   persisted to flash, blitted by index from draw ops or the stream.
 - **On-device content** — a stored animation library (with GIF import) and boot
   animation, a scrolling ticker (exclusive or overlaid), and effects: plasma, fire,
-  matrix rain, flip-o-rama, a clock, Game of Life.
-- **Audio-reactive visuals** *(v3.4)* — the board's dual microphones (ES7210 ADC)
-  drive a `spectrum` analyzer, a `soundwall` mode where the flap wall itself flips on
-  beats, and an `"audio":true` option that makes fire/matrix/plasma react to the
-  room. Sound is reduced to a handful of numbers on-device; nothing is recorded.
+  matrix rain, flip-o-rama, a clock, Game of Life, an oscilloscope and a spectrogram.
+- **Audio-reactive visuals** — the board's onboard microphone (the ES8311 codec's ADC)
+  drives a `spectrum` analyzer, an oscilloscope and spectrogram, a `soundwall` mode where
+  the flap wall itself flips on beats, and an `"audio":true` option that makes
+  fire/matrix/plasma react to the room. Sound is reduced to a handful of numbers on-device;
+  nothing is recorded.
 - **Self-describing effects** *(v3.4)* — capabilities carry `effectDefs`: every
   effect with exactly the typed, ranged, labelled params it consumes, so clients
   render effect UIs dynamically instead of hard-coding options.
@@ -267,101 +267,38 @@ traffic.
 
 ## The panel
 
-The module grid *is* the wall. Cell size falls out of it:
+The panel is a fixed **1280×800** MIPI-DSI IPS LCD (native 800×1280 portrait, mounted
+landscape). The module grid *is* the wall, and cell size falls out of it — but a flap
+**card keeps a 1:2 proportion** no matter the grid: whichever axis is the constraint sets
+the card size, and a wall that does not fill the panel is centred on both axes (short walls
+letterbox or pillarbox). The default is **15×5** — 75 modules, 80×160 px cards — and any grid
+from **10×1 to 32×10** works.
 
-```
-cellW = panelW / gridCols          cellH = panelH / gridRows
-```
+The renderer picks the largest glyph face that fits the card. There are two families:
 
-and the renderer then picks the roomiest bundled font that fits with a one-pixel seam. **Seven**
-faces are bundled — `10x20`, `9x18`, `8x13`, `6x13`, `6x10`, `6x9` and `5x8` — all carrying the
-full 216-glyph CP1252 set with real diacritics, plus the 14 pictographs. (`5x7` and `4x6` are
-deliberately absent: at those sizes the source face has no room for accents and draws `À`
-identically to `A`, which on this reel is a correctness bug, not an aesthetic one.
-`tools/genfont.py` rejects any face that does this.)
+- **Six Helvetica flap faces** (110×154 down to 32×46 px, generated by `tools/genflapfont.py`
+  from Helvetica Bold — the real split-flap typeface — with the 14 pictographs from Apple
+  Symbols) cover every card width the grid range produces. Each cell draws a proper flap
+  **card**: a dark card face inset in a housing gutter, a permanent split seam, and the
+  mid-flip fold across the middle.
+- **Seven small CP1252 bitmap faces** (`10x20` down to `5x8`, `tools/genfont.py`) serve tiny
+  cells and the effects' fliporama. All carry the full 216-glyph CP1252 set with real
+  diacritics plus the 14 pictographs. (`5x7`/`4x6` are absent: at those sizes the source face
+  draws `À` identically to `A`, a correctness bug the generator rejects.)
 
-The three big faces exist because a **256px-wide chain makes big cells possible**: a 15×3 wall
-on 256×64 is **17×21 px per module**, roughly three times the area of the 8×12 cells a 128-wide
-chain gives you — and `6x13` simply floats in that much room.
-
-They were not possible before v1.8, for a reason worth knowing: the glyph rows were packed
-**one byte per row**, which silently capped every face at **8 pixels wide**. That is the whole
-reason nothing bigger than `6x13` had ever been bundled — not a design choice, a packing limit.
-Rows are 16-bit now. (`render()` in `genfont.py` *raised* on a wider glyph rather than dropping
-its right-hand columns, so the limit never shipped as a silent corruption — it just quietly
-stopped anyone from trying.)
-
-Leftover pixels become an even margin, so the wall is centred. A grid whose cells could not
-hold even the 5×8 face is quietly reduced, and the boot log says so.
-
-The default is a **15 × 3 wall on a 128 × 32 chain** — two 64×32 panels in series, or one
-native 128×32. Fifteen columns need 120 px, so this wall does not fit a 64-wide panel.
-
-| Panel | Grid | px per module | Font | Verdict |
-|---|---|---|---|---|
-| 64 × 32 | 15 × 3 | 4 × 10 | — | 15 columns don't fit; auto-reduced to 10 |
-| 64 × 64 | 15 × 3 | 4 × 21 | — | too narrow for 15 columns |
-| **128 × 32** | **15 × 3** | **8 × 10** | **6×9** | the default. Tight, every glyph legible |
-| 128 × 64 | 16 × 3 | 8 × 21 | 6×13 | roomy, with real bezels — but three rows leave the wall looking sparse |
-| **128 × 64** | **15 × 5** | **8 × 12** | **6×10** | **75 modules — fills the panel. The one to pick for a 64-row chain.** |
-| 128 × 64 | 10 × 3 | 12 × 21 | **10×20** | 30 big, detailed flaps |
-| **256 × 64** | **15 × 3** | **17 × 21** | **10×20** | **the biggest, most detailed flaps this firmware can draw.** Depth 3 |
-| 256 × 64 | 32 × 5 | 8 × 12 | 6×10 | 160 modules — a dense wall two panels wide. Depth 3 |
-
-**A 256px chain must run at colour depth 3.** At depth 4 the framebuffer needs 144 KB of
-internal DMA RAM, over the 120 KB budget — and since 1.17.1 `panelBegin()` **clamps the depth
-down** to the deepest that fits (256 × 64 lands on depth 3) rather than refusing and running
-headless; it logs the clamp, and `GET /api/status` reports the depth actually running. Depth 3
-needs 102 KB and refreshes at **~85 Hz**, which is actually *better* than a 128 × 64 wall at
-depth 4 (79 Hz). The geometry presets carry the depth for you, so the clamp never has to fire.
-
-Settings → *Geometry preset* offers each of these; picking one fills the Panel and Module Wall
-cards and saves them. Power-cycle to apply (geometry is read once at boot).
-
-**A 64-row panel halves the refresh rate**, because the same pixel clock now has twice the rows
-to scan: ~157 Hz at 128 × 32 becomes **~78 Hz at 128 × 64**, and the framebuffer grows from 38 KB
-to 77 KB of internal DMA RAM. Both are within budget — `panelBegin()` steps the bit depth down
-until the framebuffer no longer starves WiFi of internal SRAM, refusing outright only if even
-depth 1 will not fit (see [Known limitations](#known-limitations)) — but if you see flicker,
-drop `panelBitDepth` to 3, which buys back refresh at the cost of colour depth.
-
-The ceiling on the emulated wall is **`VM_MAX_MODULES` = 192** (`src/vmodule.h`), so a
-32 × 5 = 160-module wall on a 256px chain still has room to spare. A grid that exceeds the
-ceiling is quietly reduced, and the boot log says so.
+Rendering runs at 60 Hz. The logical landscape frame is a linear RGB565 framebuffer in PSRAM;
+`panelShow()` rotates it 90° into the DSI scanout using the P4's **PPA** (Pixel Processing
+Accelerator) in hardware. Pixel effects render at a reduced 256×160 surface and the PPA
+upscales them; the clock and the wall render native. The layout presets (Settings → *Module
+Wall*) offer common grids; power-cycle to apply (the grid is read once at boot). The ceiling
+on the emulated wall is **`VM_MAX_MODULES` = 320** (`src/vmodule.h`) — exactly a 32×10 wall.
 
 ### If every colour is wrong
 
-Some HUB75 panels are wired **BGR**, not RGB. That is the panel's own hardware colour order,
-and nothing in the firmware can detect it. On a BGR panel every colour comes out wrong in a
-very specific pattern:
-
-| you ask for | a BGR panel draws |
-|---|---|
-| red | **blue** |
-| blue | **orange** |
-| yellow | **cyan** |
-| purple | **pink** |
-| **green** | green — correct |
-| **white** | white — correct |
-
-Green and white look perfectly normal, because green is its own channel and white is all
-three. That is exactly why this hides for so long: **text is white**, so nothing looks wrong
-until the first time you draw a colour.
-
-Tick **Settings → LED Panel → "Panel is wired BGR"**. It takes effect on the next frame — no
-reboot — so you can tick it and see the answer immediately. It is stored per board, because
-the next panel may well be RGB.
-
-The swap happens in `panelPixel()`, the single choke point every pixel passes through
-(`panelHLine`, `panelVLine` and `panelFillRect` all funnel into it), rather than by
-re-mapping the pins: the pin map is correct and matches Waveshare's own reference map for
-this board.
-
-A 64-row panel needs the E address line, which is GPIO 9 on this board — wired directly on the
-HUB75 header, no jumper to set. All five address lines are always mapped; the panel height
-decides how many are actually clocked, so a 1/16-scan 32-row panel simply never drives E.
-
----
+If red and blue are swapped, the panel is wired **BGR** rather than RGB. Tick **Settings →
+LCD Panel → "Panel is wired BGR"** — it takes effect on the next frame, no reboot. The swap
+happens in `panelPixel()`, the one choke point every pixel passes through. (Rotation is the
+other first-look check: if the image is upside-down, flip `PANEL_ROT_180` in `panel.cpp`.)
 
 ## The flip
 
@@ -385,17 +322,15 @@ Everything is on the Settings page and in `POST /api/config/settings`.
 
 | Setting | Default | Applies |
 |---|---|---|
-| `gridRows` × `gridCols` | 3 × 15 | **on reboot** — this creates and destroys modules (up to `VM_MAX_MODULES` = 192) |
-| `panelW` × `panelH` | 128 × 32 | **on reboot** — the panel driver takes geometry at init |
+| `gridRows` × `gridCols` | 5 × 15 | **on reboot** — this creates and destroys modules (up to `VM_MAX_MODULES` = 320) |
 | `panelBitDepth` | 4 | **on reboot** — 1…6 RAM and EMI scale with it |
 | `panelBGR` | false | next frame — see [If every colour is wrong](#if-every-colour-is-wrong) |
 | `panelBright` | 160 | next frame |
 | `flapMs` | 60 | next flap |
 | `flapMax` | 64 | next change |
 
-`GET /api/config` also reports `product`, `fwVersion` and `maxFlaps`. Its `version` field is the
-**gateway API level** (`3.1.0`), not this firmware's version — see
-[Compatibility](#compatibility).
+`GET /api/config` also reports `product`, `fwVersion` and `maxFlaps`. Its `version` field is
+the firmware version (same as `fwVersion`); clients key on `product` and the capability tokens.
 
 > ### Test WiFi credentials are compiled in
 > `DEFAULT_WIFI_SSID` / `DEFAULT_WIFI_PASS` in `src/common.h` seed the config on a board whose
@@ -501,8 +436,8 @@ src/common.h        board config, panel defaults, buffer sizes, shared types
 src/gateway.h       umbrella header: common.h plus every subsystem's public API
 src/globals.cpp     single definition site for every shared global
 src/config.*        runtime configuration (GwConfig) persisted in NVS
-src/rtc.*           wall-clock time: the system clock, seeded by the PCF85063 battery
-                    RTC at boot and disciplined by NTP (which writes the chip back)
+src/rtc.*           wall-clock time: the system clock, set by NTP (no RTC chip)
+src/touch.*         GT911 capacitive touch: taps + double-tap dismiss
 src/charset.*       UTF-8 <-> Windows-1252 flap-byte transcoding
 src/reel.h          the 237-flap reel and its two resolvers — Arduino-free, so
                     tools/reel_test.cpp compiles the same code
@@ -514,10 +449,10 @@ src/vmodule.*       the virtual split-flap modules: protocol dispatch and the sh
 src/display.*       flap-wall geometry and the flap renderer (calls panel.*)
 src/canvas.*        raw canvas: frames, rects, QOI decode, draw ops, on-device animation + ticker,
                     the animation/font libraries, transitions, sprite atlas, GIF import
-src/audio.*         microphone frontend: ES7210 bring-up, I2S capture, FFT/beat features
+src/audio.*         microphone frontend: ES8311 ADC capture, I2S, FFT/beat features
 src/effects.*       on-device effects: plasma, fire, matrix, flip-o-rama, clock, Life,
                     spectrum + soundwall (audio-reactive, v3.4)
-src/panel.*         the low-level HUB75 driver: ESP32-S3 LCD_CAM + GDMA, no library
+src/panel.*         the low-level panel driver: ESP32-P4 MIPI-DSI + PPA rotate
 src/modules.*       high-level protocol send helpers (text/char/home) + FATFS mount
 src/httpx.*         the native esp_http_server layer: route table, dispatch hook (CORS,
                     watchdog stamps), JSON/chunk/query/body helpers, heap-graded recv pacing
@@ -612,31 +547,20 @@ c++ -std=c++17 -Isrc tools/reel_test.cpp src/charset.cpp src/font1252.cpp \
 
 ## Known limitations
 
-- **The pixel clock stays at 5 MHz — but for a different reason than before.** On the
-  MatrixPortal, 10 MHz starved the WiFi MAC of internal-SRAM bandwidth and broke association
-  outright. On this board a 10 MHz A/B (2026-07-18) showed the **radio survives** — instant
-  association, 0% ping loss, normal HTTP latency — but the thing 10 MHz would buy, depth 4 on a
-  256×64 chain at ~80 Hz, is blocked by RAM instead: that geometry's 144.6 KB double-buffered
-  internal framebuffer left 26 KB of free heap and a 1.7 KB minimum, which is unshippable. So
-  `LCD_CLK_HZ` (`src/panel.cpp`) stays 5 MHz, where refresh is ample and the radio has margin.
-  Future direction: if the driver ever grows single-buffering or PSRAM bounce buffers, 10 MHz +
-  depth 4 is on the table on this board. WiFi modem sleep remains disabled (`src/main.cpp`).
-- **The framebuffer does not go in PSRAM — even 16 MB of octal PSRAM.** The panel's GDMA stream
-  and WiFi share the PSRAM/cache bus, and bounce-buffering frames through internal RAM would put
-  the CPU back into the refresh loop the DMA design exists to keep it out of. So `panel.cpp`
-  allocates the double-buffered framebuffer and the DMA descriptor chain from internal
-  DMA-capable RAM (`MALLOC_CAP_DMA`), which bounds panel size and colour depth together
-  (`PANEL_RAM_BUDGET` stays 120 KB), and `panelBegin()` clamps the bit depth down until the
-  framebuffer stops starving WiFi of that pool — refusing only a geometry that will not fit even
-  at depth 1. The virtual-module array is pinned to internal RAM too — `taskDisplay` walks it
-  100×/s on the core the refresh runs on, and a PSRAM cache miss there causes a shimmer. (The
-  command log, the scheduled-TX ring, the animation store and the atlas library *are* in
-  PSRAM — and since v3.3.0 the WiFi/lwIP buffers are too; nothing in the refresh path
-  touches any of them.)
-- **Wall-clock time needs a backup cell or a network.** The PCF85063 seeds the system clock at
-  boot only when it holds a plausible time; with no cell fitted (or a rejected/implausible
-  reading), time is invalid from power-on until the first NTP sync. Every caller already
-  handles that state; frame timestamps show `HH:MM:SS` uptime until then.
+- **A full 1280×800 frame is ~2 MB, and rotating it into the scanout costs ~12 ms.** That is
+  the inherent floor for driving a panel this size with a mandatory 90° rotate, so shared
+  throughput tops out around 60–80 fps. Effects sidestep it by rendering at a 256×160 surface
+  the PPA upscales; full-frame companion pushes and canvas transitions pay it directly. Prefer
+  QOI or the `rects` partial-update channel over raw full frames, and use Ethernet for
+  canvas-heavy work — the C6 WiFi link is the throughput bottleneck, not the panel.
+- **WiFi is remoted through the ESP32-C6 over SDIO** (esp_hosted). Bulk inbound data (a canvas
+  flood) queues in the C6's SDIO RX pool, which is internal/DMA RAM; `custom_sdkconfig` in
+  `platformio.ini` keeps lwIP/pbuf allocations in PSRAM and bounds the TCP window so that pool
+  never starves (it did, once, and the driver asserts rather than drops — the companion-crash
+  fix). WiFi modem sleep stays disabled (`src/main.cpp`).
+- **Wall-clock time needs a network.** This board has no RTC chip, so time is invalid from
+  power-on until the first NTP sync. Every caller already handles that state; frame timestamps
+  show `HH:MM:SS` uptime until then.
 
 ---
 
