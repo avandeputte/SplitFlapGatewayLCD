@@ -2110,7 +2110,11 @@ static esp_err_t handleApiCanvas(httpd_req_t* r) {
 // "none", return to the wall. Supersedes raw-canvas mode -- the display task, not HTTP, owns the
 // panel -- so it clears gCanvasMode too.
 static esp_err_t handleApiCanvasEffect(httpd_req_t* r) {
-  if (csBusy(r)) return ESP_OK;
+  // NO csBusy gate here (unlike the draw endpoints): an effect SUPERSEDES a raw-canvas
+  // stream rather than being refused by it. A client that took the panel over via a draw
+  // stream and then starts an effect used to get a 409 and see nothing happen ("parks and
+  // never un-parks"). The start below evicts the stream (gCanvasStreamKill / dispReturnToWall)
+  // and hands the panel to taskDisplay, which renders the effect.
   if (!gPanel.ready) { httpxErr(r, 503, "Panel not running"); return ESP_OK; }
   JsonDocument doc;
   if (!httpxReadJson(r, doc)) return ESP_OK;
@@ -2135,6 +2139,11 @@ static esp_err_t handleApiCanvasEffect(httpd_req_t* r) {
     dispReturnToWall();             // stop -> reel wall
   } else {
     gCanvasMode = false;            // an effect owns the panel via taskDisplay, which runs
+    gCanvasStreamKill = true;       // evict any canvas stream the client left open: otherwise its
+                                    // next record calls canvasEnter->canvasStandDown, which re-raises
+                                    // gCanvasMode AND clears gEffect/gEffectReq -- so the effect is
+                                    // cancelled and taskDisplay re-parks, "renders but never shows".
+                                    // (dispReturnToWall does the same eviction for the wall path.)
     gEffectReq  = e;                // effectReset() + starts it -- no effect state touched off-core
   }
   char buf[128];
