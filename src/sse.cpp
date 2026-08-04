@@ -133,7 +133,7 @@ void sseBroadcastStatus() {
   xSemaphoreGive(sseMutex);
 }
 
-// Gesture events (v3.15): claps (mic) and taps (IMU), same shape for the companion.
+// Gesture events: touch taps, delivered to the companion over SSE.
 void sseBroadcastGesture(const char* kind, uint8_t count, uint32_t seq) {
   if (!sseMutex || !sseBuf || xSemaphoreTake(sseMutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
   if (sseClientCount()) {

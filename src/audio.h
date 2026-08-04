@@ -9,7 +9,7 @@
 //
 // Split lifecycle, deliberately:
 //   * audioInit() -- called ONCE from setup(), BEFORE tasks exist: confirms the ES8311
-//     answers (sound.cpp writes its registers, ADC included). rtc.cpp's PCF85063 uses raw Wire
+//     answers (sound.cpp writes its registers, ADC included). rtcHwInit brings up Wire
 //     with no bus lock, so all of audio's I2C happens while the system is still
 //     single-threaded; after boot this module never touches I2C again.
 //   * capture starts on demand (an audio effect starting) and self-stops a few

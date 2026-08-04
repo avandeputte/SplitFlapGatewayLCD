@@ -4,7 +4,6 @@
 #include "panel.h"    // panelSetBrightness: the brightness schedule (v3.13)
 #include "timer.h"    // alarmTick: daily alarms fire from taskRTC (v3.14)
 #include "audio.h"    // audio capture for the reactive effects
-#include "imu.h"
 #include "touch.h"    // GT911 touchscreen taps (LCD Gateway); I2C stays on taskRTC
 #include "sdcard.h"   // sdLog: gesture-dismissal audit trail (v3.15)
 
@@ -138,18 +137,16 @@ static void quietScheduleTick() {
 }
 
 void taskRTC(void* pv) {
-  // 100 ms base tick (was 1 s, v3.15): the IMU tap poll wants sub-second latency, and
-  // this task is where ALL runtime I2C must live (the bus has no lock). Everything
-  // else keeps its old cadence via the ms-timers below.
+  // 100 ms base tick: the touch poll wants sub-second latency, and this task is where
+  // ALL runtime I2C must live (the bus has no lock). Everything else keeps its slower
+  // cadence via the ms-timers below.
   uint32_t lastSched = 0, lastEnv = 0, lastSec = 0;
   while (true) {
-    if (cfg.tapEnabled) imuTapTick();
     if (cfg.touchEnabled) touchTick();   // GT911 poll (taskRTC: the I2C rule)
     panelBacklightService();   // pending backlight writes land here (the I2C rule)
     if (lastSec == 0 || millis() - lastSec >= 1000UL) {
       lastSec = millis();
       rtcRead();
-      rtcChipService();        // queued RTC-chip writeback + verify (I2C on THIS task, v3.15)
       alarmTick();             // daily alarms, ~1/s (v3.14; overrides quiet by design)
     }
     if (lastSched == 0 || millis() - lastSched > 5000UL) {
@@ -187,26 +184,20 @@ void taskWeb(void* pv) {
     const unsigned long busy = httpxBusySince();
     if (!busy || now - busy < 110000UL) wdgWebMs = now;
 
-    // Gesture events (v3.15): the detectors publish, this pump delivers. A live
-    // timer/alarm CONSUMES the gesture as its stop/dismiss (double-tap the screen, or
-    // tap the board on IMU boards); only otherwise does it reach the companion over SSE.
+    // Gesture events: the touch detector publishes, this pump delivers. A live
+    // timer/alarm CONSUMES a gesture as its stop/dismiss (double-tap the screen);
+    // only otherwise does it reach the companion over SSE.
     { uint8_t gc; uint32_t gs;
       // Dismissal requires a DOUBLE gesture: one stray touch must never kill a timer.
       // Singles still reach the companion, which sets its own bar. Two single events
       // within the pair window also count as a double (human rhythm, not the sensor's).
-      static unsigned long lastTapEvMs = 0, lastTouchEvMs = 0;
+      static unsigned long lastTouchEvMs = 0;
       // Pair window 1.0 s (was 1.5): deliberate doubles land ~0.3-0.6 s apart, but desk
       // activity (typing bursts) could pair two accidental singles inside 1.5 s -- the
       // 2026-08-01 false dismissal. Every dismissal is SD-logged with its channel so a
       // surprise dismissal is diagnosable from the log, not from guesswork.
-      if (imuTapPoll(&gc, &gs)) {
-        const bool dbl = (gc >= 2) || (millis() - lastTapEvMs < 1000);
-        lastTapEvMs = millis();
-        if (dbl && timerAlarmGestureDismiss()) sdLog("gesture dismiss: tap x%u", (unsigned)(gc >= 2 ? gc : 2));
-        else { sseBroadcastGesture("tap", gc, gs); panelGestureBlip(255, 140, 0); }    // amber = tap
-      }
-      // Touchscreen tap: same contract -- a DOUBLE-tap dismisses a timer/alarm, a
-      // single reaches the companion as a "touch" event with {count,seq}.
+      // Touchscreen tap: a DOUBLE-tap dismisses a timer/alarm, a single reaches the
+      // companion as a "touch" event with {count,seq}.
       if (touchPoll(&gc, &gs)) {
         const bool dbl = (gc >= 2) || (millis() - lastTouchEvMs < 1000);
         lastTouchEvMs = millis();

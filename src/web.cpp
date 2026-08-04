@@ -13,7 +13,6 @@
 #include "touch.h"            // GT911 touchscreen (LCD Gateway)
 #include "esp32-hal-hosted.h"   // C6 co-processor slave OTA (LCD Gateway)          // microSD info + the sd token (v3.10)
 #include "timer.h"           // kitchen timer + alarms (v3.14)
-#include "imu.h"             // tap detection state + the taps token (v3.15)
 #include "SD_MMC.h"          // /api/sd/* file operations
 #include <fcntl.h>            // non-blocking mode for the canvas stream socket (v3.2)
 #include <lwip/sockets.h>    // setsockopt on the stream socket at close (v3.3)
@@ -808,12 +807,11 @@ static esp_err_t handleApiCapabilities(httpd_req_t* r) {
     snprintf(ft, sizeof(ft),
              "\"features\":[\"cells\",\"colors\",\"index\",\"lowercase\",\"pictographs\","
              "\"quiet\",\"ota\",\"canvas\",\"effects\",\"ticker\",\"brightness\",\"events\","
-             "\"effectDefs\",\"timer\",\"alarms\"%s%s%s%s%s%s]}",
+             "\"effectDefs\",\"timer\",\"alarms\"%s%s%s%s%s]}",
              audioAvailable() ? ",\"audio\"" : "",
              soundAvailable() ? ",\"sound\"" : "",
              sensorAvailable() ? ",\"environment\"" : "",
              sdReady() ? ",\"sd\"" : "",
-             imuAvailable() ? ",\"taps\"" : "",
              touchAvailable() ? ",\"touch\"" : "");
     capPut(ft); }
   capFlush();
@@ -944,7 +942,6 @@ static esp_err_t handleApiConfigGet(httpd_req_t* r) {
   doc["dimStart"]      = cfg.dimStart;
   doc["dimEnd"]        = cfg.dimEnd;
   doc["dimLevel"]      = cfg.dimLevel;
-  doc["tapEnabled"]    = cfg.tapEnabled;
   doc["backupEnabled"] = cfg.backupEnabled;
   doc["flapMs"]        = cfg.flapMs;
   doc["flapMax"]       = cfg.flapMax;
@@ -1036,7 +1033,6 @@ static esp_err_t handleApiConfigSettings(httpd_req_t* r) {
   if (doc["dimLevel"].is<int>()) { int v = doc["dimLevel"];
     if (v >= 1 && v <= 255) cfg.dimLevel = (uint8_t)v; }
   if (doc["dimTzOffsetMin"].is<int>()) cfg.quietTzOffsetMin = (int16_t)doc["dimTzOffsetMin"].as<int>();
-  if (doc["tapEnabled"].is<bool>())  cfg.tapEnabled  = doc["tapEnabled"].as<bool>();
   if (doc["touchEnabled"].is<bool>()) cfg.touchEnabled = doc["touchEnabled"].as<bool>();
   if (doc["backupEnabled"].is<bool>()) cfg.backupEnabled = doc["backupEnabled"].as<bool>();
   if (doc["panelBright"].is<int>())   { int v = doc["panelBright"];
@@ -1659,17 +1655,14 @@ static esp_err_t handleApiEnvironment(httpd_req_t* r) {
   return httpxSend(r, 200, "application/json", buf);
 }
 
-/* ---- gestures: touch (+ IMU tap on boards that carry one) -------------------------- */
-// GET /api/gestures -- hardware presence + enables. Events ride SSE ("touch"/"tap"
+/* ---- gestures: the touchscreen ---------------------------------------------------- */
+// GET /api/gestures -- touch presence + enable + live point. Taps ride SSE ("touch"
 // {count,seq}); this is the discovery/diagnostic view.
 static esp_err_t handleApiGestures(httpd_req_t* r) {
-  char buf[256];
+  char buf[192];
   uint16_t tx = 0, ty = 0; const bool tdown = touchPoint(&tx, &ty);
   snprintf(buf, sizeof(buf),
-           "{\"taps\":{\"available\":%s,\"enabled\":%s,\"total\":%lu,\"peakMg\":%ld},"
-           "\"touch\":{\"available\":%s,\"enabled\":%s,\"total\":%lu,\"down\":%s,\"x\":%u,\"y\":%u}}",
-           imuAvailable() ? "true" : "false",  cfg.tapEnabled ? "true" : "false",
-           (unsigned long)imuTapTotal(), (long)imuAccelPeakMg(),
+           "{\"touch\":{\"available\":%s,\"enabled\":%s,\"total\":%lu,\"down\":%s,\"x\":%u,\"y\":%u}}",
            touchAvailable() ? "true" : "false", cfg.touchEnabled ? "true" : "false",
            (unsigned long)touchTotal(), tdown ? "true" : "false", (unsigned)tx, (unsigned)ty);
   return httpxSend(r, 200, "application/json", buf);

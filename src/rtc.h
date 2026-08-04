@@ -1,10 +1,8 @@
-// rtc.h -- wall-clock time: the ESP32's internal RTC + NTP.
+// rtc.h -- wall-clock time: the ESP32-P4's system clock + NTP.
 //
-// The API is unchanged from the physical Split-Flap Gateway. The Waveshare
-// board carries the same battery-backed PCF85063: it seeds the system clock at
-// boot (valid time seconds after power-on, no network needed) and is written
-// back on every NTP sync. With no backup cell the old behaviour returns --
-// time is invalid until the first sync, which every caller already handles.
+// This board has no battery-backed RTC chip, so the clock is invalid until the
+// first NTP sync -- every caller already handles rtcNow.valid == false and
+// rtcEpochNow() == 0. Local time comes from the configured POSIX TZ at format time.
 
 #ifndef MPGW_RTC_H
 #define MPGW_RTC_H
@@ -25,9 +23,6 @@ extern char gPosixTZ[64];
 void rtcHwInit();
 void rtcRead();
 bool rtcNTPSync();
-void rtcRequestChipWriteback();   // queue a chip write (any task)
-void rtcChipService();            // perform queued write + verify + rate check (taskRTC only)
-bool rtcChipLogTake(char* out, size_t cap);   // drain the service's log line (loop() flushes to SD)
 void rtcFormatTime(char* out, size_t outLen);
 unsigned long rtcEpochNow();
 bool rtcLocalNow(struct tm* out);   // broken-down local time; false if clock unset or TZ lock busy

@@ -4,7 +4,6 @@
 #include "sensor.h"
 #include "sdcard.h"
 #include "backup.h"
-#include "imu.h"
 #include "touch.h"
 #include "canvas.h"   // canvasAnimLoadPlay: the boot animation
 #include <ETH.h>      // LCD Gateway: IP101 PHY behind the PoE jack
@@ -134,7 +133,6 @@ void setup() {
   audioInit();
   soundInit();   // ES8311 speaker DAC -- same single-threaded I2C window
   sensorInit();  // SHTC3 temp/humidity -- same single-threaded I2C window
-  imuInit();     // QMI8658 tap engine -- same single-threaded I2C window (v3.15)
   touchInit();   // GT911 capacitive touch -- same single-threaded I2C window (LCD)
 
   // 4. Plan the panel geometry. The DSI panel is a fixed size; the module grid is
@@ -244,7 +242,6 @@ void loop() {
   sfResetUpMin[0] = (uint32_t)((millis() - sfBootMs) / 60000UL);
   // RTC chip-service diagnostics (v3.15): the service runs on stack-lean taskRTC, so
   // it mails its log lines here -- this task has the stack for FatFs.
-  { char rl[96]; if (rtcChipLogTake(rl, sizeof(rl))) sdLog("%s", rl); }
   // FATFS->SD backup (v3.16): manual trigger, nightly pass, first-run pass. Runs
   // here because this task has FatFs stack headroom and no latency budget.
   backupTick();

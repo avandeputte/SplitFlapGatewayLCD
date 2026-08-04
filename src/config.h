@@ -56,7 +56,6 @@ struct GwConfig {
   char          almTime[4][6];
   uint8_t       almDays[4];    // day bitmask, bit0=Sun .. bit6=Sat
   bool          almEnabled[4];
-  bool          tapEnabled;    // IMU tap detection (v3.15): QMI8658 tap engine; SSE "tap" events
   bool          touchEnabled;  // GT911 touchscreen taps (LCD Gateway): SSE "touch" events; default on
   bool          backupEnabled; // v3.16: nightly FATFS->SD mirror at 03:30 local (backup.h)
 };
