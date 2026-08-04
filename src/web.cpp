@@ -2704,6 +2704,37 @@ static const uint8_t* gBinMacroPtr[8] = {};
 static uint16_t       gBinMacroLen[8] = {};
 static uint8_t        gBinAlpha       = 255;    // batch alpha (0x15); scoped across CALL
 
+// Cooperative yield for the ops runners (resilience). The canvas ops render on the HTTP
+// server task (one-shot PUTs) and on taskWeb (the stream pump), both on core 0; the ESP
+// task watchdog watches idle-core-0 with a 5 s timeout. A large batch, a single expensive
+// op, OR a flood of small records drained in one pump tick can render for seconds at this
+// resolution and, without yielding, starve idle-core-0 -- the whole board then reboots
+// (reset cause TASK_WDT), and until it does taskWeb/SSE/other HTTP requests are frozen. A
+// companion app must never be able to do that. So after every ~40 ms of continuous
+// rendering, sleep one tick: idle runs, the watchdog is satisfied, and the board stays
+// responsive no matter what is pushed.
+//
+// The clock is FILE-STATIC and is NEVER reset per batch: the stream pump dispatches many
+// records back-to-back in one tick (up to a 64 KB budget), calling a runner once per
+// record, and the runners recurse for macros. A shared, persistent clock makes the 40 ms
+// bound hold across ALL of that -- a burst of individually cheap records (each < 40 ms, so
+// each on its own would never trip a per-batch timer) cannot accumulate past 40 ms without
+// yielding. (An earlier version re-seeded the clock at each batch entry; that reset it
+// every record and let a record flood peg the CPU for > 5 s between yields -- the aquarium
+// TASK_WDT.) Ops rendering is serialised (the stream owns the canvas XOR one-shot draws,
+// via the 409 guard), so the single clock has no cross-task race that matters. Light work
+// (< 40 ms since the last yield) never yields, so the common path pays nothing; after an
+// idle gap the first op yields once (a harmless 1 ms).
+static uint32_t gOpsLastYield = 0;
+static inline void opsYieldMaybe() {
+  const uint32_t now = millis();
+  if ((int32_t)(now - gOpsLastYield) >= 40) {
+    wdgWebMs = now;          // also refresh the 120 s web-stall cover
+    vTaskDelay(1);           // 1 tick (1 ms @ 1 kHz): hands idle-core-0 a slot
+    gOpsLastYield = millis();
+  }
+}
+
 static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* okOut, int depth) {
   int applied = 0; bool shown = false, ok = true;
   if (depth == 0) {                              // top-level batch: reset all batch-scoped state
@@ -2718,6 +2749,7 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
   #define BXY(o)  const int x = xfX(bops16(p+i+(o)), bops16(p+i+(o)+2)), \
                             y = xfY(bops16(p+i+(o)), bops16(p+i+(o)+2))
   while (i < len) {
+    opsYieldMaybe();                              // resilience: cap CPU hog per batch
     panelSetBlend((uint8_t)gOpsBlend, gBinAlpha); // per op: batch mode + batch alpha
     const uint8_t opb = p[i++];
     switch (opb) {
@@ -2933,6 +2965,7 @@ static int canvasOpsRun(JsonArrayConst ops, bool* shownOut, int depth) {
     panelClearClip(); panelClearBlend(); panelLayerDiscard();
   }
   for (JsonVariantConst op : ops) {
+    opsYieldMaybe();                          // resilience: cap CPU hog per batch (see opsYieldMaybe)
     panelSetBlend((uint8_t)gOpsBlend, 255);   // per op: batch mode, opaque unless a colour sets alpha
     const char* k = op["op"] | "";
     const int lx = op["x"] | 0, ly = op["y"] | 0;
@@ -3429,7 +3462,7 @@ static bool canvasRectsApply(const uint8_t* body, size_t len, int* outDone) {
     }
     off += px;
     done++;
-    if ((i & 15) == 0) wdgWebMs = millis();
+    opsYieldMaybe();                      // resilience: bound CPU across many rects/records (also feeds wdgWebMs)
   }
   if (outDone) *outDone = done;
   return done == count;
