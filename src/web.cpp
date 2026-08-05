@@ -1447,7 +1447,8 @@ static void canvasEnter(bool clear) {
   if (!gCanvasMode) canvasStandDown();
   if (clear && gPanel.ready) { panelClear(); panelShow(); }
 }
-static void canvasLeave() { dispReturnToWall(); }              // hand the panel back (no-op if idle)
+static void canvasPrefixReset();               // release replay storage (defined with its state)
+static void canvasLeave() { canvasPrefixReset(); dispReturnToWall(); }   // hand the panel back
 
 /* ---- PUT /api/canvas/stream: persistent TLV draw channel (v3.2) --------------------
    One long-lived PUT carrying draw records back-to-back, executed as they arrive. No
@@ -1650,14 +1651,33 @@ void canvasStreamPump() {
       // is already waiting in the socket, drop this ops batch instead of executing it --
       // the newer one supersedes it. Only small 0x03/0x06 records (whole-frame batches);
       // frames/rects/atlas/show pass through untouched.
-      if ((cs.type == 0x03 || cs.type == 0x06) && cs.need <= 4096) {
-        int avail = 0; { uint8_t peek;
-          avail = recv(httpd_req_to_sockfd(cs.req), (char*)&peek, 1, MSG_PEEK | MSG_DONTWAIT); }
-        if (avail > 0) {                          // more data queued: this batch is stale
-          cs.records++; csSkipped++;
-          if (gSerialDebug && (csSkipped & 15) == 1)
-            printf("[CS] coalesce: %lu stale ops batches dropped\n", (unsigned long)csSkipped);
-          continue;
+      // Drop only when PROVABLY superseded (review fix): (a) this batch is a self-contained
+      // full-cover frame (first draw is a clear or full-panel raw gradient -- incremental
+      // batches like ticker scrolls are never dropped), and (b) the NEXT queued record is
+      // another complete 0x06 batch, header+payload fully buffered. A peeked 0x05 show /
+      // 0x04 bind / partial record never triggers a drop -- those belong to THIS frame.
+      if (cs.type == 0x06 && cs.need <= 4096 && cs.need >= 16) {
+        const uint8_t f0 = cs.buf[0];
+        bool fullCover = (f0 == 0x01);
+        if (!fullCover && f0 == 0x0B && cs.need >= 15) {
+          const int gx = (int16_t)((cs.buf[1]<<8)|cs.buf[2]), gy = (int16_t)((cs.buf[3]<<8)|cs.buf[4]);
+          const int gw = (int16_t)((cs.buf[5]<<8)|cs.buf[6]), gh = (int16_t)((cs.buf[7]<<8)|cs.buf[8]);
+          fullCover = (gx == 0 && gy == 0 && gw >= gPanel.panelW && gh >= gPanel.panelH);
+        }
+        if (fullCover) {
+          uint8_t nh[4];
+          const int pk = recv(httpd_req_to_sockfd(cs.req), (char*)nh, 4, MSG_PEEK | MSG_DONTWAIT);
+          if (pk == 4 && nh[0] == 0x06) {
+            const size_t nNeed = ((size_t)nh[1] << 16) | ((size_t)nh[2] << 8) | nh[3];
+            int queued = 0;
+            if (nNeed <= 4096 && ioctl(httpd_req_to_sockfd(cs.req), FIONREAD, &queued) == 0
+                && (size_t)queued >= 4 + nNeed) {   // the superseding batch is fully here
+              cs.records++; csSkipped++;
+              if (gSerialDebug && (csSkipped & 15) == 1)
+                printf("[CS] coalesce: %lu stale ops batches dropped\n", (unsigned long)csSkipped);
+              continue;
+            }
+          }
         }
       }
       // Perf telemetry (serialDebug only): per-second record mix -- the one fact that
@@ -3011,6 +3031,7 @@ static inline void opsYieldMaybe() {
 #define PFX_MAX_OPS 192
 static uint8_t* gPfxBatch = nullptr; static size_t gPfxBatchLen = 0, gPfxBatchCap = 0;
 static uint16_t gPfxOff[PFX_MAX_OPS]; static uint8_t gPfxOpb[PFX_MAX_OPS]; static int gPfxOps = 0;
+static bool     gPfxTrunc = false;               // batch had >PFX_MAX_OPS ops: last op's extent unknown
 static size_t   gPfxEnd = 0;                     // byte end of the validated static prefix
 static uint8_t  gPfxPhase = 0;                   // 0 candidate-pending, 1 snapshot-this-run, 2 replay
 static uint16_t* gPfxSnap = nullptr; static size_t gPfxSnapCap = 0;
@@ -3020,6 +3041,11 @@ static inline bool pfxDrawGeom(uint8_t o) {      // deterministic pure-geometry 
 }
 static inline bool pfxStateOp(uint8_t o) {       // executed during replay (cheap, order-preserving)
   return o == 0x0E || o == 0x0F || (o >= 0x14 && o <= 0x1A);
+}
+static void canvasPrefixReset() {                // release replay storage (review fix: ~2 MB PSRAM)
+  free(gPfxSnap); gPfxSnap = nullptr; gPfxSnapCap = 0;
+  free(gPfxBatch); gPfxBatch = nullptr; gPfxBatchLen = 0; gPfxBatchCap = 0;
+  gPfxOps = 0; gPfxEnd = 0; gPfxPhase = 0; gPfxTrunc = false;
 }
 static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* okOut, int depth) {
   int applied = 0; bool shown = false, ok = true;
@@ -3032,18 +3058,21 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
   bool pfxReplay = false, pfxSnapNow = false; int pfxRec = -1; int pfxK = 0;
   if (depth == 0 && len >= 32 && len <= 2048) {
     if (gPfxBatch && gPfxEnd >= 64 && gPfxPhase >= 1
-        && gPfxW == gPanel.panelW && gPfxH == gPanel.panelH
+        && gPfxW == panelInfo().width && gPfxH == panelInfo().height
         && len >= gPfxEnd && memcmp(p, gPfxBatch, gPfxEnd) == 0) {
-      if (gPfxPhase == 2 && gPfxSnap) {          // REPLAY: restore the composed static scene
-        panelRestoreFull(gPfxSnap);
+      if (gPfxPhase == 2 && gPfxSnap
+          && (size_t)panelInfo().width * panelInfo().height * 2 <= gPfxSnapCap
+          && panelInfo().width == gPfxW && panelInfo().height == gPfxH) {
+        panelRestoreFull(gPfxSnap);              // REPLAY: restore the composed static scene
         pfxReplay = true;
       } else gPfxPhase = 2;                      // snapshot happened last run; replay from now on
-    } else if (gPfxBatch && gPfxBatchLen && gPfxW == gPanel.panelW && gPfxH == gPanel.panelH) {
+    } else if (gPfxBatch && gPfxBatchLen && gPfxW == panelInfo().width && gPfxH == panelInfo().height) {
       // CANDIDATE from last run: diff, find the largest op-aligned identical prefix
       size_t d = 0; const size_t lim = len < gPfxBatchLen ? len : gPfxBatchLen;
       while (d < lim && p[d] == gPfxBatch[d]) d++;
       size_t end = 0; bool geomOk = true, coverOk = false; int m = 0;
-      for (; m < gPfxOps; m++) {
+      const int mLim = gPfxTrunc ? gPfxOps - 1 : gPfxOps;   // truncated: last op's end unknown
+      for (; m < mLim; m++) {
         const size_t oEnd = (m + 1 < gPfxOps) ? gPfxOff[m + 1] : gPfxBatchLen;
         if (oEnd > d) break;
         const uint8_t o = gPfxOpb[m];
@@ -3098,7 +3127,8 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
         applied++; continue;
       }
     }
-    if (pfxRec >= 0 && pfxRec < PFX_MAX_OPS) { gPfxOff[pfxRec] = (uint16_t)i; gPfxOpb[pfxRec] = p[i]; pfxRec++; }
+    if (pfxRec >= 0) { if (pfxRec < PFX_MAX_OPS) { gPfxOff[pfxRec] = (uint16_t)i; gPfxOpb[pfxRec] = p[i]; pfxRec++; }
+                       else gPfxTrunc = true; }
     opsYieldMaybe();                              // resilience: cap CPU hog per batch
     panelSetBlend((uint8_t)gOpsBlend, gBinAlpha); // per op: batch mode + batch alpha
     const uint8_t opb = p[i++];
@@ -3341,8 +3371,9 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
     if (gPfxBatchCap < len) { free(gPfxBatch);
       gPfxBatch = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
       gPfxBatchCap = gPfxBatch ? len : 0; }
-    if (gPfxBatch) { memcpy(gPfxBatch, p, len); gPfxBatchLen = len; gPfxOps = pfxRec;
-      gPfxW = gPanel.panelW; gPfxH = gPanel.panelH;
+    if (gPfxBatch) { gPfxTrunc = (pfxRec >= PFX_MAX_OPS);
+      memcpy(gPfxBatch, p, len); gPfxBatchLen = len; gPfxOps = pfxRec;
+      gPfxW = panelInfo().width; gPfxH = panelInfo().height;
       if (gPfxPhase == 0) gPfxPhase = 0;          // stays candidate until a match validates it
     } else { gPfxBatchLen = 0; gPfxOps = 0; gPfxPhase = 0; }
   } else if (depth == 0 && !ok) { gPfxPhase = 0; gPfxEnd = 0; gPfxBatchLen = 0; }
