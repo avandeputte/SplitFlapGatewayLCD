@@ -737,6 +737,32 @@ int canvasAtlasSave(const char* name) {
   char tmp[64], path[64];
   snprintf(tmp, sizeof(tmp), "/atlas/%s.tmp", name);
   atlasPath(name, path, sizeof(path));
+  // Skip-if-identical (v0.3.1): a FATFS WRITE stalls the L2 cache per erase and glitches
+  // the DPI scan-out (the app-switch flash), but flash READS are harmless. Companions
+  // re-persist their sprite sheets on every app start; when the persisted file already
+  // matches the resident sheet byte-for-byte, answer success without touching flash --
+  // the glitch then happens only the first time a sheet is genuinely new or changed.
+  {
+    const AtlasSheet& a = atlasTab[i];
+    File rf = FFat.open(path, "r");
+    if (rf && (size_t)rf.size() == 12 + a.bytes) {
+      uint8_t want[12] = { 'M','P','T','A', 1, a.fmt,
+                           (uint8_t)(a.tileW >> 8), (uint8_t)a.tileW,
+                           (uint8_t)(a.tileH >> 8), (uint8_t)a.tileH,
+                           (uint8_t)(a.tiles >> 8), (uint8_t)a.tiles };
+      uint8_t got[12];
+      bool same = rf.read(got, 12) == 12 && memcmp(got, want, 12) == 0;
+      static uint8_t cmpBuf[8192];                 // httpd worker only -- no concurrent saves
+      for (size_t off = 0; same && off < a.bytes; ) {
+        size_t c = (a.bytes - off < sizeof(cmpBuf)) ? (a.bytes - off) : sizeof(cmpBuf);
+        if (rf.read(cmpBuf, c) != (int)c || memcmp(cmpBuf, a.buf + off, c) != 0) same = false;
+        off += c;
+        wdgWebMs = millis();
+      }
+      rf.close();
+      if (same) { atlasTab[i].persisted = true; return 0; }   // already on disk, byte-for-byte
+    } else if (rf) rf.close();
+  }
   File f = FFat.open(tmp, "w");
   if (!f) return 507;
   const AtlasSheet& a = atlasTab[i];

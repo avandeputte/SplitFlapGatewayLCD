@@ -1287,38 +1287,103 @@ static esp_err_t handleApiCompanion(httpd_req_t* r) {
    buffering. (The WebServer era needed this split across two callbacks with static
    state; native esp_http_server lets it read as what it is.)
 ---------------------------------------------------------- */
+// Deferred store (v0.3.1): a settings PUT no longer touches flash inline. Any FATFS
+// write stalls the L2 cache during erase, which starves the DPI scan-out and glitches
+// the panel -- and the companion saves settings ~1 s after EVERY app switch, which was
+// the "flash after each app change". The blob now lands in a PSRAM pending buffer and
+// is flushed by taskWeb once saves go quiet (10 s) or at a 60 s bound, coalescing a
+// burst of switches into one glitch at a calm moment instead of one per switch.
+// A reboot inside the window loses at most that pending save; the companion re-syncs.
+static SemaphoreHandle_t gSetMutex   = nullptr;    // guards the pending-blob fields below
+static uint8_t*          gSetPend    = nullptr;    // PSRAM; null = nothing pending
+static size_t            gSetPendLen = 0;
+static uint32_t          gSetFirstMs = 0, gSetLastMs = 0;
+static inline void setLock()   { if (!gSetMutex) gSetMutex = xSemaphoreCreateMutex(); xSemaphoreTake(gSetMutex, portMAX_DELAY); }
+static inline void setUnlock() { xSemaphoreGive(gSetMutex); }
+
 // PUT /api/companion/settings
 static esp_err_t handleApiCompanionSettingsPut(httpd_req_t* r) {
   const size_t len = r->content_len;
-  // Decide before opening anything, so a bad request never touches flash.
+  // Decide before allocating anything; !sfFsReady still refuses (it could never persist).
   if (!sfFsReady)                { return httpxErr(r, 503, "No filesystem"); }
   if (len == 0)                  { return httpxErr(r, 400, "Empty or truncated body"); }
   if (len > COMPANION_MAX_BYTES) { return httpxErr(r, 413, "Settings blob too large"); }
-  FFat.remove(COMPANION_TMP);                                 // clear a stale temp file
-  File f = FFat.open(COMPANION_TMP, "w");
-  if (!f) { return httpxErr(r, 507, "Write failed"); }
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+  if (!buf) buf = (uint8_t*)malloc(len);
+  if (!buf) { return httpxErr(r, 507, "Write failed"); }
 
   size_t recvd = 0;
   while (recvd < len) {
-    int n = httpxRecv(r, (char*)httpxBuf, min(len - recvd, (size_t)sizeof(httpxBuf)));
-    // A truncated body (fewer bytes than promised) must not overwrite good settings.
-    if (n <= 0) { f.close(); FFat.remove(COMPANION_TMP); return httpxErr(r, 400, "Empty or truncated body"); }
-    if (f.write(httpxBuf, (size_t)n) != (size_t)n) { f.close(); FFat.remove(COMPANION_TMP); return httpxErr(r, 507, "Write failed"); }
+    int n = httpxRecv(r, (char*)buf + recvd, len - recvd);
+    // A truncated body (fewer bytes than promised) must not replace good settings.
+    if (n <= 0) { free(buf); return httpxErr(r, 400, "Empty or truncated body"); }
     recvd += (size_t)n;
   }
-  f.close();
-  // Publish atomically: the old blob survives intact until the rename lands.
-  FFat.remove(COMPANION_FILE);
-  if (!FFat.rename(COMPANION_TMP, COMPANION_FILE)) { return httpxErr(r, 507, "Write failed"); }
-  DBG("[CFG] Companion settings stored (%u bytes)\n", (unsigned)recvd);
+  setLock();
+  if (gSetPend) free(gSetPend);                    // newer save supersedes an unflushed one
+  else gSetFirstMs = millis();                     // first pending save starts the 60 s bound
+  gSetPend = buf; gSetPendLen = recvd; gSetLastMs = millis();
+  setUnlock();
+  DBG("[CFG] Companion settings pending (%u bytes, deferred flush)\n", (unsigned)recvd);
   char out[64];
   snprintf(out, sizeof(out), "{\"ok\":true,\"bytes\":%u}", (unsigned)recvd);
   return httpxSend(r, 200, "application/json", out);
 }
 
-// GET /api/companion/settings -- hand the stored blob back byte-for-byte
+// taskWeb tick: flush the pending blob to FATFS once saves go quiet. The glitch this
+// write causes (see the deferred-store note above) then lands ONCE, after the switching
+// burst, instead of on every app change. Skipped during OTA (flash is busy).
+void companionSettingsFlushMaybe() {
+  if (!gSetPend || gOtaInProgress || !sfFsReady) return;
+  const uint32_t now = millis();
+  if (now - gSetLastMs < 10000UL && now - gSetFirstMs < 60000UL) return;
+  setLock();
+  uint8_t* buf = gSetPend; size_t len = gSetPendLen;
+  gSetPend = nullptr; gSetPendLen = 0;             // detach: a new PUT can pend while we write
+  setUnlock();
+  if (!buf) return;
+  FFat.remove(COMPANION_TMP);
+  File f = FFat.open(COMPANION_TMP, "w");
+  bool ok = false;
+  if (f) {
+    ok = (f.write(buf, len) == len);
+    f.close();
+    if (ok) {                                      // publish atomically, as the inline path did
+      FFat.remove(COMPANION_FILE);
+      ok = FFat.rename(COMPANION_TMP, COMPANION_FILE);
+    } else FFat.remove(COMPANION_TMP);
+  }
+  printf("[CFG] Companion settings flushed (%u bytes) %s\n", (unsigned)len, ok ? "ok" : "-- WRITE FAILED");
+  free(buf);
+  wdgWebMs = millis();
+}
+
+// GET /api/companion/settings -- hand the stored blob back byte-for-byte.
+// A pending (not-yet-flushed) blob is the NEWEST truth and is served first --
+// read-your-writes across the deferred flush window.
 static esp_err_t handleApiCompanionSettingsGet(httpd_req_t* r) {
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  if (gSetPend) {
+    setLock();
+    uint8_t* copy = nullptr; size_t len = gSetPendLen;
+    if (gSetPend && len) {
+      copy = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+      if (!copy) copy = (uint8_t*)malloc(len);
+      if (copy) memcpy(copy, gSetPend, len);
+    }
+    setUnlock();
+    if (copy) {
+      httpd_resp_set_type(r, "application/gzip");  // same content-type contract as the file path
+      size_t off = 0;
+      while (off < len) {
+        const size_t n = len - off > 512 ? 512 : len - off;
+        httpxChunk(r, (const char*)copy + off, n);
+        off += n; wdgWebMs = millis();
+      }
+      free(copy);
+      return httpxChunkEnd(r);
+    }
+  }
   if (!sfFsReady || !FFat.exists(COMPANION_FILE)) { httpxErr(r, 404, "No settings stored"); return ESP_OK; }
   File f = FFat.open(COMPANION_FILE, "r");
   if (!f) { httpxErr(r, 404, "No settings stored"); return ESP_OK; }
@@ -2083,10 +2148,15 @@ static void pxDecode(const uint8_t* c, uint8_t bpp, uint8_t& r, uint8_t& g, uint
 // GET  /api/canvas -> {active,width,height,formats}   POST {"active":bool} take over / release.
 static esp_err_t handleApiCanvas(httpd_req_t* r) {
   if (r->method == HTTP_POST) {
-    if (csBusy(r)) return ESP_OK;
+    // NO csBusy gate (v0.3.1, same rationale as the effect endpoint): this is the mode
+    // switch itself. {"active":false} is how an app is STOPPED -- 409ing it while the
+    // app's own stream was open made a streaming app unstoppable ("aquarium keeps
+    // coming back"). canvasLeave -> dispReturnToWall evicts the stream; an explicit
+    // {"active":true} takeover likewise supersedes a left-open stream.
     JsonDocument doc;
     if (!httpxReadJson(r, doc)) return ESP_OK;
-    if (doc["active"] | false) canvasEnter(true); else canvasLeave();
+    if (doc["active"] | false) { gCanvasStreamKill = true; canvasEnter(true); }
+    else canvasLeave();
     char buf[48];
     snprintf(buf, sizeof(buf), "{\"ok\":true,\"active\":%s}", gCanvasMode ? "true" : "false");
     return httpxSend(r, 200, "application/json", buf);

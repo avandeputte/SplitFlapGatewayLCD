@@ -21,5 +21,9 @@ size_t statusJson(char* out, size_t cap);
 // every tick; while a stream is open it tightens its loop for drain throughput.
 void canvasStreamPump();
 bool canvasStreamActive();
+// Deferred companion-settings flush (v0.3.1): taskWeb calls this every tick; it writes the
+// pending PSRAM blob to FATFS once saves go quiet (10 s) or at a 60 s bound, keeping the
+// flash write -- and the DPI scan-out glitch it causes -- off the app-switch hot path.
+void companionSettingsFlushMaybe();
 
 #endif // SFGW_WEB_H

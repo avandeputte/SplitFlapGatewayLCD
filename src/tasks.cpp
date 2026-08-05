@@ -216,6 +216,10 @@ void taskWeb(void* pv) {
     // Canvas stream channel (v3.2): drain and execute whatever records have arrived.
     canvasStreamPump();
 
+    // Deferred companion-settings flush (v0.3.1): write the pending blob to FATFS only
+    // once saves go quiet, so the flash write's scan-out glitch stays off app switches.
+    companionSettingsFlushMaybe();
+
     // SSE live preview: when the wall changes, push the display state to every open
     // /api/events stream -- at most ~7 events/s so a flip cascade streams as motion
     // without flooding the sockets. The hash reads the reels under vmMutex; a miss
