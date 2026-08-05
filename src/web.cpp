@@ -1575,7 +1575,17 @@ static bool csExec() {
       char name[40];
       const size_t n = min((size_t)cs.need, sizeof(name) - 1);
       memcpy(name, cs.buf, n); name[n] = 0;
-      canvasAtlasBind(name);
+      // A bind miss FAILS the stream (v0.3.1) instead of the ops path's silent no-op. In a
+      // stream every subsequent sprite would silently drop -- after a reboot cleared the
+      // resident store, the aquarium ran "fine" with invisible fish and the companion never
+      // learned its sheet was gone. A loud close ("atlas missing") hits the client's normal
+      // reconnect/re-provision path. (One-shot JSON batches keep the silent-skip: a missing
+      // optional sheet there shouldn't kill a mixed batch.)
+      if (canvasAtlasBind(name) < 0) {
+        printf("[CANVAS] stream: bind of unknown atlas '%s' -- closing stream\n", name);
+        csClose(false, "atlas missing");
+        return false;
+      }
       return true;
     }
     case 0x05: canvasEnter(false); panelShow(); return true;
