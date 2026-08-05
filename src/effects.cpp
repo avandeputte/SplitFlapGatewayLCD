@@ -820,30 +820,74 @@ static AqBub   aqBub[AQ_MAX_BUB];
 static AqPlant aqPlant[AQ_MAX_PLNT]; static int aqPlantN = 0;
 static uint16_t* aqBg = nullptr; static size_t aqBgCap = 0;
 static bool aqBgValid = false; static int aqBgHue = -1; static uint16_t aqBgW = 0, aqBgH = 0;
+// Dirty-rect restore (v0.4.1): instead of restoring the whole 2 MB background every frame
+// (whose DMA+PPA+scan concurrency starved the DPI into white flicker), track the rects the
+// dynamic entities covered LAST frame and restore only those strips (~0.3-0.5 MB). Less
+// PSRAM traffic, faster frames.
+struct AqRect { int16_t x, y, w, h; };
+#define AQ_MAX_RECT (AQ_MAX_FISH + AQ_MAX_PLNT + AQ_MAX_BUB + 2)
+// TWO lists, indexed by frame parity: the framebuffer double-buffers (panelShow swaps),
+// so the rects to erase are the ones drawn into THIS buffer two frames ago.
+static AqRect aqDirty[2][AQ_MAX_RECT]; static int aqDirtyN[2] = {0, 0};
+static int  aqParity = 0;
+static bool aqFirstFrame = true;
+static inline void aqMark(int x, int y, int w, int h) {
+  if (aqDirtyN[aqParity] >= AQ_MAX_RECT || w <= 0 || h <= 0) return;
+  aqDirty[aqParity][aqDirtyN[aqParity]++] = { (int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h };
+}
+static void aqRestoreDirty(int W, int H) {
+  for (int i = 0; i < aqDirtyN[aqParity]; i++) {
+    int x = aqDirty[aqParity][i].x, y = aqDirty[aqParity][i].y;
+    int w = aqDirty[aqParity][i].w, h = aqDirty[aqParity][i].h;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > W) w = W - x;
+    if (y + h > H) h = H - y;
+    for (int yy = 0; yy < h; yy++)
+      panelBlitRowNative(x, y + yy, w, aqBg + (size_t)(y + yy) * W + x);
+  }
+  aqDirtyN[aqParity] = 0;
+}
 
+static const uint8_t AQ_BAYER[16] = { 0,8,2,10, 12,4,14,6, 3,11,1,9, 15,7,13,5 };
+static inline uint8_t aqDith(int c, int x, int y) {   // one 565-quant step of ordered dither
+  c += ((AQ_BAYER[((y & 3) << 2) | (x & 3)] - 8) * 8) >> 4;
+  return (uint8_t)(c < 0 ? 0 : c > 255 ? 255 : c);
+}
 static void aqComposeBg(int W, int H, int hue) {
-  // Water: vertical gradient, deep at the bottom. Tint follows the hue param (default teal-blue).
+  // Water: vertical gradient, deep at the bottom, Bayer-dithered per pixel -- a subtle
+  // dark 565 gradient BANDS without it (Alex spotted it at once). Composed once; cost
+  // is ~150 ms at native and irrelevant thereafter (snapshot restore per frame).
   const uint8_t baseHue = (uint8_t)(hue >= 0 ? hue : 148);
   uint8_t tr, tg, tb, br_, bg_, bb_;
   hsv(baseHue, tr, tg, tb);                       // top: brighter water
   hsv((uint8_t)(baseHue + 12), br_, bg_, bb_);    // bottom: deeper, darker
   for (int y = 0; y < H; y++) {
     const int t = 255 * y / (H > 1 ? H - 1 : 1);
-    const uint8_t r = (uint8_t)(((int)tr * 90 * (255 - t) / 255 + (int)br_ * 28 * t / 255) / 255);
-    const uint8_t g = (uint8_t)(((int)tg * 110 * (255 - t) / 255 + (int)bg_ * 40 * t / 255) / 255);
-    const uint8_t b = (uint8_t)(((int)tb * 160 * (255 - t) / 255 + (int)bb_ * 80 * t / 255) / 255);
-    panelHLine(0, y, W, r, g, b);
+    const int r = ((int)tr * 90 * (255 - t) / 255 + (int)br_ * 28 * t / 255) / 255;
+    const int g = ((int)tg * 110 * (255 - t) / 255 + (int)bg_ * 40 * t / 255) / 255;
+    const int b = ((int)tb * 160 * (255 - t) / 255 + (int)bb_ * 80 * t / 255) / 255;
+    for (int x = 0; x < W; x++) {
+      fxRow[x * 3] = aqDith(r, x, y); fxRow[x * 3 + 1] = aqDith(g, x, y); fxRow[x * 3 + 2] = aqDith(b, x, y);
+    }
+    panelBlitRow888(0, y, W, fxRow);
   }
-  // Light shafts: three slanted additive bands from the surface, fading with depth.
+  // Light shafts: slanted additive bands with SOFT edges -- a feathered ramp (quarter
+  // alpha, then half) on each side kills the staircase that a hard edge shows on a slant.
   for (int sfi = 0; sfi < 3; sfi++) {
     const int topX = W * (12 + sfi * 30) / 100, topW = W / 14 + sfi * (W / 60);
     const int drift = W / 5;                       // lean right as they go down
+    const int feather = W / 90 + 2;
     for (int y = 0; y < H * 82 / 100; y++) {
       const int a = 46 - 40 * y / H;               // fade with depth
       if (a <= 2) break;
-      panelSetBlend(1, (uint8_t)a);
-      const int xo = topX + drift * y / H;
-      panelHLine(xo, y, topW + y / 6, 255, 250, 210);
+      const int xo = topX + drift * y / H, wRow = topW + y / 6;
+      panelSetBlend(1, (uint8_t)(a / 4));          // outer feather
+      panelHLine(xo - feather, y, wRow + 2 * feather, 255, 250, 210);
+      panelSetBlend(1, (uint8_t)(a / 2));          // inner feather
+      panelHLine(xo - feather / 2, y, wRow + feather, 255, 250, 210);
+      panelSetBlend(1, (uint8_t)(a / 2));          // core (adds to ~a total with the ramps)
+      panelHLine(xo, y, wRow, 255, 250, 210);
     }
     panelClearBlend();
   }
@@ -857,10 +901,14 @@ static void aqComposeBg(int W, int H, int hue) {
     const int px = (i * 2654435761u) % W, py = sandTop + ((i * 40503u) % (H - sandTop));
     panelPixel(px, py, 140, 118, 74);
   }
-  for (int i = 0; i < 5; i++) {                    // pebbles
-    const int px = W * (7 + i * 19) / 100, pr = 2 + (i % 3);
-    panelCircle(px, H - (H - sandTop) / 3, pr, true, 120, 104, 78);
-    panelCircle(px, H - (H - sandTop) / 3, pr, false, 96, 82, 60);
+  for (int i = 0; i < 6; i++) {                    // pebbles, sized to the panel (v0.4.1: the
+    const int px = W * (6 + i * 17) / 100;         //  old 2-4 px reads as specks at 1280x800)
+    const int pr = H / 64 + (i % 3) * (H / 90 > 0 ? H / 90 : 1);
+    const int py = H - (H - sandTop) / 3 + (i % 2) * (H / 160);
+    panelCircle(px, py, pr, true, 128, 110, 82);                       // body
+    panelCircle(px, py, pr, false, 96, 82, 60);                        // rim
+    panelCircle(px - pr / 3, py - pr / 3, pr / 3 > 0 ? pr / 3 : 1,     // light catch
+                true, 156, 138, 106);
   }
 }
 
@@ -902,6 +950,7 @@ static void aqDrawPlant(const AqPlant& pl, int W, int H, float t) {
   const int segs = 7;
   int px = pl.x, py = sandTop + 2;
   const int thick = pl.front ? (H / 90 + 2) : (H / 120 + 1);
+  int minX = pl.x, maxX = pl.x;                    // dirty tracking
   for (int sg = 1; sg <= segs; sg++) {
     const float fr = (float)sg / segs;
     const int ny = sandTop + 2 - (int)(pl.h * fr);
@@ -912,15 +961,21 @@ static void aqDrawPlant(const AqPlant& pl, int W, int H, float t) {
       const int ldir = (sg & 1) ? 1 : -1;
       panelEllipse(nx + ldir * (H / 60 + 2), ny + 2, H / 44 + 2, H / 110 + 1, true, 30, (uint8_t)(g0 + 18), 52);
     }
+    if (nx < minX) minX = nx; if (nx > maxX) maxX = nx;
     px = nx; py = ny;
   }
+  const int pad = H / 44 + H / 60 + thick + 4;     // leaf reach + stroke width
+  aqMark(minX - pad, sandTop + 2 - pl.h - 3, (maxX - minX) + 2 * pad, pl.h + 6);
 }
 
 static void aqDrawFish(const AqFish& f, float t) {
   uint8_t r, g, b; hsv(f.hue, r, g, b);
   const uint8_t dr = (uint8_t)(r * 3 / 4), dg = (uint8_t)(g * 3 / 4), db = (uint8_t)(b * 3 / 4);
   const int L = f.size, hh = L / 3 + 1;            // body half-length / half-height
-  const int cx = (int)f.x, cy = (int)(f.y + sinf(t + f.phase) * 2.0f);
+  const int cx = (int)f.x, cy = (int)(f.y + sinf(t + f.phase) * 2.0f * (panelInfo().height / 200.0f));
+  // Dirty rect from the DRAWN position (cy includes the bob!) with margin -- marking the
+  // base y left ghost strips above/below the fish as it bobbed (v0.4.1 artifact fix).
+  aqMark(cx - L - L / 6 - 3, cy - hh - hh / 2 - 6, 2 * L + L / 3 + 6, 2 * hh + hh / 2 + 12);
   const float flap = sinf(t * 3.0f + f.phase);
   // tail (behind the body)
   const int rear = cx - f.dir * (L / 2);
@@ -933,13 +988,15 @@ static void aqDrawFish(const AqFish& f, float t) {
                 cx + f.dir * (L / 4), cy - hh + 1, true, dr, dg, db);
   // eye with glint
   const int ex = cx + f.dir * (L / 2 - L / 6), ey = cy - hh / 3;
-  panelCircle(ex, ey, L > 24 ? 2 : 1, true, 15, 15, 20);
-  if (L > 24) panelPixel(ex, ey - 1, 240, 240, 245);
+  const int er = L / 16 > 1 ? L / 16 : 1;
+  panelCircle(ex, ey, er, true, 15, 15, 20);
+  if (er > 1) panelPixel(ex - 1, ey - 1, 240, 240, 245);
 }
 
 static void renderAquarium() {
   const int W = panelInfo().width, H = panelInfo().height;
   const float t = (float)fxFrame / 24.0f;
+  const float sc = (float)H / 200.0f;              // motion in surface px, calibrated at H=200
   uint32_t tm0 = millis(), tmBg = 0, tmPl = 0, tmFish = 0, tmShow = 0;   // [AQ] diag
   const int hue = gEffectHue;
   // Background snapshot: (re)compose when absent, or when hue/geometry changed.
@@ -947,12 +1004,17 @@ static void renderAquarium() {
     aqComposeBg(W, H, hue);
     aqBgValid = panelSnapshotFull(&aqBg, &aqBgCap);
     aqBgHue = hue; aqBgW = W; aqBgH = H;
+    aqDirtyN[0] = aqDirtyN[1] = 0; aqParity = 0; aqFirstFrame = true;
     if (aqBgValid) aqSeed(W, H);                   // seed on the first good compose
+  } else if (aqFirstFrame) {
+    panelRestoreFull(aqBg);                        // the other double-buffer half, once
+    aqFirstFrame = false;
   } else {
-    panelRestoreFull(aqBg);
+    aqRestoreDirty(W, H);                          // only the strips that moved (v0.4.1)
   }
-  // Surface shimmer: two light rows sliding slowly.
+  // Surface shimmer: two light rows sliding slowly (their band restores every frame).
   { const int sy = H / 24 + 1;
+    aqMark(0, sy - 1, W, 5);
     panelSetBlend(1, 26);
     const int off = (int)(sinf(t * 0.5f) * (W / 40));
     panelHLine(W / 10 + off, sy, W * 8 / 10, 220, 235, 255);
@@ -969,18 +1031,19 @@ static void renderAquarium() {
       const bool small = f.size < (uint8_t)(H / 11);
       if ((pass == 0) != small) continue;
       if (pass == 1 || true) { /* update once, on its draw pass */ }
-      f.x += f.vx * f.dir * spd * 0.8f;          // calm default; speed param scales the tempo
+      f.x += f.vx * f.dir * spd * 0.8f * sc;     // calm default; speed param scales the tempo
       const int margin = f.size;
       if (f.dir > 0 && f.x > W - margin) f.dir = -1;
       if (f.dir < 0 && f.x < margin)     f.dir = 1;
-      f.y += sinf(t * 0.7f + f.phase * 2.0f) * 0.10f * spd;
+      f.y += sinf(t * 0.7f + f.phase * 2.0f) * 0.10f * spd * sc;
       const float yMin = (float)(H / 8), yMax = (float)(H * 80 / 100);
       if (f.y < yMin) f.y = yMin; if (f.y > yMax) f.y = yMax;
       aqDrawFish(f, t);
       // occasional bubble from the mouth
       if (((fxTick + i * 37) % 256) == 0)
         for (int bi = 0; bi < AQ_MAX_BUB; bi++) if (!aqBub[bi].live) {
-          aqBub[bi] = { f.x + f.dir * (f.size / 2), f.y - 2, 0.5f + (float)(i % 3) / 4, (float)i, (uint8_t)(1 + (i % 2)), true };
+          aqBub[bi] = { f.x + f.dir * (f.size / 2), f.y - 2, 0.5f + (float)(i % 3) / 4, (float)i,
+                        (uint8_t)((1 + (i % 2)) * (panelInfo().height / 200 > 0 ? panelInfo().height / 200 : 1)), true };
           break;
         }
     }
@@ -989,20 +1052,23 @@ static void renderAquarium() {
   // Bubbles: rise with wobble, pop near the surface. A vent by the second plant.
   if ((fxTick % 96) == 0 && aqPlantN > 1)
     for (int bi = 0; bi < AQ_MAX_BUB; bi++) if (!aqBub[bi].live) {
-      aqBub[bi] = { (float)aqPlant[1].x, (float)(H * 84 / 100), 0.6f, (float)(fxTick % 7), 2, true };
+      aqBub[bi] = { (float)aqPlant[1].x, (float)(H * 84 / 100), 0.6f, (float)(fxTick % 7),
+                    (uint8_t)(2 * (H / 200 > 0 ? H / 200 : 1)), true };
       break;
     }
   for (int bi = 0; bi < AQ_MAX_BUB; bi++) {
     AqBub& bu = aqBub[bi];
     if (!bu.live) continue;
-    bu.y -= bu.vy * spd * 1.1f;
-    bu.x += sinf(t * 2.0f + bu.phase) * 0.5f;
+    bu.y -= bu.vy * spd * 1.1f * sc;
+    bu.x += sinf(t * 2.0f + bu.phase) * 0.5f * sc;
     if (bu.y < (float)(H / 18)) { bu.live = false; continue; }
+    aqMark((int)bu.x - bu.r - 2, (int)bu.y - bu.r - 4, 2 * bu.r + 4, 2 * bu.r + 8);
     panelCircle((int)bu.x, (int)bu.y, bu.r, false, 210, 230, 250);
     if (bu.r > 1) panelPixel((int)bu.x - 1, (int)bu.y - 1, 245, 250, 255);
   }
   tmPl = millis();
   panelShow();
+  aqParity ^= 1;                                   // next frame draws into the other buffer
   tmShow = millis();
   if (gSerialDebug) { static uint32_t lastAq = 0;
     if (tmShow - lastAq > 2000) { lastAq = tmShow;

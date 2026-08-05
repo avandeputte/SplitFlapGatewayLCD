@@ -40,6 +40,9 @@
 #include <esp_lcd_panel_io.h>
 #include <driver/ppa.h>              // hardware rotate for the landscape mount
 #include <esp_async_memcpy.h>        // AXI-GDMA bulk copies (panelFastCopy, v0.3.3)
+#include <hal/axi_icm_ll.h>          // AXI arbiter QoS: the scan-out must WIN arbitration (v0.4.1)
+#include <soc/mipi_dsi_bridge_struct.h>  // the bridge's underflow substitute pixel (v0.4.1)
+#include <esp_lcd_mipi_dsi.h>        // refresh-done heartbeat callbacks (already included; harmless)
 #include "esp_lcd_jd9365_10_1.h"     // vendored Waveshare panel driver (Apache-2.0)
 #include "sdcard.h"        // sdLog: on-card event log
 
@@ -78,6 +81,14 @@ static bool IRAM_ATTR ppaRotDoneCb(ppa_client_handle_t, ppa_event_data_t*, void*
   BaseType_t hp = pdFALSE;
   if (ud) xSemaphoreGiveFromISR((SemaphoreHandle_t)ud, &hp);
   return hp == pdTRUE;
+}
+// DSI wedge self-heal (v0.4.1): heartbeat counter bumped by the refresh ISR; panelShow
+// stamps activity; panelHealthTick recovers a stalled pipeline (see there).
+static volatile uint32_t gRefreshBeats = 0;
+static volatile uint32_t gLastShowMs   = 0;
+static bool IRAM_ATTR panelRefreshHeartbeatCb(esp_lcd_panel_handle_t, esp_lcd_dpi_panel_event_data_t*, void*) {
+  gRefreshBeats++;
+  return false;
 }
 static void panelRotSync() {                             // drain: wait out an in-flight rotate
   if (gPpa && gRotDone) { xSemaphoreTake(gRotDone, portMAX_DELAY); xSemaphoreGive(gRotDone); }
@@ -374,10 +385,27 @@ void panelFastCopy(void* dst, const void* src, size_t bytes) {
   }
   const bool aligned = ((uintptr_t)dst % 128 == 0) && ((uintptr_t)src % 128 == 0) && (bytes % 128 == 0);
   if (gMcp && gMcpDone && aligned && bytes >= 32768) {
-    if (esp_async_memcpy(gMcp, dst, (void*)src, bytes, mcpDoneCb, gMcpDone) == ESP_OK) {
-      xSemaphoreTake(gMcpDone, portMAX_DELAY);
-      return;
+    // Chunked with breathing gaps (v0.4.1): an unbroken 2 MB burst at 128 B bursts hogs
+    // the PSRAM controller hard enough to starve the DPI scan-out -- sub-line underruns
+    // are silently discarded by the bridge (no IRQ) and show as brief white flicker.
+    // 256 KB chunks with a tick's gap keep the copy fast (~+2 ms total) while the DPI
+    // refills between bursts. Also caps the DMA driver's per-call internal descriptor
+    // allocation (~30 KB for 2 MB -> ~4 KB per chunk).
+    const size_t CHUNK = 256 * 1024;
+    uint8_t* d = (uint8_t*)dst; const uint8_t* sp = (const uint8_t*)src;
+    size_t off = 0; bool ok = true;
+    while (off < bytes && ok) {
+      const size_t n = (bytes - off > CHUNK) ? CHUNK : (bytes - off);
+      ok = esp_async_memcpy(gMcp, d + off, (void*)(sp + off), n, mcpDoneCb, gMcpDone) == ESP_OK;
+      if (ok) {
+        xSemaphoreTake(gMcpDone, portMAX_DELAY);
+        off += n;
+        if (off < bytes) vTaskDelay(1);          // the breathing gap for the scan-out
+      }
     }
+    if (ok) return;
+    if (off < bytes) memcpy(d + off, sp + off, bytes - off);   // finish what the DMA didn't
+    return;
   }
   memcpy(dst, src, bytes);
 }
@@ -936,6 +964,7 @@ void panelShow() {
   const uint8_t shown = drawBuf;
   drawBuf = liveBuf;
   liveBuf = shown;
+  gLastShowMs = millis();                        // wedge detector: we ARE presenting
   if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
 }
 
@@ -1025,10 +1054,11 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
 
   esp_lcd_dpi_panel_config_t dpiCfg = {};
   dpiCfg.dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT;
-  dpiCfg.dpi_clock_freq_mhz = 80;                  // 60 Hz at the timing below. (66 MHz was tried
-                                                   // against the flash-write scan-out glitch and
-                                                   // reverted: FIFO margin is irrelevant against a
-                                                   // multi-ms cache-disable stall -- see platformio.ini)
+  dpiCfg.dpi_clock_freq_mhz = 80;                  // 60 Hz. DO NOT lower: a 66 MHz trial against
+                                                   // the aquarium's bandwidth flicker LATCHED the
+                                                   // bridge solid blue within a minute (v0.4.1).
+                                                   // Bandwidth relief lives in the DRAW paths
+                                                   // (dirty-rect restores), not the scan clock.
   dpiCfg.virtual_channel = 0;
   // IDF 5.5 takes in_color_format (the legacy pixel_format field is a separate,
   // unread member here); and Waveshare's own 5.5 configs do NOT enable use_dma2d.
@@ -1070,6 +1100,10 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   // PPA client for the hardware rotate. Optional: on failure the CPU path serves.
   ppa_client_config_t ppaCfg = {};
   ppaCfg.oper_type = PPA_OPERATION_SRM;
+  ppaCfg.data_burst_length = PPA_DATA_BURST_LENGTH_64;   // v0.4.1: 128 B bursts head-of-line
+                                                         // block the DSI fetch; 64 B halves the
+                                                         // unpreemptible window (ext. precedent:
+                                                         // lvgl#9590 -- no throughput loss)
   if (ppa_register_client(&ppaCfg, &gPpa) != ESP_OK) {
     gPpa = nullptr;
     printf("[PANEL] PPA unavailable -- CPU rotate fallback\n");
@@ -1084,6 +1118,32 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
            (unsigned)(bytes / 1024), (unsigned long)tCpu, (unsigned long)tDma1,
            (unsigned long)tDma2, gMcp ? "axi-gdma" : "fallback");
   }
+  // THE white-flash mechanism (v0.4.1, confirmed by the red-pixel experiment): the DSI
+  // bridge emits a hardware SUBSTITUTE PIXEL whenever its FIFO underflows -- register
+  // dpi_rsv_dpi_data, default 0x3FFF = bright cyan-white, never programmed by esp_lcd.
+  // Brief starvation showed as white flashes; sustained starvation is the solid-blue
+  // latch (same mechanism, two durations). Recoloring it RED made the flashes red --
+  // proof. Ship config: BLACK, so residual tail-latency underruns (which no bandwidth
+  // or QoS tuning fully eliminates) are imperceptible blinks instead of white strobes.
+  // The driver's discard_vcnt = h_size stays (underrun IRQ masked: its ESP_DRAM_LOGE in
+  // ISR context is pure jitter in production). Must be re-applied after any DPI re-init.
+  { MIPI_DSI_BRIDGE.dpi_rsv_dpi_data.dpi_rsv_data = 0x0000;      // substitute = black
+    MIPI_DSI_BRIDGE.dpi_config_update.dpi_config_update = 1; }
+
+  // Scan-out arbitration priority (v0.4.1): the DSI's framebuffer fetches ride DW-GDMA
+  // master port 1 (the PSRAM-facing port); every AXI master defaults to QoS 0, so under
+  // heavy PPA + memcpy traffic the DISPLAY lost arbitration and underran (white flicker;
+  // occasionally a latched solid-blue bridge wedge). Priority 10 makes the ~160 MB/s scan
+  // fetch win; the bulk movers just queue a little longer.
+  axi_icm_ll_set_dw_gdma_qos_arbiter_prio(1, 10, 10);
+
+  // Refresh heartbeat (v0.4.1): on this silicon rev the on_refresh_done callback fires
+  // from the DMA re-arm ISR -- the exact loop that dies in the blue-wedge state -- so a
+  // stalled counter WHILE presenting is a perfect wedge signal (see panelHealthTick).
+  { esp_lcd_dpi_panel_event_callbacks_t hb = {};
+    hb.on_refresh_done = panelRefreshHeartbeatCb;
+    esp_lcd_dpi_panel_register_event_callbacks(gPanel, &hb, nullptr); }
+
   if (gPpa) {                                    // pipelined present (see gRotDone)
     if (!gRotDone) gRotDone = xSemaphoreCreateBinary();
     ppa_event_callbacks_t pcb = {};
@@ -1123,4 +1183,31 @@ void panelRelease() {
 // The DPI engine owns refresh end to end; there is no descriptor chain to freeze.
 // Kept as a hook: if a DSI-underrun class of wedge ever shows up in the field, its
 // detector goes here (esp_lcd exposes DPI event callbacks for it).
-void panelHealthTick() {}
+void panelHealthTick() {
+  // DSI blue-wedge self-heal (v0.4.1). The bridge's underrun ISR does NO recovery (it
+  // only logs), and a hard underrun can desync the bridge's internal frame counter: the
+  // DMA channel hangs mid-block, the re-arm loop dies, the panel goes undriven and the
+  // JD9365 latches solid blue -- previously until a manual reboot. Detection: the
+  // refresh heartbeat (driven by the very re-arm ISR that dies) stops advancing while
+  // panelShow is still presenting. Recovery: esp_lcd_panel_init(gPanel) -- verified
+  // idempotent and allocation-free in the DPI driver; it re-runs the full start-stream
+  // sequence (re-arm DMA + bridge + video mode + DCS init). ~200-300 ms blink, no reboot.
+  static uint32_t lastBeats = 0, lastCheckMs = 0, lastRecoverMs = 0;
+  if (!info.ok || !gPanel) return;
+  const uint32_t now = millis();
+  if (now - lastCheckMs < 500) return;
+  const uint32_t beats = gRefreshBeats;
+  const bool presenting = (now - gLastShowMs) < 2000;
+  const bool stalled = (beats == lastBeats);
+  lastBeats = beats; lastCheckMs = now;
+  if (!presenting || !stalled) return;
+  if (now - lastRecoverMs < 5000) return;        // cooldown: never thrash the re-init
+  lastRecoverMs = now;
+  printf("[PANEL] DSI wedge: no refresh for 500+ ms while presenting -- re-initing the pipeline\n");
+  panelRotSync();                                // let an in-flight PPA rotate land first
+  if (esp_lcd_panel_init(gPanel) == ESP_OK) {
+    printf("[PANEL] DSI pipeline recovered\n");
+    MIPI_DSI_BRIDGE.dpi_rsv_dpi_data.dpi_rsv_data = 0x0000;      // re-apply: re-init resets it
+    MIPI_DSI_BRIDGE.dpi_config_update.dpi_config_update = 1;
+  } else printf("[PANEL] DSI re-init FAILED -- next stop: the task watchdog\n");
+}
