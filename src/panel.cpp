@@ -66,6 +66,21 @@ static esp_lcd_dsi_bus_handle_t  gDsiBus  = nullptr;
 static esp_ldo_channel_handle_t  gPhyLdo  = nullptr;
 static void*                     gScanout = nullptr;   // DPI frame buffer (esp_lcd owns it)
 static ppa_client_handle_t       gPpa     = nullptr;   // hardware rotate; null = CPU fallback
+// Pipelined present (v0.3.2): the full-res rotate is ~53 ms of pure engine time (16x16
+// macro-blocks -> 32-36 B PSRAM transactions; a hardware floor on this silicon rev). Run it
+// NON-blocking: panelShow waits for the PREVIOUS rotate, kicks this one, and returns -- the
+// app composes the next frame while the engine churns. Safe because the just-kicked source
+// becomes liveBuf, which everything only READS; the writers of that memory (panelSetScale,
+// panelFreeAll) drain the pipeline first via panelRotSync().
+static SemaphoreHandle_t         gRotDone = nullptr;    // given when the in-flight rotate lands
+static bool IRAM_ATTR ppaRotDoneCb(ppa_client_handle_t, ppa_event_data_t*, void* ud) {
+  BaseType_t hp = pdFALSE;
+  if (ud) xSemaphoreGiveFromISR((SemaphoreHandle_t)ud, &hp);
+  return hp == pdTRUE;
+}
+static void panelRotSync() {                             // drain: wait out an in-flight rotate
+  if (gPpa && gRotDone) { xSemaphoreTake(gRotDone, portMAX_DELAY); xSemaphoreGive(gRotDone); }
+}
 // Serialize the whole present. panelShow() is called from taskDisplay (core 1: wall/effects),
 // taskWeb (core 0: canvas stream + ticker) and the httpd worker (core 0: one-shot frames). The
 // single PPA client is NOT safe for concurrent use -- two presents at once (the window during an
@@ -120,6 +135,7 @@ void panelSetScale(uint8_t s) {
   if (s < 1) s = 1;
   if (s > 8) s = 8;
   if (!info.ok || s == gScale) return;
+  panelRotSync();                                // an in-flight rotate reads these buffers
   gScale = s;
   W = (uint16_t)(PANEL_NATIVE_H / s);
   H = (uint16_t)(PANEL_NATIVE_W / s);
@@ -173,6 +189,7 @@ void panelSetBlend(uint8_t mode, uint8_t alpha) {
   gBlendActive = (mode != 0 || alpha != 255);
 }
 void panelClearBlend() { gBlendActive = false; gBlendMode = 0; gBlendAlpha = 255; }
+bool panelBlendActive() { return gBlendActive; }   // fast-path gate for row-composed fills (v0.3.2)
 
 // Offscreen layers: while open, every drawing primitive redirects into a full-panel
 // RGBA shadow; composite flattens the group back with one blend mode + group alpha.
@@ -239,11 +256,68 @@ void panelClear() {
   memset(fb[drawBuf], 0, (size_t)W * H * sizeof(px_t));
 }
 
+// v0.3.2 perf: spans as direct row/column stores. Every span-based primitive (polygon
+// fill, filled circles, thick lines) funnels through these; the old per-pixel panelPixel
+// loop cost ~97 ms per seaweed polygon in the aquarium. Layer/blend fall back per-pixel.
 void panelHLine(int x, int y, int w, uint8_t r, uint8_t g, uint8_t b) {
-  for (int i = 0; i < w; i++) panelPixel(x + i, y, r, g, b);
+  if (!info.ok || y < 0 || y >= H || y < clipY0 || y >= clipY1) return;
+  if (gLayerBuf) { for (int i = 0; i < w; i++) panelPixel(x + i, y, r, g, b); return; }
+  if (gBlendActive) {
+    // Blended span fast lane (v0.3.2): the aquarium's ADD-blended light-shaft quads are
+    // 228K span pixels/frame; the per-pixel panelPixel fallback (~400 ns each: call +
+    // bounds + readPixelRGB + blendCh calls) cost ~97 ms per quad. Same math, inlined
+    // over the row: clip once, unpack-blend-pack per pixel, no per-pixel re-checks.
+    if (x < clipX0) { w -= clipX0 - x; x = clipX0; }
+    if (x < 0)      { w += x; x = 0; }
+    if (x + w > W) w = W - x;
+    if (x + w > clipX1) w = clipX1 - x;
+    if (w <= 0) return;
+    uint8_t sr = r, sg = g, sb = b;
+    if (bgrOrder) { uint8_t t = sr; sr = sb; sb = t; }   // match pack565/readPixelRGB order
+    const uint8_t m = gBlendMode, a = gBlendAlpha;
+    px_t* p = fb[drawBuf] + (size_t)y * W + x;
+    if (m == 1 && a == 255) {                    // ADD at full alpha == saturating add (the
+      for (int i = 0; i < w; i++) {              // aquarium's light shafts) -- ~3x the generic lane
+        const px_t v = p[i];
+        const uint8_t r5 = (v >> 11) & 0x1F, g6 = (v >> 5) & 0x3F, b5 = v & 0x1F;
+        int nr = ((r5 << 3) | (r5 >> 2)) + sr; if (nr > 255) nr = 255;
+        int ng = ((g6 << 2) | (g6 >> 4)) + sg; if (ng > 255) ng = 255;
+        int nb = ((b5 << 3) | (b5 >> 2)) + sb; if (nb > 255) nb = 255;
+        p[i] = (px_t)(((nr & 0xF8) << 8) | ((ng & 0xFC) << 3) | ((unsigned)nb >> 3));
+      }
+      return;
+    }
+    for (int i = 0; i < w; i++) {
+      const px_t v = p[i];
+      const uint8_t r5 = (v >> 11) & 0x1F, g6 = (v >> 5) & 0x3F, b5 = v & 0x1F;
+      const uint8_t dr = (uint8_t)((r5 << 3) | (r5 >> 2));       // bit-replicate, as readPixelRGB
+      const uint8_t dg = (uint8_t)((g6 << 2) | (g6 >> 4));
+      const uint8_t db = (uint8_t)((b5 << 3) | (b5 >> 2));
+      const uint8_t nr = blendCh(m, sr, dr, a), ng = blendCh(m, sg, dg, a), nb = blendCh(m, sb, db, a);
+      p[i] = (px_t)(((nr & 0xF8) << 8) | ((ng & 0xFC) << 3) | (nb >> 3));
+    }
+    return;
+  }
+  if (x < clipX0) { w -= clipX0 - x; x = clipX0; }
+  if (x < 0)      { w += x; x = 0; }
+  if (x + w > W) w = W - x;
+  if (x + w > clipX1) w = clipX1 - x;
+  if (w <= 0) return;
+  const px_t v = pack565(r, g, b);
+  px_t* p = fb[drawBuf] + (size_t)y * W + x;
+  for (int i = 0; i < w; i++) p[i] = v;
 }
 void panelVLine(int x, int y, int h, uint8_t r, uint8_t g, uint8_t b) {
-  for (int i = 0; i < h; i++) panelPixel(x, y + i, r, g, b);
+  if (!info.ok || x < 0 || x >= W || x < clipX0 || x >= clipX1) return;
+  if (gLayerBuf || gBlendActive) { for (int i = 0; i < h; i++) panelPixel(x, y + i, r, g, b); return; }
+  if (y < clipY0) { h -= clipY0 - y; y = clipY0; }
+  if (y < 0)      { h += y; y = 0; }
+  if (y + h > H) h = H - y;
+  if (y + h > clipY1) h = clipY1 - y;
+  if (h <= 0) return;
+  const px_t v = pack565(r, g, b);
+  px_t* p = fb[drawBuf] + (size_t)y * W + x;
+  for (int i = 0; i < h; i++, p += W) *p = v;
 }
 
 void panelFillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) {
@@ -267,6 +341,31 @@ void panelFillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) 
     px_t* p = fb[drawBuf] + (size_t)yy * W + x0;
     for (int i = x1 - x0; i > 0; i--) *p++ = v;
   }
+}
+
+// v0.3.2 perf: expose the packer + a native-565 row blit for the gradient cache. The cache
+// stores pre-packed rows; a hit lands as row memcpys (~3-8 ms full-screen vs ~370 ms of
+// per-pixel composition). Layer fallback unpacks per pixel so group compositing stays right.
+uint16_t panelPack565(uint8_t r, uint8_t g, uint8_t b) { return pack565(r, g, b); }
+bool panelLayerActive() { return gLayerBuf != nullptr; }
+void panelBlitRowNative(int x, int y, int n, const uint16_t* row) {
+  if (!info.ok || y < 0 || y >= H || y < clipY0 || y >= clipY1) return;
+  if (gLayerBuf) {
+    for (int i = 0; i < n; i++) {
+      const uint16_t v = row[i];
+      uint8_t r5 = (v >> 11) & 0x1F, g6 = (v >> 5) & 0x3F, b5 = v & 0x1F;
+      uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2)), g = (uint8_t)((g6 << 2) | (g6 >> 4)), b = (uint8_t)((b5 << 3) | (b5 >> 2));
+      if (bgrOrder) { uint8_t t = r; r = b; b = t; }   // undo the baked-in order for panelPixel
+      panelPixel(x + i, y, r, g, b);
+    }
+    return;
+  }
+  if (x < clipX0) { row += clipX0 - x; n -= clipX0 - x; x = clipX0; }
+  if (x < 0)      { row -= x; n += x; x = 0; }
+  if (x + n > W) n = W - x;
+  if (x + n > clipX1) n = clipX1 - x;
+  if (n <= 0) return;
+  memcpy(fb[drawBuf] + (size_t)y * W + x, row, (size_t)n * sizeof(px_t));
 }
 
 void panelBlitRow888(int x, int y, int n, const uint8_t* rgb) {
@@ -684,9 +783,19 @@ static void rotateToScanout() {
     op.rotation_angle    = PANEL_ROT_180 ? PPA_SRM_ROTATION_ANGLE_270 : PPA_SRM_ROTATION_ANGLE_90;
     op.scale_x           = (float)gScale;
     op.scale_y           = (float)gScale;
-    op.mode              = PPA_TRANS_MODE_BLOCKING;
-    if (ppa_do_scale_rotate_mirror(gPpa, &op) == ESP_OK) return;
-    // fall through to the CPU path on error
+    // Pipelined: the caller (panelShow) has already TAKEN gRotDone, so at most one rotate
+    // is in flight; the engine's done-callback gives it back. The submitted config is
+    // copied by the driver at submit, so the stack-local op is safe.
+    op.mode              = gRotDone ? PPA_TRANS_MODE_NON_BLOCKING : PPA_TRANS_MODE_BLOCKING;
+    op.user_data         = (void*)gRotDone;
+    const esp_err_t pe = ppa_do_scale_rotate_mirror(gPpa, &op);
+    if (pe == ESP_OK) { if (!gRotDone) return; return; }
+    if (gRotDone) xSemaphoreGive(gRotDone);   // submit failed: nothing in flight, release the gate
+    // fall through to the CPU path on error -- but never SILENTLY (v0.3.2 perf hunt: a
+    // silent per-frame fallback to the ~50 ms CPU rotate would masquerade as "slow app").
+    { static uint32_t lastPpaErrMs = 0;
+      if (millis() - lastPpaErrMs > 2000) { lastPpaErrMs = millis();
+        printf("[PANEL] PPA rotate FAILED (0x%x) -- CPU fallback in use\n", (unsigned)pe); } }
   }
   const px_t* src = fb[drawBuf];
   px_t* dst = (px_t*)gScanout;
@@ -721,6 +830,7 @@ void panelShow() {
   // P4 cache lines are 128 B (the S3 was 64): a sync not aligned to that is REJECTED
   // outright by esp_cache_msync, not partially done -- the boot log said so.
   const size_t liveBytes = ((size_t)W * H * sizeof(px_t) + 127u) & ~((size_t)127u);
+  if (gPpa && gRotDone) xSemaphoreTake(gRotDone, portMAX_DELAY);   // previous rotate must land first
   if (gPpa) esp_cache_msync(fb[drawBuf], liveBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
   const uint32_t t1 = micros();
   rotateToScanout();
@@ -767,6 +877,7 @@ void panelShow() {
 
 // ---- bring-up / teardown ----------------------------------------------------------
 static void panelFreeAll() {
+  panelRotSync();                                // never free memory the engine is reading
   for (int b = 0; b < 2; b++)
     if (fb[b]) { heap_caps_free(fb[b]); fb[b] = nullptr; }
   panelLayerDiscard();
@@ -898,6 +1009,13 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   if (ppa_register_client(&ppaCfg, &gPpa) != ESP_OK) {
     gPpa = nullptr;
     printf("[PANEL] PPA unavailable -- CPU rotate fallback\n");
+  }
+  if (gPpa) {                                    // pipelined present (see gRotDone)
+    if (!gRotDone) gRotDone = xSemaphoreCreateBinary();
+    ppa_event_callbacks_t pcb = {};
+    pcb.on_trans_done = ppaRotDoneCb;
+    if (gRotDone && ppa_client_register_event_callbacks(gPpa, &pcb) == ESP_OK) xSemaphoreGive(gRotDone);
+    else { vSemaphoreDelete(gRotDone); gRotDone = nullptr; }   // no callback -> stay blocking
   }
 
   info.bytes = (uint32_t)(gFbBytes * 2);

@@ -1644,11 +1644,30 @@ void canvasStreamPump() {
     wdgWebMs  = millis();
     if (cs.inRec && cs.got == cs.need) {          // record complete (covers len-0 records)
       cs.inRec = false; cs.hdrN = 0;
+      // Perf telemetry (serialDebug only): per-second record mix -- the one fact that
+      // separates "gateway drain-bound" from "companion producer-bound" at low app fps.
+      if (gSerialDebug) {
+        static uint32_t statMs = 0, cnt[8] = {0}, byt = 0;
+        const uint8_t ti = cs.type < 8 ? cs.type : 7;
+        cnt[ti]++; byt += (uint32_t)cs.need;
+        const uint32_t nowMs = millis();
+        if (nowMs - statMs >= 1000) {
+          printf("[CS] 1s: frame=%lu rects=%lu ops=%lu atlas=%lu show=%lu other=%lu bytes=%lu\n",
+                 (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                 (unsigned long)cnt[4], (unsigned long)cnt[5],
+                 (unsigned long)(cnt[0] + cnt[6] + cnt[7]), (unsigned long)byt);
+          memset(cnt, 0, sizeof(cnt)); byt = 0; statMs = nowMs;
+        }
+      }
+      const uint32_t tExec0 = millis();
       if (!csExec()) {
         printf("[CANVAS] stream: bad record type 0x%02x len %lu\n", cs.type, (unsigned long)cs.need);
         csClose(false, "bad record");
         return;
       }
+      // Long single-record executions are the other drain killer -- surface them.
+      if (gSerialDebug) { const uint32_t d = millis() - tExec0;
+        if (d > 30) printf("[CS] slow exec: type=%02x len=%lu took %lums\n", cs.type, (unsigned long)cs.need, (unsigned long)d); }
       cs.records++;
     }
   }
@@ -2276,6 +2295,7 @@ static inline uint8_t ditherCh(int c, int x, int y, int q) {
 
 // Gradient fill: mode 0 = vertical, 1 = horizontal, 2 = radial (centre -> corners),
 // 3 = angled (angleDeg: 0 = left->right, 90 = top->bottom, any degree between).
+typedef uint16_t px565_t;   // native-packed 565, as panelPack565/panelBlitRowNative speak
 static void canvasOpGradientEx(int x, int y, int w, int h,
                                uint8_t r0, uint8_t g0, uint8_t b0,
                                uint8_t r1, uint8_t g1, uint8_t b1,
@@ -2310,6 +2330,100 @@ static void canvasOpGradientEx(int x, int y, int w, int h,
   }
   const float cx = (w - 1) * 0.5f, cy = (h - 1) * 0.5f;
   const float maxR = sqrtf(cx * cx + cy * cy);
+  // Row-composed fast path (v0.3.2 perf): the old per-pixel panelPixel loop cost ~1 s for a
+  // full 1280x800 gradient -- it WAS the aquarium's "2 fps" (one ~380-byte ops batch taking
+  // ~1020 ms, dominated by the background gradient; measured via [CS] slow-exec telemetry).
+  // Compose each row into a scratch buffer with the IDENTICAL per-pixel math, then land it
+  // with one panelBlitRow888 (which handles clip and open layers). Only a non-trivial batch
+  // blend still needs the general per-pixel path -- backgrounds don't blend, so that stays rare.
+  if (!panelBlendActive()) {
+    static uint8_t rowBuf[PANEL_MAX_W * 3];        // ops are single-threaded (stream XOR one-shot)
+    static uint8_t baseRow[PANEL_MAX_W * 3];       // mode 1: per-column base colours, computed once
+    const int wc = w > PANEL_MAX_W ? PANEL_MAX_W : w;
+    // Gradient render cache (v0.3.2): app backgrounds are the SAME gradient every frame --
+    // the aquarium spent ~370 ms/frame recomposing one. Key on every param; on a hit,
+    // replay pre-packed rows as memcpys (~3-8 ms full-screen). One entry; PSRAM.
+    static px565_t* gcBuf = nullptr; static size_t gcCap = 0;
+    static int gcX, gcY, gcW, gcH, gcMode, gcAngle; static bool gcDither, gcValid = false;
+    static uint8_t gcC[6]; static uint16_t gcPW, gcPH;
+    const bool cacheable = !panelLayerActive() && (size_t)wc * h >= 65536;   // big fills only
+    if (cacheable && gcValid && gcBuf && gcX == x && gcY == y && gcW == wc && gcH == h
+        && gcMode == mode && gcAngle == angleDeg && gcDither == dither
+        && gcC[0]==r0 && gcC[1]==g0 && gcC[2]==b0 && gcC[3]==r1 && gcC[4]==g1 && gcC[5]==b1
+        && gcPW == gPanel.panelW && gcPH == gPanel.panelH) {
+      for (int yy = 0; yy < h; yy++) {
+        panelBlitRowNative(x, y + yy, wc, gcBuf + (size_t)yy * wc);
+        if ((yy & 127) == 127) wdgWebMs = millis();
+      }
+      return;
+    }
+    px565_t* fill = nullptr;                       // non-null: populate the cache as we compose
+    if (cacheable && gSerialDebug)                 // perf diag: why does the cache miss?
+      printf("[GRAD] compose %dx%d m=%d a=%d d=%d c=%02x%02x%02x-%02x%02x%02x\n",
+             wc, h, mode, angleDeg, (int)dither, r0, g0, b0, r1, g1, b1);
+    if (cacheable) {
+      const size_t need = (size_t)wc * h * sizeof(px565_t);
+      if (gcCap < need) { free(gcBuf); gcBuf = (px565_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM); gcCap = gcBuf ? need : 0; }
+      if (gcBuf) {
+        fill = gcBuf; gcValid = false;             // valid only after a complete compose
+        gcX = x; gcY = y; gcW = wc; gcH = h; gcMode = mode; gcAngle = angleDeg; gcDither = dither;
+        gcC[0]=r0; gcC[1]=g0; gcC[2]=b0; gcC[3]=r1; gcC[4]=g1; gcC[5]=b1;
+        gcPW = gPanel.panelW; gcPH = gPanel.panelH;
+      }
+    }
+    if (mode == 1) {
+      for (int xx = 0; xx < wc; xx++) {
+        int t8 = (w > 1) ? 255 * xx / (w - 1) : 0;
+        if (t8 < 0) t8 = 0; else if (t8 > 255) t8 = 255;
+        baseRow[xx * 3]     = (uint8_t)(r0 + ((r1 - r0) * t8) / 255);
+        baseRow[xx * 3 + 1] = (uint8_t)(g0 + ((g1 - g0) * t8) / 255);
+        baseRow[xx * 3 + 2] = (uint8_t)(b0 + ((b1 - b0) * t8) / 255);
+      }
+    }
+    for (int yy = 0; yy < h; yy++) {
+      const float dy2 = ((float)yy - cy) * ((float)yy - cy);   // mode 2: hoisted per row
+      const float ybase = yy * ay - tmin;                      // mode 3: hoisted per row
+      int rr = 0, rg = 0, rb = 0;
+      if (mode == 0) {                                         // vertical: colour constant per row
+        int t8 = (h > 1) ? 255 * yy / (h - 1) : 0;
+        if (t8 < 0) t8 = 0; else if (t8 > 255) t8 = 255;
+        rr = r0 + ((r1 - r0) * t8) / 255;
+        rg = g0 + ((g1 - g0) * t8) / 255;
+        rb = b0 + ((b1 - b0) * t8) / 255;
+      }
+      for (int xx = 0; xx < wc; xx++) {
+        int r, g, b;
+        if (mode == 0)      { r = rr; g = rg; b = rb; }
+        else if (mode == 1) { r = baseRow[xx*3]; g = baseRow[xx*3+1]; b = baseRow[xx*3+2]; }
+        else {
+          int t8;
+          if (mode == 2) {
+            const float dx = xx - cx;
+            t8 = (int)(255.0f * sqrtf(dx * dx + dy2) / (maxR > 0 ? maxR : 1));
+          } else t8 = (int)(255.0f * ((xx * ax + ybase)) / tspan);
+          if (t8 < 0) t8 = 0; else if (t8 > 255) t8 = 255;
+          r = r0 + ((r1 - r0) * t8) / 255;
+          g = g0 + ((g1 - g0) * t8) / 255;
+          b = b0 + ((b1 - b0) * t8) / 255;
+        }
+        if (dither) {
+          rowBuf[xx*3]   = ditherCh(r, x + xx, y + yy, q);
+          rowBuf[xx*3+1] = ditherCh(g, x + xx, y + yy, q);
+          rowBuf[xx*3+2] = ditherCh(b, x + xx, y + yy, q);
+        } else {
+          rowBuf[xx*3] = (uint8_t)r; rowBuf[xx*3+1] = (uint8_t)g; rowBuf[xx*3+2] = (uint8_t)b;
+        }
+      }
+      if (fill) {                                  // pack this row into the cache as composed
+        px565_t* cr = fill + (size_t)yy * wc;
+        for (int xx = 0; xx < wc; xx++) cr[xx] = panelPack565(rowBuf[xx*3], rowBuf[xx*3+1], rowBuf[xx*3+2]);
+      }
+      panelBlitRow888(x, y + yy, wc, rowBuf);
+      if ((yy & 63) == 63) wdgWebMs = millis();    // long fills keep the web watchdog fed
+    }
+    if (fill) gcValid = true;                      // complete compose: cache is now the truth
+    return;
+  }
   for (int yy = 0; yy < h; yy++)
     for (int xx = 0; xx < w; xx++) {
       int t8;
@@ -2518,16 +2632,26 @@ static void opsApplyClip() {
 static void canvasThickLine(int x0, int y0, int x1, int y1, int t,
                             uint8_t r, uint8_t g, uint8_t b) {
   if (t <= 1) { panelLine(x0, y0, x1, y1, r, g, b); return; }
+  // v0.3.2 perf: the old loop stamped a FULL t x t rect at every Bresenham step -- each
+  // stroke pixel written ~t times plus a fillRect call per step (~97 ms per seaweed
+  // strand in the aquarium). The union of consecutive unit-step stamps is exactly the
+  // previous coverage plus the stamp's LEADING edges, so: one initial stamp, then one
+  // t-px column per x-step and one t-px row per y-step. Identical rendered coverage,
+  // every pixel written once (which also blends correctly -- the old overlap
+  // double-blended under batch alpha).
   const int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
   const int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
   int err = dx + dy;
   const int off = t >> 1;
+  panelFillRect(x0 - off, y0 - off, t, t, r, g, b);          // the starting stamp
   for (;;) {
-    panelFillRect(x0 - off, y0 - off, t, t, r, g, b);
     if (x0 == x1 && y0 == y1) break;
     const int e2 = 2 * err;
-    if (e2 >= dy) { err += dy; x0 += sx; }
-    if (e2 <= dx) { err += dx; y0 += sy; }
+    bool mx = false, my = false;
+    if (e2 >= dy) { err += dy; x0 += sx; mx = true; }
+    if (e2 <= dx) { err += dx; y0 += sy; my = true; }
+    if (mx) panelVLine(x0 + (sx > 0 ? off : -off), y0 - off, t, r, g, b);   // leading column
+    if (my) panelHLine(x0 - off, y0 + (sy > 0 ? off : -off), t, r, g, b);   // leading row
   }
 }
 
@@ -2866,10 +2990,14 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
   // (identity + ORIGIN translate for v1 clients, so their batches decode unchanged).
   #define BXY(o)  const int x = xfX(bops16(p+i+(o)), bops16(p+i+(o)+2)), \
                             y = xfY(bops16(p+i+(o)), bops16(p+i+(o)+2))
+  // Per-opcode cost histogram (serialDebug diag, v0.3.2 perf hunt): which opcode eats a batch.
+  static uint32_t opMs[0x28], opCnt[0x28]; static uint8_t opAlpha; static uint32_t opT0;
+  if (depth == 0 && gSerialDebug) { memset(opMs,0,sizeof(opMs)); memset(opCnt,0,sizeof(opCnt)); opAlpha = 255; opT0 = millis(); }
   while (i < len) {
     opsYieldMaybe();                              // resilience: cap CPU hog per batch
     panelSetBlend((uint8_t)gOpsBlend, gBinAlpha); // per op: batch mode + batch alpha
     const uint8_t opb = p[i++];
+    const uint32_t tOp0 = gSerialDebug ? millis() : 0;
     switch (opb) {
       case 0x01: { BOPS_NEED(3);
         panelFillRect(0, 0, gPanel.panelW, gPanel.panelH, p[i], p[i+1], p[i+2]); i += 3; break; }
@@ -2936,6 +3064,7 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
           vy[k] = xfY(bops16(p + q + k * 4), bops16(p + q + k * 4 + 2));
         }
         const bool aa = (fl & 4) != 0;                                               // aa (v2)
+        const uint32_t tPoly0 = gSerialDebug ? millis() : 0;                          // perf diag
         if (fl & 1) canvasPolyFillPts(vx, vy, keep, cr, cg, cb);
         else {
           for (int k = 1; k < keep; k++)
@@ -2946,6 +3075,11 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
             else    canvasThickLine(vx[keep-1], vy[keep-1], vx[0], vy[0], t, cr, cg, cb);
           }
         }
+        if (gSerialDebug) { const uint32_t d = millis() - tPoly0;
+          if (d > 20) { int mnx=vx[0],mxx=vx[0],mny=vy[0],mxy=vy[0];
+            for (int k=1;k<keep;k++){ if(vx[k]<mnx)mnx=vx[k]; if(vx[k]>mxx)mxx=vx[k]; if(vy[k]<mny)mny=vy[k]; if(vy[k]>mxy)mxy=vy[k]; }
+            printf("[POLY] n=%u fl=%02x t=%u box=%dx%d %lums\n", (unsigned)keep, fl, (unsigned)t,
+                   mxx-mnx+1, mxy-mny+1, (unsigned long)d); } }
         i += 6 + (size_t)n * 4; break; }
       case 0x0E: { BOPS_NEED(8); BXY(0);
         const int w = xfW(bops16(p+i+4)), h = xfH(bops16(p+i+6));
@@ -3090,11 +3224,19 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
       default: ok = false; break;
     }
     if (!ok) break;
+    if (gSerialDebug && opb < 0x28) { opMs[opb] += millis() - tOp0; opCnt[opb]++; if (opb == 0x15) opAlpha = gBinAlpha; }
     applied++;                                    // counts like the JSON path (state ops too)
   }
   #undef BOPS_NEED
   #undef BXY
   if (depth == 0) {
+    if (gSerialDebug && millis() - opT0 > 100) {   // slow batch: name the culprits
+      char line[160]; int n = snprintf(line, sizeof(line), "[OPS] %lums alpha=%u:", (unsigned long)(millis()-opT0), (unsigned)opAlpha);
+      for (int o = 0; o < 0x28; o++)
+        if (opMs[o] > 10 && n < (int)sizeof(line) - 20)
+          n += snprintf(line + n, sizeof(line) - n, " %02x=%lux/%lums", o, (unsigned long)opCnt[o], (unsigned long)opMs[o]);
+      printf("%s\n", line);
+    }
     gOpsClipOn = false; gOpsBlend = 0; gBinAlpha = 255; xfReset();
     memset(gBinMacroPtr, 0, sizeof(gBinMacroPtr));
     panelClearClip(); panelClearBlend(); panelLayerDiscard();
