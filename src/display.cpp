@@ -69,6 +69,9 @@ static void drawFace(int cx, int cy, const FaceSnap& f, Ink ink, int rowFrom, in
 // (Alex's words) where a plasma blob reads as retro.
 uint8_t effectScaleFor(uint8_t type) {
   if (type == EFFECT_CLOCK || type == EFFECT_NONE || type == EFFECT_SOUNDWALL) return 1;
+  if (type == EFFECT_AQUARIUM) return 4;   // 320x200. Scale 2 measured ~140 ms/rotate (finer
+                                           // PPA input granularity, same scattered output);
+                                           // scale 4 keeps 128 B output bursts -> ~15 ms present.
   return EFFECT_RENDER_SCALE;
 }
 

@@ -162,6 +162,7 @@ static const uint8_t P_MAZE[]    = { EPI_SPEED, EPI_HUE };
 static const uint8_t P_RIPPLE[]  = { EPI_SPEED, EPI_HUE };
 static const uint8_t P_SCOPE[]   = { EPI_HUE };
 static const uint8_t P_SPECTRO[] = { EPI_SPEED };
+static const uint8_t P_AQUA[]    = { EPI_SPEED, EPI_HUE, EPI_DENSITY };
 static const uint8_t P_NONE_[1]  = { 0 };                  // zero-length arrays are not C++
 
 struct EffectDefRow { uint8_t id; const char* title; const uint8_t* p; uint8_t np; };
@@ -178,6 +179,7 @@ static const EffectDefRow DEFS[] = {
   { EFFECT_RIPPLE,    "Beat Ripples",P_RIPPLE, 2 },
   { EFFECT_SCOPE,     "Oscilloscope",P_SCOPE,  1 },
   { EFFECT_SPECTRO,   "Spectrogram", P_SPECTRO,1 },
+  { EFFECT_AQUARIUM,  "Aquarium",    P_AQUA,   3 },
 };
 // Registering an effect in EFFECT_TABLE without a def row (or vice versa) must not
 // compile: the def list is how clients discover the effect's options. EFFECT_COUNT
@@ -799,6 +801,216 @@ static void renderRipple() {
   panelShow();
 }
 
+/* ---- Aquarium (v0.4) --------------------------------------------------------------
+   The companion's aquarium reimagined as a native effect: no streaming, rendered at
+   panel rate on taskDisplay. Everything is sized from W/H so the same renderer serves
+   the LCD (scale-2 surface, 640x400) and the HUB75 matrix (native).
+   Layers, back to front: cached background (water gradient + light shafts + sand --
+   composed ONCE into the framebuffer and snapshot; restored per frame with one DMA
+   copy), surface shimmer, back plants, fish (small first), front plants, bubbles.
+   Params: speed = swim tempo, hue = water tint, density = fish count. */
+struct AqFish { float x, y, vx, bob; uint8_t size, hue; float phase; int8_t dir; };
+struct AqBub  { float x, y, vy, phase; uint8_t r; bool live; };
+struct AqPlant{ int x, h; float phase; uint8_t shade; bool front; };
+#define AQ_MAX_FISH 24
+#define AQ_MAX_BUB  20
+#define AQ_MAX_PLNT 7
+static AqFish  aqFish[AQ_MAX_FISH]; static int aqFishN = 0;
+static AqBub   aqBub[AQ_MAX_BUB];
+static AqPlant aqPlant[AQ_MAX_PLNT]; static int aqPlantN = 0;
+static uint16_t* aqBg = nullptr; static size_t aqBgCap = 0;
+static bool aqBgValid = false; static int aqBgHue = -1; static uint16_t aqBgW = 0, aqBgH = 0;
+
+static void aqComposeBg(int W, int H, int hue) {
+  // Water: vertical gradient, deep at the bottom. Tint follows the hue param (default teal-blue).
+  const uint8_t baseHue = (uint8_t)(hue >= 0 ? hue : 148);
+  uint8_t tr, tg, tb, br_, bg_, bb_;
+  hsv(baseHue, tr, tg, tb);                       // top: brighter water
+  hsv((uint8_t)(baseHue + 12), br_, bg_, bb_);    // bottom: deeper, darker
+  for (int y = 0; y < H; y++) {
+    const int t = 255 * y / (H > 1 ? H - 1 : 1);
+    const uint8_t r = (uint8_t)(((int)tr * 90 * (255 - t) / 255 + (int)br_ * 28 * t / 255) / 255);
+    const uint8_t g = (uint8_t)(((int)tg * 110 * (255 - t) / 255 + (int)bg_ * 40 * t / 255) / 255);
+    const uint8_t b = (uint8_t)(((int)tb * 160 * (255 - t) / 255 + (int)bb_ * 80 * t / 255) / 255);
+    panelHLine(0, y, W, r, g, b);
+  }
+  // Light shafts: three slanted additive bands from the surface, fading with depth.
+  for (int sfi = 0; sfi < 3; sfi++) {
+    const int topX = W * (12 + sfi * 30) / 100, topW = W / 14 + sfi * (W / 60);
+    const int drift = W / 5;                       // lean right as they go down
+    for (int y = 0; y < H * 82 / 100; y++) {
+      const int a = 46 - 40 * y / H;               // fade with depth
+      if (a <= 2) break;
+      panelSetBlend(1, (uint8_t)a);
+      const int xo = topX + drift * y / H;
+      panelHLine(xo, y, topW + y / 6, 255, 250, 210);
+    }
+    panelClearBlend();
+  }
+  // Sand: bottom band with dither speckle and a few pebbles.
+  const int sandTop = H * 86 / 100;
+  for (int y = sandTop; y < H; y++) {
+    const int t = 255 * (y - sandTop) / (H - sandTop > 0 ? H - sandTop : 1);
+    panelHLine(0, y, W, (uint8_t)(178 - t / 8), (uint8_t)(154 - t / 7), (uint8_t)(96 - t / 9));
+  }
+  for (int i = 0; i < W / 12; i++) {               // speckle
+    const int px = (i * 2654435761u) % W, py = sandTop + ((i * 40503u) % (H - sandTop));
+    panelPixel(px, py, 140, 118, 74);
+  }
+  for (int i = 0; i < 5; i++) {                    // pebbles
+    const int px = W * (7 + i * 19) / 100, pr = 2 + (i % 3);
+    panelCircle(px, H - (H - sandTop) / 3, pr, true, 120, 104, 78);
+    panelCircle(px, H - (H - sandTop) / 3, pr, false, 96, 82, 60);
+  }
+}
+
+static void aqSeed(int W, int H) {
+  const int dens = gEffectDensity;                 // -1 = effect default
+  aqFishN = dens < 0 ? (AQ_MAX_FISH / 2) : (3 + dens * (AQ_MAX_FISH - 3) / 100);
+  if (aqFishN > AQ_MAX_FISH) aqFishN = AQ_MAX_FISH;
+  const uint8_t fishHues[6] = { 18, 32, 6, 205, 90, 240 };   // gold, orange, red, blue, green, violet
+  for (int i = 0; i < aqFishN; i++) {
+    AqFish& f = aqFish[i];
+    const uint32_t rnd = i * 2654435761u;
+    f.size  = (uint8_t)(H / 16 + (rnd % (H / 10)));          // ~body length
+    f.x     = (float)((rnd >> 8) % W);
+    f.y     = (float)(H / 8 + ((rnd >> 16) % (H * 6 / 10)));
+    f.dir   = (i & 1) ? 1 : -1;
+    f.vx    = 0.35f + (float)((rnd >> 4) % 100) / 160.0f;    // px/tick at speed 5
+    f.bob   = 0.0f;
+    f.hue   = (uint8_t)(fishHues[i % 6] + (gEffectHue >= 0 ? gEffectHue : 0));
+    f.phase = (float)(rnd % 628) / 100.0f;
+  }
+  aqPlantN = 3 + (W > 300 ? 2 : 0) + (W > 500 ? 2 : 0);
+  if (aqPlantN > AQ_MAX_PLNT) aqPlantN = AQ_MAX_PLNT;
+  for (int i = 0; i < aqPlantN; i++) {
+    AqPlant& pl = aqPlant[i];
+    const uint32_t rnd = (i + 3) * 40503u;
+    pl.x     = W * (6 + i * (88 / (aqPlantN > 1 ? aqPlantN - 1 : 1))) / 100;
+    pl.h     = H * (22 + (rnd % 30)) / 100;
+    pl.phase = (float)(rnd % 628) / 100.0f;
+    pl.shade = (uint8_t)(rnd % 3);
+    pl.front = (i % 3 == 2);                       // every third plant in front of the fish
+  }
+  for (int i = 0; i < AQ_MAX_BUB; i++) aqBub[i].live = false;
+}
+
+static void aqDrawPlant(const AqPlant& pl, int W, int H, float t) {
+  const int sandTop = H * 86 / 100;
+  const float sway = sinf(t * 0.6f + pl.phase);
+  const uint8_t g0 = (uint8_t)(120 + pl.shade * 30);
+  const int segs = 7;
+  int px = pl.x, py = sandTop + 2;
+  const int thick = pl.front ? (H / 90 + 2) : (H / 120 + 1);
+  for (int sg = 1; sg <= segs; sg++) {
+    const float fr = (float)sg / segs;
+    const int ny = sandTop + 2 - (int)(pl.h * fr);
+    const int nx = pl.x + (int)(sway * fr * fr * (H / 14));   // tip sways most
+    for (int k = 0; k < thick; k++)
+      panelLine(px + k, py, nx + k, ny, 24, g0, 46);
+    if (sg > 1 && sg < segs) {                    // leaves off alternating sides
+      const int ldir = (sg & 1) ? 1 : -1;
+      panelEllipse(nx + ldir * (H / 60 + 2), ny + 2, H / 44 + 2, H / 110 + 1, true, 30, (uint8_t)(g0 + 18), 52);
+    }
+    px = nx; py = ny;
+  }
+}
+
+static void aqDrawFish(const AqFish& f, float t) {
+  uint8_t r, g, b; hsv(f.hue, r, g, b);
+  const uint8_t dr = (uint8_t)(r * 3 / 4), dg = (uint8_t)(g * 3 / 4), db = (uint8_t)(b * 3 / 4);
+  const int L = f.size, hh = L / 3 + 1;            // body half-length / half-height
+  const int cx = (int)f.x, cy = (int)(f.y + sinf(t + f.phase) * 2.0f);
+  const float flap = sinf(t * 3.0f + f.phase);
+  // tail (behind the body)
+  const int rear = cx - f.dir * (L / 2);
+  const int tl = L / 2 + (int)(flap * (L / 6));
+  panelTriangle(rear, cy, rear - f.dir * tl, cy - hh + (int)(flap * 2), rear - f.dir * tl, cy + hh - (int)(flap * 2),
+                true, dr, dg, db);
+  // body + top fin
+  panelEllipse(cx, cy, L / 2, hh, true, r, g, b);
+  panelTriangle(cx - f.dir * (L / 6), cy - hh, cx + f.dir * (L / 8), cy - hh - hh / 2 - 1,
+                cx + f.dir * (L / 4), cy - hh + 1, true, dr, dg, db);
+  // eye with glint
+  const int ex = cx + f.dir * (L / 2 - L / 6), ey = cy - hh / 3;
+  panelCircle(ex, ey, L > 24 ? 2 : 1, true, 15, 15, 20);
+  if (L > 24) panelPixel(ex, ey - 1, 240, 240, 245);
+}
+
+static void renderAquarium() {
+  const int W = panelInfo().width, H = panelInfo().height;
+  const float t = (float)fxFrame / 24.0f;
+  uint32_t tm0 = millis(), tmBg = 0, tmPl = 0, tmFish = 0, tmShow = 0;   // [AQ] diag
+  const int hue = gEffectHue;
+  // Background snapshot: (re)compose when absent, or when hue/geometry changed.
+  if (!aqBgValid || aqBgHue != hue || aqBgW != W || aqBgH != H) {
+    aqComposeBg(W, H, hue);
+    aqBgValid = panelSnapshotFull(&aqBg, &aqBgCap);
+    aqBgHue = hue; aqBgW = W; aqBgH = H;
+    if (aqBgValid) aqSeed(W, H);                   // seed on the first good compose
+  } else {
+    panelRestoreFull(aqBg);
+  }
+  // Surface shimmer: two light rows sliding slowly.
+  { const int sy = H / 24 + 1;
+    panelSetBlend(1, 26);
+    const int off = (int)(sinf(t * 0.5f) * (W / 40));
+    panelHLine(W / 10 + off, sy, W * 8 / 10, 220, 235, 255);
+    panelHLine(W / 8 - off, sy + 2, W * 3 / 4, 200, 225, 250);
+    panelClearBlend();
+  }
+  tmBg = millis();
+  for (int i = 0; i < aqPlantN; i++) if (!aqPlant[i].front) aqDrawPlant(aqPlant[i], W, H, t);
+  // Fish: update + draw, smallest (farthest) first.
+  const float spd = (float)gEffectSpeed / 5.0f;
+  for (int pass = 0; pass < 2; pass++)
+    for (int i = 0; i < aqFishN; i++) {
+      AqFish& f = aqFish[i];
+      const bool small = f.size < (uint8_t)(H / 11);
+      if ((pass == 0) != small) continue;
+      if (pass == 1 || true) { /* update once, on its draw pass */ }
+      f.x += f.vx * f.dir * spd * 0.8f;          // calm default; speed param scales the tempo
+      const int margin = f.size;
+      if (f.dir > 0 && f.x > W - margin) f.dir = -1;
+      if (f.dir < 0 && f.x < margin)     f.dir = 1;
+      f.y += sinf(t * 0.7f + f.phase * 2.0f) * 0.10f * spd;
+      const float yMin = (float)(H / 8), yMax = (float)(H * 80 / 100);
+      if (f.y < yMin) f.y = yMin; if (f.y > yMax) f.y = yMax;
+      aqDrawFish(f, t);
+      // occasional bubble from the mouth
+      if (((fxTick + i * 37) % 256) == 0)
+        for (int bi = 0; bi < AQ_MAX_BUB; bi++) if (!aqBub[bi].live) {
+          aqBub[bi] = { f.x + f.dir * (f.size / 2), f.y - 2, 0.5f + (float)(i % 3) / 4, (float)i, (uint8_t)(1 + (i % 2)), true };
+          break;
+        }
+    }
+  tmFish = millis();
+  for (int i = 0; i < aqPlantN; i++) if (aqPlant[i].front) aqDrawPlant(aqPlant[i], W, H, t);
+  // Bubbles: rise with wobble, pop near the surface. A vent by the second plant.
+  if ((fxTick % 96) == 0 && aqPlantN > 1)
+    for (int bi = 0; bi < AQ_MAX_BUB; bi++) if (!aqBub[bi].live) {
+      aqBub[bi] = { (float)aqPlant[1].x, (float)(H * 84 / 100), 0.6f, (float)(fxTick % 7), 2, true };
+      break;
+    }
+  for (int bi = 0; bi < AQ_MAX_BUB; bi++) {
+    AqBub& bu = aqBub[bi];
+    if (!bu.live) continue;
+    bu.y -= bu.vy * spd * 1.1f;
+    bu.x += sinf(t * 2.0f + bu.phase) * 0.5f;
+    if (bu.y < (float)(H / 18)) { bu.live = false; continue; }
+    panelCircle((int)bu.x, (int)bu.y, bu.r, false, 210, 230, 250);
+    if (bu.r > 1) panelPixel((int)bu.x - 1, (int)bu.y - 1, 245, 250, 255);
+  }
+  tmPl = millis();
+  panelShow();
+  tmShow = millis();
+  if (gSerialDebug) { static uint32_t lastAq = 0;
+    if (tmShow - lastAq > 2000) { lastAq = tmShow;
+      printf("[AQ] frame %lums: bg+shim %lu draw1 %lu fish %lu draw2+bub %lu show %lu\n",
+             (unsigned long)(tmShow - tm0), (unsigned long)(tmBg - tm0), 0UL,
+             (unsigned long)(tmFish - tmBg), (unsigned long)(tmPl - tmFish), (unsigned long)(tmShow - tmPl)); } }
+}
+
 void effectReset(uint8_t type) {
   fxBuildLUTs();
   fxFrame = 0; fxTick = 0;
@@ -838,6 +1050,7 @@ void effectReset(uint8_t type) {
     case EFFECT_RIPPLE:    memset(ripPool, 0, sizeof(ripPool)); audioMaybeStart(); break;
     case EFFECT_SCOPE:     audioMaybeStart(); break;
     case EFFECT_SPECTRO:   panelClear(); audioMaybeStart(); break;
+    case EFFECT_AQUARIUM:  aqBgValid = false; break;   // recompose bg + reseed on entry
     default: break;
   }
 }
@@ -1094,6 +1307,7 @@ void effectRender(uint8_t type) {
     case EFFECT_RIPPLE:    renderRipple();    break;
     case EFFECT_SCOPE:     renderScope();     break;
     case EFFECT_SPECTRO:   renderSpectrogram(); break;
+    case EFFECT_AQUARIUM:  renderAquarium();  break;
     // EFFECT_SOUNDWALL never reaches effectRender: taskDisplay routes it to
     // effectSoundwallTick() and keeps the wall renderer running.
     default: break;
