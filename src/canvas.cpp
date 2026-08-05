@@ -464,6 +464,20 @@ struct AtlasSheet {
   bool          persisted;                 // a same-named /atlas file exists
 };
 static AtlasSheet atlasTab[ATLAS_MAX_SHEETS];
+// Atlas store lock (v0.3.1): uploads/saves run on the httpd worker while the stream pump
+// (taskWeb) blits from resident sheets -- an upload's atlasEvictFor/realloc under a blit was
+// a use-after-free, previously prevented by 409ing every atlas REST call while a stream was
+// open. That gate made a streaming app unable to (re)provision its own sheets -- after a
+// reboot cleared the resident store, the aquarium could never get its sprites back ("no
+// fishes"). This recursive mutex serializes store access instead, so the 409s could go.
+// Held across the FATFS write in canvasAtlasSave (~seconds for a big sheet): the stream
+// stalls for that save, which skip-if-identical makes a once-per-new-sheet event.
+static SemaphoreHandle_t gAtlasMx = nullptr;
+struct AtlasLock {
+  AtlasLock()  { if (!gAtlasMx) gAtlasMx = xSemaphoreCreateRecursiveMutex();
+                 xSemaphoreTakeRecursive(gAtlasMx, portMAX_DELAY); }
+  ~AtlasLock() { xSemaphoreGiveRecursive(gAtlasMx); }
+};
 static int        atlasBound = -1;         // sticky bind (the ops "atlas" op); -1 = none
 
 // In-flight upload staging (double buffer: published only at Commit)
@@ -537,6 +551,7 @@ static int atlasFreeSlotIndex() {
 }
 
 int canvasAtlasBegin(const char* name, uint8_t fmt, uint16_t tileW, uint16_t tileH, uint16_t tiles) {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   if (!canvasAtlasNameOk(name))      return 400;
   if (fmt != 2 && fmt != 3)          return 400;
   if (!tileW || !tileH || !tiles)    return 400;
@@ -554,6 +569,7 @@ int canvasAtlasBegin(const char* name, uint8_t fmt, uint16_t tileW, uint16_t til
 }
 
 void canvasAtlasFeed(const uint8_t* data, size_t n) {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   if (!atlasStage) return;
   if (atlasStageOff + n > atlasStageTotal) n = atlasStageTotal - atlasStageOff;
   memcpy(atlasStage + atlasStageOff, data, n);
@@ -563,10 +579,12 @@ void canvasAtlasFeed(const uint8_t* data, size_t n) {
 // Drop a half-fed staging buffer NOW (an aborted upload used to park up to 2 MB of PSRAM
 // until the next Begin happened to reclaim it).
 void canvasAtlasAbort() {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   if (atlasStage) { free(atlasStage); atlasStage = nullptr; }
 }
 
 int canvasAtlasCommit() {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   if (!atlasStage || atlasStageOff != atlasStageTotal) {        // short upload
     if (atlasStage) { free(atlasStage); atlasStage = nullptr; }
     return 400;
@@ -612,6 +630,7 @@ static int atlasLoadFromFs(const char* name) {
 }
 
 int canvasAtlasBind(const char* name) {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   int i = atlasFindResident(name);
   if (i < 0) i = atlasLoadFromFs(name);    // lazy load; -1 when it exists nowhere
   atlasBound = i;
@@ -626,6 +645,7 @@ int canvasAtlasBoundHandle() { return atlasBound; }
 // (a plain 1x1 panelPixel when scale is 1). Transparency (magenta) skips as always.
 bool canvasAtlasBlitEx(int handle, uint16_t i, int x, int y,
                        bool flipH, bool flipV, uint16_t rot, uint8_t scale) {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   if (handle < 0 || handle >= ATLAS_MAX_SHEETS || !atlasTab[handle].name[0]) return false;
   AtlasSheet& a = atlasTab[handle];
   if (i >= a.tiles) return false;
@@ -671,6 +691,7 @@ bool canvasAtlasBlitFrom(int handle, uint16_t i, int x, int y) {
 // composes with flip/rotate the same way the integer path does. Transparency skipped.
 bool canvasAtlasBlitScaled(int handle, uint16_t i, int x, int y,
                            bool flipH, bool flipV, uint16_t rot, float scale) {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   if (handle < 0 || handle >= ATLAS_MAX_SHEETS || !atlasTab[handle].name[0]) return false;
   AtlasSheet& a = atlasTab[handle];
   if (i >= a.tiles) return false;
@@ -717,6 +738,7 @@ bool canvasAtlasBlitScaled(int handle, uint16_t i, int x, int y,
 }
 
 const uint8_t* canvasAtlasData(const char* name, uint8_t hdr[12], size_t* bytes) {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   const int i = atlasFindResident(name);
   if (i < 0) return nullptr;
   const AtlasSheet& a = atlasTab[i];
@@ -730,6 +752,7 @@ const uint8_t* canvasAtlasData(const char* name, uint8_t hdr[12], size_t* bytes)
 }
 
 int canvasAtlasSave(const char* name) {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   if (!sfFsReady)                return 503;
   const int i = atlasFindResident(name);
   if (i < 0)                     return 404;
@@ -785,6 +808,7 @@ int canvasAtlasSave(const char* name) {
 }
 
 int canvasAtlasDelete(const char* name) {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   bool any = false;
   const int i = atlasFindResident(name);
   if (i >= 0) { atlasFreeSlot(i); any = true; }
@@ -809,6 +833,7 @@ static void atlasRowJson(char* out, size_t cap, const char* name, uint16_t tiles
 }
 
 void canvasAtlasListJson(void (*sink)(const char*)) {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   char row[192];
   bool first = true;
   sink("[");
@@ -849,6 +874,7 @@ void canvasAtlasListJson(void (*sink)(const char*)) {
 }
 
 void canvasAtlasStateJson(char* out, size_t cap) {
+  AtlasLock lk;   // serialize store access (see gAtlasMx)
   size_t o = (size_t)snprintf(out, cap, "{\"bound\":%s%s%s,\"loaded\":[",
     atlasBound >= 0 ? "\"" : "", atlasBound >= 0 ? atlasTab[atlasBound].name : "null",
     atlasBound >= 0 ? "\"" : "");

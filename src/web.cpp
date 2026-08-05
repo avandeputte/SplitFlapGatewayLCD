@@ -3913,9 +3913,10 @@ static esp_err_t atlasRawReply(httpd_req_t* r, int e) {
   return httpxErr(r, 503, "Out of memory");
 }
 static esp_err_t handleApiAtlasPut(httpd_req_t* r) {
-  // The stream pump (taskWeb) may be mid-blit from a resident sheet; an upload here can
-  // evict/realloc that very sheet (atlasEvictFor) -> use-after-free. Same guard as anim PUT.
-  if (csBusy(r)) return ESP_OK;
+  // NO csBusy gate (v0.3.1): the atlas store has its own lock now (gAtlasMx in canvas.cpp),
+  // so an upload can no longer evict/realloc a sheet out from under the stream pump's blit.
+  // The old 409 meant a STREAMING app could never (re)provision its own sheets -- after a
+  // reboot cleared the resident store, the aquarium's sprites were gone for good.
   if (ESP.getFreeHeap() < CANVAS_MIN_UPLOAD_HEAP) return atlasRawReply(r, 507);   // stressed: back off
   const String name = httpxPathTail(r, "/api/canvas/atlas/");
   if (!canvasAtlasNameOk(name.c_str())) return atlasRawReply(r, 400);
@@ -4007,7 +4008,7 @@ static esp_err_t handleApiAtlasPost(httpd_req_t* r) {
   return httpxSend(r, 200, "application/json", "{\"ok\":true}");
 }
 static esp_err_t handleApiAtlasDelete(httpd_req_t* r) {
-  if (csBusy(r)) return ESP_OK;      // delete frees a resident sheet the stream pump may be blitting
+  // NO csBusy gate (v0.3.1): the store lock (gAtlasMx) serializes against the pump's blits.
   const String name = httpxPathTail(r, "/api/canvas/atlas/");
   if (canvasAtlasDelete(name.c_str()) != 0) return atlasRawReply(r, 404);
   { char cd[64]; snprintf(cd, sizeof(cd), "atlas '%.32s' deleted", name.c_str()); logCommand('R', cd); }
