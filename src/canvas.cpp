@@ -656,8 +656,12 @@ bool canvasAtlasBlitEx(int handle, uint16_t i, int x, int y,
   // Identity fast path (v0.3.3): no flip/rot, scale 1, no blend/layer -- the common sprite
   // case (the aquarium's fish: 5 blits/frame, ~16 ms via per-pixel panelPixel). Walk each
   // tile row batching contiguous NON-transparent runs into panelBlitRow888 span writes.
-  if (rot == 0 && scale == 1 && !panelBlendActive() && !panelLayerActive()) {
-    static uint8_t runBuf[1024 * 3];               // one tile row of rgb888 (tiles cap at 1024 px wide)
+  if (rot == 0 && !panelBlendActive() && !panelLayerActive()) {
+    // Run-batched blit for rot-0 sprites at any integer scale (v0.3.3): contiguous opaque
+    // runs land as row spans; at scale s each source run becomes an s*wide span drawn s
+    // times. Flips are pure index remaps. The aquarium's fish (scale 2, flipped) ride this.
+    static uint8_t runBuf[256 * 3];                // one run, source resolution (chunked at 256)
+    static uint8_t sclBuf[256 * 4 * 3];            // the scaled run (s <= 4)
     for (int row = 0; row < th; row++) {
       const int srow = flipV ? th - 1 - row : row;                     // flips are index remaps here
       const uint8_t* rp = t + (size_t)srow * tw * a.fmt;
@@ -673,11 +677,19 @@ bool canvasAtlasBlitEx(int handle, uint16_t i, int x, int y,
                           cg = (uint8_t)(((v >> 5)  & 0x3F) << 2);
                           cb = (uint8_t)((v & 0x1F) << 3); } }
         }
-        if (opaque && runLen < 1024) {
+        if (opaque && runLen < 256) {
           if (runStart < 0) runStart = col;
           runBuf[runLen*3] = cr; runBuf[runLen*3+1] = cg; runBuf[runLen*3+2] = cb; runLen++;
-        } else if (runStart >= 0) {                // run ended: land it as one span
-          panelBlitRow888(x + runStart, y + row, runLen, runBuf);
+        } else if (runStart >= 0) {                // run ended (or chunk full): land it
+          if (scale == 1) {
+            panelBlitRow888(x + runStart, y + row, runLen, runBuf);
+          } else {
+            for (int i2 = 0; i2 < runLen; i2++)    // expand horizontally once...
+              for (int k = 0; k < scale; k++)
+                memcpy(sclBuf + ((size_t)i2 * scale + k) * 3, runBuf + (size_t)i2 * 3, 3);
+            for (int k = 0; k < scale; k++)        // ...then land s identical rows
+              panelBlitRow888(x + runStart * scale, y + row * scale + k, runLen * scale, sclBuf);
+          }
           runStart = -1; runLen = 0;
           if (opaque) { runStart = col; runBuf[0]=cr; runBuf[1]=cg; runBuf[2]=cb; runLen=1; }
         }

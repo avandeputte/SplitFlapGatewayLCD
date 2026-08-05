@@ -1074,6 +1074,16 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
     gPpa = nullptr;
     printf("[PANEL] PPA unavailable -- CPU rotate fallback\n");
   }
+  // One-shot copy benchmark (v0.3.3): is the 2 MB blit descriptor-bound or bandwidth-bound?
+  // Printed once at boot; fb[0]/fb[1] are 128-aligned PSRAM so the DMA path qualifies.
+  { const size_t bytes = (size_t)W * H * sizeof(px_t);
+    uint32_t t0 = micros(); memcpy(fb[1], fb[0], bytes);        uint32_t tCpu = micros() - t0;
+    t0 = micros();          panelFastCopy(fb[1], fb[0], bytes); uint32_t tDma1 = micros() - t0;
+    t0 = micros();          panelFastCopy(fb[1], fb[0], bytes); uint32_t tDma2 = micros() - t0;
+    printf("[PANEL] copy bench %ukB: cpu %luus dma %luus/%luus (%s)\n",
+           (unsigned)(bytes / 1024), (unsigned long)tCpu, (unsigned long)tDma1,
+           (unsigned long)tDma2, gMcp ? "axi-gdma" : "fallback");
+  }
   if (gPpa) {                                    // pipelined present (see gRotDone)
     if (!gRotDone) gRotDone = xSemaphoreCreateBinary();
     ppa_event_callbacks_t pcb = {};
