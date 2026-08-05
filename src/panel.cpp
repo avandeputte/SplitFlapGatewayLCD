@@ -276,26 +276,31 @@ void panelHLine(int x, int y, int w, uint8_t r, uint8_t g, uint8_t b) {
     if (bgrOrder) { uint8_t t = sr; sr = sb; sb = t; }   // match pack565/readPixelRGB order
     const uint8_t m = gBlendMode, a = gBlendAlpha;
     px_t* p = fb[drawBuf] + (size_t)y * W + x;
-    if (m == 1 && a == 255) {                    // ADD at full alpha == saturating add (the
-      for (int i = 0; i < w; i++) {              // aquarium's light shafts) -- ~3x the generic lane
-        const px_t v = p[i];
-        const uint8_t r5 = (v >> 11) & 0x1F, g6 = (v >> 5) & 0x3F, b5 = v & 0x1F;
-        int nr = ((r5 << 3) | (r5 >> 2)) + sr; if (nr > 255) nr = 255;
-        int ng = ((g6 << 2) | (g6 >> 4)) + sg; if (ng > 255) ng = 255;
-        int nb = ((b5 << 3) | (b5 >> 2)) + sb; if (nb > 255) nb = 255;
-        p[i] = (px_t)(((nr & 0xF8) << 8) | ((ng & 0xFC) << 3) | ((unsigned)nb >> 3));
-      }
-      return;
+    // Per-mode specialized loops (v0.3.3): hoist the mode/alpha switch OUT of the pixel
+    // loop -- 3 blendCh calls per pixel were ~48 ms per light-shaft quad. Macros keep the
+    // unpack/pack identical to readPixelRGB/pack565 so results match panelPixel exactly.
+    #define SPAN_UNPACK(v) const uint8_t r5=((v)>>11)&0x1F, g6=((v)>>5)&0x3F, b5=(v)&0x1F;       const int dr=(r5<<3)|(r5>>2), dg=(g6<<2)|(g6>>4), db=(b5<<3)|(b5>>2)
+    #define SPAN_PACK(nr,ng,nb) (px_t)((((nr)&0xF8)<<8) | (((ng)&0xFC)<<3) | (((unsigned)(nb))>>3))
+    #define SPAN_LOOP(exprR,exprG,exprB) for (int i=0;i<w;i++){ const px_t v=p[i]; SPAN_UNPACK(v);       int nr=(exprR), ng=(exprG), nb=(exprB);       if(nr>255)nr=255; if(nr<0)nr=0; if(ng>255)ng=255; if(ng<0)ng=0; if(nb>255)nb=255; if(nb<0)nb=0;       p[i]=SPAN_PACK(nr,ng,nb); }
+    const int AR = sr, AG = sg, AB = sb, AL = a;
+    switch (m) {
+      case 1:  SPAN_LOOP(dr + AR*AL/255, dg + AG*AL/255, db + AB*AL/255); break;              // add
+      case 2:  SPAN_LOOP(((dr*AR/255)*AL + dr*(255-AL))/255,                                   // multiply
+                         ((dg*AG/255)*AL + dg*(255-AL))/255,
+                         ((db*AB/255)*AL + db*(255-AL))/255); break;
+      case 3:  SPAN_LOOP(((255-(255-AR)*(255-dr)/255)*AL + dr*(255-AL))/255,                   // screen
+                         ((255-(255-AG)*(255-dg)/255)*AL + dg*(255-AL))/255,
+                         ((255-(255-AB)*(255-db)/255)*AL + db*(255-AL))/255); break;
+      case 4:  SPAN_LOOP((AR*AL/255) > dr ? (AR*AL/255) : dr,                                  // max/lighten
+                         (AG*AL/255) > dg ? (AG*AL/255) : dg,
+                         (AB*AL/255) > db ? (AB*AL/255) : db); break;
+      default: SPAN_LOOP((AR*AL + dr*(255-AL))/255,                                            // over
+                         (AG*AL + dg*(255-AL))/255,
+                         (AB*AL + db*(255-AL))/255); break;
     }
-    for (int i = 0; i < w; i++) {
-      const px_t v = p[i];
-      const uint8_t r5 = (v >> 11) & 0x1F, g6 = (v >> 5) & 0x3F, b5 = v & 0x1F;
-      const uint8_t dr = (uint8_t)((r5 << 3) | (r5 >> 2));       // bit-replicate, as readPixelRGB
-      const uint8_t dg = (uint8_t)((g6 << 2) | (g6 >> 4));
-      const uint8_t db = (uint8_t)((b5 << 3) | (b5 >> 2));
-      const uint8_t nr = blendCh(m, sr, dr, a), ng = blendCh(m, sg, dg, a), nb = blendCh(m, sb, db, a);
-      p[i] = (px_t)(((nr & 0xF8) << 8) | ((ng & 0xFC) << 3) | (nb >> 3));
-    }
+    #undef SPAN_LOOP
+    #undef SPAN_PACK
+    #undef SPAN_UNPACK
     return;
   }
   if (x < clipX0) { w -= clipX0 - x; x = clipX0; }
@@ -341,6 +346,21 @@ void panelFillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) 
     px_t* p = fb[drawBuf] + (size_t)yy * W + x0;
     for (int i = x1 - x0; i > 0; i--) *p++ = v;
   }
+}
+
+// Full-frame native snapshot/restore (v0.3.3): the static-prefix replay's storage. Both
+// operate on fb[drawBuf] at the CURRENT logical geometry; the caller keys validity on W/H.
+bool panelSnapshotFull(uint16_t** buf, size_t* cap) {
+  if (!info.ok) return false;
+  const size_t need = (size_t)W * H * sizeof(px_t);
+  if (*cap < need) { free(*buf); *buf = (uint16_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM); *cap = *buf ? need : 0; }
+  if (!*buf) return false;
+  memcpy(*buf, fb[drawBuf], need);
+  return true;
+}
+void panelRestoreFull(const uint16_t* buf) {
+  if (!info.ok || !buf) return;
+  memcpy(fb[drawBuf], buf, (size_t)W * H * sizeof(px_t));
 }
 
 // v0.3.2 perf: expose the packer + a native-565 row blit for the gradient cache. The cache

@@ -55,6 +55,8 @@ void panelVLine(int x, int y, int h, uint8_t r, uint8_t g, uint8_t b);
 void panelFillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b);
 // Row blitters (v3.1): one horizontal run of n pixels at (x,y) -- ~4-6x the per-pixel
 // path for frame-shaped draws. 565 is big-endian, as every wire format here is.
+bool panelSnapshotFull(uint16_t** buf, size_t* cap);       // fb[drawBuf] -> PSRAM (prefix replay)
+void panelRestoreFull(const uint16_t* buf);                // PSRAM -> fb[drawBuf]
 uint16_t panelPack565(uint8_t r, uint8_t g, uint8_t b);   // the panel's own packing (bgr-aware)
 bool panelLayerActive();                                   // an offscreen layer is open
 void panelBlitRowNative(int x, int y, int n, const uint16_t* row);   // pre-packed 565 row (gradient cache)

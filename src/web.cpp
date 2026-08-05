@@ -1602,6 +1602,7 @@ static bool csExec() {
 // The stream pump: called from taskWeb every tick while a stream is open. Drains and
 // executes whatever has arrived, up to a per-tick byte budget so taskWeb's other
 // duties (SSE, watchdog cover) keep their cadence.
+static uint32_t csSkipped = 0;   // stale ops batches dropped by freshness coalescing (v0.3.3)
 void canvasStreamPump() {
   // The wall/effect/timer took the panel back (dispReturnToWall) while this stream was still
   // open: close it so a client that didn't stand its app down can't keep painting over the
@@ -1644,6 +1645,21 @@ void canvasStreamPump() {
     wdgWebMs  = millis();
     if (cs.inRec && cs.got == cs.need) {          // record complete (covers len-0 records)
       cs.inRec = false; cs.hdrN = 0;
+      // Freshness coalescing (v0.3.3): the companion generates faster than we execute, so
+      // ops batches queue in TCP and the panel lags reality. When ANOTHER complete record
+      // is already waiting in the socket, drop this ops batch instead of executing it --
+      // the newer one supersedes it. Only small 0x03/0x06 records (whole-frame batches);
+      // frames/rects/atlas/show pass through untouched.
+      if ((cs.type == 0x03 || cs.type == 0x06) && cs.need <= 4096) {
+        int avail = 0; { uint8_t peek;
+          avail = recv(httpd_req_to_sockfd(cs.req), (char*)&peek, 1, MSG_PEEK | MSG_DONTWAIT); }
+        if (avail > 0) {                          // more data queued: this batch is stale
+          cs.records++; csSkipped++;
+          if (gSerialDebug && (csSkipped & 15) == 1)
+            printf("[CS] coalesce: %lu stale ops batches dropped\n", (unsigned long)csSkipped);
+          continue;
+        }
+      }
       // Perf telemetry (serialDebug only): per-second record mix -- the one fact that
       // separates "gateway drain-bound" from "companion producer-bound" at low app fps.
       if (gSerialDebug) {
@@ -2977,6 +2993,34 @@ static inline void opsYieldMaybe() {
   }
 }
 
+/* Static-prefix replay (v0.3.3) -- the aquarium insight generalized: an ops app's frame
+   batch usually starts with a byte-identical STATIC SCENE (background gradient, light
+   shafts) followed by the moving tail (fish, bubbles). Recompositing that prefix cost
+   ~190 ms/frame. Protocol, per top-level binary batch:
+     frame N   (CANDIDATE): run normally, record op offsets/opcodes + a copy of the bytes.
+     frame N+1 (SNAPSHOT):  bytes match to an op boundary -> run normally, and at the
+                            prefix end memcpy the framebuffer into a PSRAM snapshot.
+     frame N+2+ (REPLAY):   restore the snapshot with one memcpy, execute only the
+                            prefix's STATE ops (blend/clip/transform -- cheap, keeps the
+                            tail's context identical), skip its draw ops, run the tail.
+   Validity: every skipped draw is pure geometry (no atlas/font/external deps) and the
+   first draw op fully covers the panel opaquely (clear, or a full-panel raw gradient
+   with no prior state ops) so the result is independent of the previous frame. ANY
+   divergence -- bytes, length, panel geometry -- drops back to CANDIDATE for the new
+   batch shape. Macros (depth>0) are not tracked. */
+#define PFX_MAX_OPS 192
+static uint8_t* gPfxBatch = nullptr; static size_t gPfxBatchLen = 0, gPfxBatchCap = 0;
+static uint16_t gPfxOff[PFX_MAX_OPS]; static uint8_t gPfxOpb[PFX_MAX_OPS]; static int gPfxOps = 0;
+static size_t   gPfxEnd = 0;                     // byte end of the validated static prefix
+static uint8_t  gPfxPhase = 0;                   // 0 candidate-pending, 1 snapshot-this-run, 2 replay
+static uint16_t* gPfxSnap = nullptr; static size_t gPfxSnapCap = 0;
+static uint16_t gPfxW = 0, gPfxH = 0;
+static inline bool pfxDrawGeom(uint8_t o) {      // deterministic pure-geometry draw ops
+  return (o >= 0x01 && o <= 0x0D) || o == 0x1F || o == 0x20;
+}
+static inline bool pfxStateOp(uint8_t o) {       // executed during replay (cheap, order-preserving)
+  return o == 0x0E || o == 0x0F || (o >= 0x14 && o <= 0x1A);
+}
 static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* okOut, int depth) {
   int applied = 0; bool shown = false, ok = true;
   if (depth == 0) {                              // top-level batch: reset all batch-scoped state
@@ -2985,6 +3029,56 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
     panelClearClip(); panelClearBlend(); panelLayerDiscard();
   }
   size_t i = 0;
+  bool pfxReplay = false, pfxSnapNow = false; int pfxRec = -1; int pfxK = 0;
+  if (depth == 0 && len >= 32 && len <= 2048) {
+    if (gPfxBatch && gPfxEnd >= 64 && gPfxPhase >= 1
+        && gPfxW == gPanel.panelW && gPfxH == gPanel.panelH
+        && len >= gPfxEnd && memcmp(p, gPfxBatch, gPfxEnd) == 0) {
+      if (gPfxPhase == 2 && gPfxSnap) {          // REPLAY: restore the composed static scene
+        panelRestoreFull(gPfxSnap);
+        pfxReplay = true;
+      } else gPfxPhase = 2;                      // snapshot happened last run; replay from now on
+    } else if (gPfxBatch && gPfxBatchLen && gPfxW == gPanel.panelW && gPfxH == gPanel.panelH) {
+      // CANDIDATE from last run: diff, find the largest op-aligned identical prefix
+      size_t d = 0; const size_t lim = len < gPfxBatchLen ? len : gPfxBatchLen;
+      while (d < lim && p[d] == gPfxBatch[d]) d++;
+      size_t end = 0; bool geomOk = true, coverOk = false; int m = 0;
+      for (; m < gPfxOps; m++) {
+        const size_t oEnd = (m + 1 < gPfxOps) ? gPfxOff[m + 1] : gPfxBatchLen;
+        if (oEnd > d) break;
+        const uint8_t o = gPfxOpb[m];
+        if (!coverOk) {                          // the FIRST draw op must fully cover the panel
+          if (pfxStateOp(o)) {                   // state before the first draw: allow only provable no-ops
+            const uint8_t* q = gPfxBatch + gPfxOff[m] + 1;
+            if ((o == 0x14 && q[0] == 0) ||      // blend mode 'over'
+                (o == 0x15 && q[0] == 255) ||    // alpha opaque
+                 o == 0x16) {                    // SAVE (pushes identity, no effect)
+              end = oEnd; continue;
+            }
+            geomOk = false; break;               // anything else could break the full-cover proof
+          }
+          if (o == 0x01) coverOk = true;
+          else if (o == 0x0B) {                  // raw full-panel gradient (identity transform)
+            const uint8_t* q = gPfxBatch + gPfxOff[m] + 1;
+            const int gx = (int16_t)((q[0]<<8)|q[1]), gy = (int16_t)((q[2]<<8)|q[3]);
+            const int gw = (int16_t)((q[4]<<8)|q[5]), gh = (int16_t)((q[6]<<8)|q[7]);
+            if (gx == 0 && gy == 0 && gw >= gPanel.panelW && gh >= gPanel.panelH) coverOk = true;
+            else { geomOk = false; break; }
+          } else { geomOk = false; break; }
+          end = oEnd; continue;
+        }
+        if (pfxDrawGeom(o) || pfxStateOp(o)) { end = oEnd; continue; }
+        break;                                   // text/sprite/image/macro/layer/show: prefix stops
+      }
+      if (geomOk && coverOk && end >= 64) {
+        gPfxEnd = end; gPfxPhase = 1; pfxSnapNow = true;   // snapshot at gPfxEnd during THIS run
+        if (gSerialDebug) printf("[PFX] armed: prefix=%u/%u ops d=%u\n", (unsigned)end, (unsigned)len, (unsigned)d);
+      } else { gPfxPhase = 0; gPfxEnd = 0;
+        if (gSerialDebug) printf("[PFX] reject: d=%u m=%d geom=%d cover=%d op0=%02x\n",
+                                 (unsigned)d, m, (int)geomOk, (int)coverOk, gPfxOps ? gPfxOpb[0] : 0xFF); }
+    }
+    if (!pfxReplay) pfxRec = 0;                  // record this batch for the next comparison
+  }
   #define BOPS_NEED(n) if (i + (n) > len) { ok = false; break; }
   // Transformed point / size helpers: read s16 pairs through the shared affine matrix
   // (identity + ORIGIN translate for v1 clients, so their batches decode unchanged).
@@ -2994,6 +3088,17 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
   static uint32_t opMs[0x28], opCnt[0x28]; static uint8_t opAlpha; static uint32_t opT0;
   if (depth == 0 && gSerialDebug) { memset(opMs,0,sizeof(opMs)); memset(opCnt,0,sizeof(opCnt)); opAlpha = 255; opT0 = millis(); }
   while (i < len) {
+    if (pfxSnapNow && i == gPfxEnd) {            // SNAPSHOT: the static scene is composed
+      pfxSnapNow = panelSnapshotFull(&gPfxSnap, &gPfxSnapCap) ? false : (gPfxPhase = 0, false);
+    }
+    if (pfxReplay && i < gPfxEnd) {              // REPLAY: skip draws, execute state ops
+      while (pfxK + 1 < gPfxOps && gPfxOff[pfxK] < i) pfxK++;
+      if (gPfxOff[pfxK] == i && !pfxStateOp(gPfxOpb[pfxK])) {
+        i = (pfxK + 1 < gPfxOps && gPfxOff[pfxK + 1] <= gPfxEnd) ? gPfxOff[pfxK + 1] : gPfxEnd;
+        applied++; continue;
+      }
+    }
+    if (pfxRec >= 0 && pfxRec < PFX_MAX_OPS) { gPfxOff[pfxRec] = (uint16_t)i; gPfxOpb[pfxRec] = p[i]; pfxRec++; }
     opsYieldMaybe();                              // resilience: cap CPU hog per batch
     panelSetBlend((uint8_t)gOpsBlend, gBinAlpha); // per op: batch mode + batch alpha
     const uint8_t opb = p[i++];
@@ -3229,6 +3334,18 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
   }
   #undef BOPS_NEED
   #undef BXY
+  if (pfxSnapNow && i >= gPfxEnd) {              // prefix ended exactly at batch end
+    if (!panelSnapshotFull(&gPfxSnap, &gPfxSnapCap)) gPfxPhase = 0;
+  }
+  if (depth == 0 && pfxRec >= 0 && ok) {         // remember this batch for the next-frame diff
+    if (gPfxBatchCap < len) { free(gPfxBatch);
+      gPfxBatch = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+      gPfxBatchCap = gPfxBatch ? len : 0; }
+    if (gPfxBatch) { memcpy(gPfxBatch, p, len); gPfxBatchLen = len; gPfxOps = pfxRec;
+      gPfxW = gPanel.panelW; gPfxH = gPanel.panelH;
+      if (gPfxPhase == 0) gPfxPhase = 0;          // stays candidate until a match validates it
+    } else { gPfxBatchLen = 0; gPfxOps = 0; gPfxPhase = 0; }
+  } else if (depth == 0 && !ok) { gPfxPhase = 0; gPfxEnd = 0; gPfxBatchLen = 0; }
   if (depth == 0) {
     if (gSerialDebug && millis() - opT0 > 100) {   // slow batch: name the culprits
       char line[160]; int n = snprintf(line, sizeof(line), "[OPS] %lums alpha=%u:", (unsigned long)(millis()-opT0), (unsigned)opAlpha);
