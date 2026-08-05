@@ -2376,42 +2376,73 @@ static void canvasOpGradientEx(int x, int y, int w, int h,
     static uint8_t rowBuf[PANEL_MAX_W * 3];        // ops are single-threaded (stream XOR one-shot)
     static uint8_t baseRow[PANEL_MAX_W * 3];       // mode 1: per-column base colours, computed once
     const int wc = w > PANEL_MAX_W ? PANEL_MAX_W : w;
-    // Gradient render cache (v0.3.2): app backgrounds are the SAME gradient every frame --
-    // the aquarium spent ~370 ms/frame recomposing one. Key on every param; on a hit,
-    // replay pre-packed rows as memcpys (~3-8 ms full-screen). One entry; PSRAM.
-    static px565_t* gcBuf = nullptr; static size_t gcCap = 0;
-    static int gcX, gcY, gcW, gcH, gcMode, gcAngle; static bool gcDither, gcValid = false;
-    static uint8_t gcC[6]; static uint16_t gcPW, gcPH;
+    // Gradient render cache, MULTI-ENTRY (v0.3.4): apps draw SEVERAL static gradients per
+    // frame (the aquarium's baked light shafts = background + 3 shafts), and the single-
+    // entry cache thrashed round-robin -- every gradient recomposed every frame
+    // (~700 ms/frame). Six LRU slots keyed on every param; a hit replays pre-packed rows
+    // (or one DMA blit when full-frame). ~4 MB PSRAM worst case across slots; 26 MB free.
+    // Keyed on DITHER PHASE (x&3,y&3), not absolute position (v0.3.4b): the rendered
+    // pixels depend on position only through the 4x4 Bayer phase, so a DRIFTING gradient
+    // (the aquarium's swaying shafts) hits whenever its phase repeats -- after one drift
+    // cycle every frame is a hit, with EXACT pixels. 16 slots (3 shafts x <=4 x-phases +
+    // background + headroom), soft-capped at 10 MB PSRAM total.
+    struct GradSlot { px565_t* buf; size_t cap; uint32_t used; bool valid;
+                      int px, py, w, h, mode, angle; bool dither; uint8_t c[6]; uint16_t pw, ph; };
+    static GradSlot gc[16] = {};
+    static uint32_t gcClock = 0;
     const bool cacheable = !panelLayerActive() && (size_t)wc * h >= 65536;   // big fills only
-    if (cacheable && gcValid && gcBuf && gcX == x && gcY == y && gcW == wc && gcH == h
-        && gcMode == mode && gcAngle == angleDeg && gcDither == dither
-        && gcC[0]==r0 && gcC[1]==g0 && gcC[2]==b0 && gcC[3]==r1 && gcC[4]==g1 && gcC[5]==b1
-        && gcPW == gPanel.panelW && gcPH == gPanel.panelH) {
+    int hit = -1, lru = 0;
+    if (cacheable) {
+      for (int si = 0; si < 16; si++) {
+        GradSlot& e = gc[si];
+        if (e.valid && e.buf && e.px == (x & 3) && e.py == (y & 3) && e.w == wc && e.h == h
+            && e.mode == mode && e.angle == angleDeg && e.dither == dither
+            && e.c[0]==r0 && e.c[1]==g0 && e.c[2]==b0 && e.c[3]==r1 && e.c[4]==g1 && e.c[5]==b1
+            && e.pw == gPanel.panelW && e.ph == gPanel.panelH) { hit = si; break; }
+        if (gc[si].used < gc[lru].used) lru = si;
+      }
+    }
+    if (hit >= 0) {
+      GradSlot& e = gc[hit]; e.used = ++gcClock;
       if (x == 0 && y == 0 && wc == (int)panelInfo().width && h == (int)panelInfo().height
           && !panelLayerActive()) {
-        panelFastCopyToFb(gcBuf, (size_t)wc * h);  // full-frame hit: one AXI-DMA blit (~5 ms)
+        panelFastCopyToFb(e.buf, (size_t)wc * h);  // full-frame hit: one AXI-DMA blit (~5 ms)
       } else {
         for (int yy = 0; yy < h; yy++) {
-          panelBlitRowNative(x, y + yy, wc, gcBuf + (size_t)yy * wc);
+          panelBlitRowNative(x, y + yy, wc, e.buf + (size_t)yy * wc);
           if ((yy & 127) == 127) wdgWebMs = millis();
         }
       }
       return;
     }
-    px565_t* fill = nullptr;                       // non-null: populate the cache as we compose
+    px565_t* fill = nullptr;                       // non-null: populate this slot as we compose
+    GradSlot* slot = nullptr;
     if (cacheable && gSerialDebug)                 // perf diag: why does the cache miss?
       printf("[GRAD] compose %dx%d m=%d a=%d d=%d c=%02x%02x%02x-%02x%02x%02x\n",
              wc, h, mode, angleDeg, (int)dither, r0, g0, b0, r1, g1, b1);
     if (cacheable) {
+      slot = &gc[lru];
       const size_t need = (size_t)wc * h * sizeof(px565_t);
-      if (gcCap < need) { free(gcBuf);           // 128-aligned so the hit path can DMA-copy
-        gcBuf = (px565_t*)heap_caps_aligned_alloc(128, need, MALLOC_CAP_SPIRAM); gcCap = gcBuf ? need : 0; }
-      if (gcBuf) {
-        fill = gcBuf; gcValid = false;             // valid only after a complete compose
-        gcX = x; gcY = y; gcW = wc; gcH = h; gcMode = mode; gcAngle = angleDeg; gcDither = dither;
-        gcC[0]=r0; gcC[1]=g0; gcC[2]=b0; gcC[3]=r1; gcC[4]=g1; gcC[5]=b1;
-        gcPW = gPanel.panelW; gcPH = gPanel.panelH;
+      size_t total = 0;                            // 10 MB soft budget across slots
+      for (int si = 0; si < 16; si++) if (&gc[si] != slot) total += gc[si].cap;
+      while (total + need > 10u * 1024 * 1024) {   // evict LRU buffers until it fits
+        int drop = -1;
+        for (int si = 0; si < 16; si++)
+          if (&gc[si] != slot && gc[si].buf && (drop < 0 || gc[si].used < gc[drop].used)) drop = si;
+        if (drop < 0) break;
+        total -= gc[drop].cap;
+        free(gc[drop].buf); gc[drop].buf = nullptr; gc[drop].cap = 0; gc[drop].valid = false;
       }
+      if (slot->cap < need) { free(slot->buf);     // 128-aligned so the hit path can DMA-copy
+        slot->buf = (px565_t*)heap_caps_aligned_alloc(128, need, MALLOC_CAP_SPIRAM);
+        slot->cap = slot->buf ? need : 0; }
+      if (slot->buf) {
+        fill = slot->buf; slot->valid = false;     // valid only after a complete compose
+        slot->px = (x & 3); slot->py = (y & 3); slot->w = wc; slot->h = h; slot->mode = mode;
+        slot->angle = angleDeg; slot->dither = dither;
+        slot->c[0]=r0; slot->c[1]=g0; slot->c[2]=b0; slot->c[3]=r1; slot->c[4]=g1; slot->c[5]=b1;
+        slot->pw = gPanel.panelW; slot->ph = gPanel.panelH; slot->used = ++gcClock;
+      } else slot = nullptr;
     }
     if (mode == 1) {
       for (int xx = 0; xx < wc; xx++) {
@@ -2463,7 +2494,7 @@ static void canvasOpGradientEx(int x, int y, int w, int h,
       panelBlitRow888(x, y + yy, wc, rowBuf);
       if ((yy & 63) == 63) wdgWebMs = millis();    // long fills keep the web watchdog fed
     }
-    if (fill) gcValid = true;                      // complete compose: cache is now the truth
+    if (fill && slot) slot->valid = true;          // complete compose: the slot is now the truth
     return;
   }
   for (int yy = 0; yy < h; yy++)
