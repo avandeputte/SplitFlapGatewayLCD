@@ -725,6 +725,29 @@ void panelShow() {
   const uint32_t t1 = micros();
   rotateToScanout();
   const uint32_t t2 = micros();
+  // TEMP flash-hunt (v0.3 diag): log the ONSET of any bright full-frame present -- the
+  // "app-switch flash". Samples EVERY present (no rate limit) so a flash lasting a single
+  // frame (~16 ms) can't slip between samples; edge-triggered (not-bright -> bright) so a
+  // sustained bright app logs once, not 60x/s. ~3000 sparse reads/present, negligible cost.
+  {
+    uint32_t sr = 0, sg = 0, sb = 0, cnt = 0;
+    const px_t* p = fb[drawBuf];
+    const size_t total = (size_t)W * H;
+    for (size_t i = 0; i < total; i += 331) {
+      const px_t v = p[i];
+      sr += ((v >> 11) & 0x1F) << 3; sg += ((v >> 5) & 0x3F) << 2; sb += (v & 0x1F) << 3; cnt++;
+    }
+    static bool wasBright = false;
+    if (cnt) {
+      const uint32_t ar = sr / cnt, ag = sg / cnt, ab = sb / cnt, avg = (ar + ag + ab) / 3;
+      const bool bright = (avg > 110);
+      if (bright && !wasBright)
+        printf("[FLASH] bright present avg=%lu R=%lu G=%lu B=%lu scale=%u t=%lu\n",
+               (unsigned long)avg, (unsigned long)ar, (unsigned long)ag, (unsigned long)ab,
+               (unsigned)gScale, (unsigned long)millis());
+      wasBright = bright;
+    }
+  }
   tSync += t1 - t0; tBlit += t2 - t1; nShow++;
   if (!tLast) tLast = millis();
   if (gSerialDebug && millis() - tLast > 2000 && nShow > 5) {
@@ -827,7 +850,10 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
 
   esp_lcd_dpi_panel_config_t dpiCfg = {};
   dpiCfg.dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT;
-  dpiCfg.dpi_clock_freq_mhz = 80;                  // 60 Hz at the timing below
+  dpiCfg.dpi_clock_freq_mhz = 80;                  // 60 Hz at the timing below. (66 MHz was tried
+                                                   // against the flash-write scan-out glitch and
+                                                   // reverted: FIFO margin is irrelevant against a
+                                                   // multi-ms cache-disable stall -- see platformio.ini)
   dpiCfg.virtual_channel = 0;
   // IDF 5.5 takes in_color_format (the legacy pixel_format field is a separate,
   // unread member here); and Waveshare's own 5.5 configs do NOT enable use_dma2d.
