@@ -653,6 +653,38 @@ bool canvasAtlasBlitEx(int handle, uint16_t i, int x, int y,
   a.lastUsedMs = millis();
   const uint8_t* t = a.buf + (size_t)i * a.tileBytes;
   const int tw = a.tileW, th = a.tileH;
+  // Identity fast path (v0.3.3): no flip/rot, scale 1, no blend/layer -- the common sprite
+  // case (the aquarium's fish: 5 blits/frame, ~16 ms via per-pixel panelPixel). Walk each
+  // tile row batching contiguous NON-transparent runs into panelBlitRow888 span writes.
+  if (rot == 0 && scale == 1 && !panelBlendActive() && !panelLayerActive()) {
+    static uint8_t runBuf[1024 * 3];               // one tile row of rgb888 (tiles cap at 1024 px wide)
+    for (int row = 0; row < th; row++) {
+      const int srow = flipV ? th - 1 - row : row;                     // flips are index remaps here
+      const uint8_t* rp = t + (size_t)srow * tw * a.fmt;
+      int runStart = -1, runLen = 0;
+      for (int col = 0; col <= tw; col++) {
+        bool opaque = false; uint8_t cr = 0, cg = 0, cb = 0;
+        if (col < tw) {
+          const uint8_t* p = rp + (size_t)(flipH ? tw - 1 - col : col) * a.fmt;
+          if (a.fmt == 3) { opaque = !(p[0] == 255 && p[1] == 0 && p[2] == 255);
+            if (opaque) { cr = p[0]; cg = p[1]; cb = p[2]; } }
+          else { const uint16_t v = ((uint16_t)p[0] << 8) | p[1]; opaque = (v != 0xF81F);
+            if (opaque) { cr = (uint8_t)(((v >> 11) & 0x1F) << 3);
+                          cg = (uint8_t)(((v >> 5)  & 0x3F) << 2);
+                          cb = (uint8_t)((v & 0x1F) << 3); } }
+        }
+        if (opaque && runLen < 1024) {
+          if (runStart < 0) runStart = col;
+          runBuf[runLen*3] = cr; runBuf[runLen*3+1] = cg; runBuf[runLen*3+2] = cb; runLen++;
+        } else if (runStart >= 0) {                // run ended: land it as one span
+          panelBlitRow888(x + runStart, y + row, runLen, runBuf);
+          runStart = -1; runLen = 0;
+          if (opaque) { runStart = col; runBuf[0]=cr; runBuf[1]=cg; runBuf[2]=cb; runLen=1; }
+        }
+      }
+    }
+    return true;
+  }
   for (int row = 0; row < th; row++)
     for (int col = 0; col < tw; col++) {
       const uint8_t* p = t + ((size_t)row * tw + col) * a.fmt;

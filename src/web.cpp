@@ -2387,9 +2387,14 @@ static void canvasOpGradientEx(int x, int y, int w, int h,
         && gcMode == mode && gcAngle == angleDeg && gcDither == dither
         && gcC[0]==r0 && gcC[1]==g0 && gcC[2]==b0 && gcC[3]==r1 && gcC[4]==g1 && gcC[5]==b1
         && gcPW == gPanel.panelW && gcPH == gPanel.panelH) {
-      for (int yy = 0; yy < h; yy++) {
-        panelBlitRowNative(x, y + yy, wc, gcBuf + (size_t)yy * wc);
-        if ((yy & 127) == 127) wdgWebMs = millis();
+      if (x == 0 && y == 0 && wc == (int)panelInfo().width && h == (int)panelInfo().height
+          && !panelLayerActive()) {
+        panelFastCopyToFb(gcBuf, (size_t)wc * h);  // full-frame hit: one AXI-DMA blit (~5 ms)
+      } else {
+        for (int yy = 0; yy < h; yy++) {
+          panelBlitRowNative(x, y + yy, wc, gcBuf + (size_t)yy * wc);
+          if ((yy & 127) == 127) wdgWebMs = millis();
+        }
       }
       return;
     }
@@ -2399,7 +2404,8 @@ static void canvasOpGradientEx(int x, int y, int w, int h,
              wc, h, mode, angleDeg, (int)dither, r0, g0, b0, r1, g1, b1);
     if (cacheable) {
       const size_t need = (size_t)wc * h * sizeof(px565_t);
-      if (gcCap < need) { free(gcBuf); gcBuf = (px565_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM); gcCap = gcBuf ? need : 0; }
+      if (gcCap < need) { free(gcBuf);           // 128-aligned so the hit path can DMA-copy
+        gcBuf = (px565_t*)heap_caps_aligned_alloc(128, need, MALLOC_CAP_SPIRAM); gcCap = gcBuf ? need : 0; }
       if (gcBuf) {
         fill = gcBuf; gcValid = false;             // valid only after a complete compose
         gcX = x; gcY = y; gcW = wc; gcH = h; gcMode = mode; gcAngle = angleDeg; gcDither = dither;

@@ -39,6 +39,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_io.h>
 #include <driver/ppa.h>              // hardware rotate for the landscape mount
+#include <esp_async_memcpy.h>        // AXI-GDMA bulk copies (panelFastCopy, v0.3.3)
 #include "esp_lcd_jd9365_10_1.h"     // vendored Waveshare panel driver (Apache-2.0)
 #include "sdcard.h"        // sdLog: on-card event log
 
@@ -348,19 +349,62 @@ void panelFillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) 
   }
 }
 
+// AXI-GDMA bulk copy (v0.3.3): PSRAM->PSRAM at ~300-500 MB/s vs ~70 MB/s CPU memcpy, on an
+// engine physically separate from the PPA's DMA2D pool (no contention with the pipelined
+// rotate; the driver handles all cache coherency internally). Eligibility per the driver:
+// both pointers AND the byte count must be multiples of the 128 B PSRAM burst; anything
+// else falls back to plain memcpy. The ops task blocks on a semaphore, freeing the CPU.
+static async_memcpy_handle_t gMcp = nullptr;
+static SemaphoreHandle_t     gMcpDone = nullptr;
+static bool IRAM_ATTR mcpDoneCb(async_memcpy_handle_t, async_memcpy_event_t*, void* ud) {
+  BaseType_t hp = pdFALSE;
+  xSemaphoreGiveFromISR((SemaphoreHandle_t)ud, &hp);
+  return hp == pdTRUE;
+}
+void panelFastCopy(void* dst, const void* src, size_t bytes) {
+  if (!gMcp) {                                   // lazy one-time install (AXI backend: PSRAM bursts)
+    static bool tried = false;
+    if (!tried) { tried = true;
+      async_memcpy_config_t cfg = {};
+      cfg.backlog = 1;
+      cfg.dma_burst_size = 128;
+      if (esp_async_memcpy_install_gdma_axi(&cfg, &gMcp) == ESP_OK) gMcpDone = xSemaphoreCreateBinary();
+      else gMcp = nullptr;
+    }
+  }
+  const bool aligned = ((uintptr_t)dst % 128 == 0) && ((uintptr_t)src % 128 == 0) && (bytes % 128 == 0);
+  if (gMcp && gMcpDone && aligned && bytes >= 32768) {
+    if (esp_async_memcpy(gMcp, dst, (void*)src, bytes, mcpDoneCb, gMcpDone) == ESP_OK) {
+      xSemaphoreTake(gMcpDone, portMAX_DELAY);
+      return;
+    }
+  }
+  memcpy(dst, src, bytes);
+}
+
 // Full-frame native snapshot/restore (v0.3.3): the static-prefix replay's storage. Both
 // operate on fb[drawBuf] at the CURRENT logical geometry; the caller keys validity on W/H.
 bool panelSnapshotFull(uint16_t** buf, size_t* cap) {
   if (!info.ok) return false;
   const size_t need = (size_t)W * H * sizeof(px_t);
-  if (*cap < need) { free(*buf); *buf = (uint16_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM); *cap = *buf ? need : 0; }
+  if (*cap < need) { free(*buf);                 // 128-aligned so panelFastCopy qualifies
+    *buf = (uint16_t*)heap_caps_aligned_alloc(128, need, MALLOC_CAP_SPIRAM);
+    *cap = *buf ? need : 0; }
   if (!*buf) return false;
-  memcpy(*buf, fb[drawBuf], need);
+  panelFastCopy(*buf, fb[drawBuf], need);
   return true;
 }
 void panelRestoreFull(const uint16_t* buf) {
   if (!info.ok || !buf) return;
-  memcpy(fb[drawBuf], buf, (size_t)W * H * sizeof(px_t));
+  panelFastCopy(fb[drawBuf], buf, (size_t)W * H * sizeof(px_t));
+}
+// Full-frame native blit honoring clip/layer: the gradient cache's hit path. Only a truly
+// unclipped, layer-free full frame takes the DMA shortcut; anything else lands row by row.
+void panelFastCopyToFb(const uint16_t* buf, size_t px) {
+  if (!info.ok || !buf || px != (size_t)W * H) return;
+  const bool clipped = (clipX0 > 0 || clipY0 > 0 || clipX1 < W || clipY1 < H);
+  if (!clipped && !gLayerBuf) { panelFastCopy(fb[drawBuf], buf, px * sizeof(px_t)); return; }
+  for (int y = 0; y < H; y++) panelBlitRowNative(0, y, W, buf + (size_t)y * W);
 }
 
 // v0.3.2 perf: expose the packer + a native-565 row blit for the gradient cache. The cache

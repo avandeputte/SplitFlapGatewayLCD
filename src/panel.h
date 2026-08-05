@@ -57,6 +57,8 @@ void panelFillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b);
 // path for frame-shaped draws. 565 is big-endian, as every wire format here is.
 bool panelSnapshotFull(uint16_t** buf, size_t* cap);       // fb[drawBuf] -> PSRAM (prefix replay)
 void panelRestoreFull(const uint16_t* buf);                // PSRAM -> fb[drawBuf]
+void panelFastCopyToFb(const uint16_t* buf, size_t px);    // full-frame native blit (clip-aware)
+void panelFastCopy(void* dst, const void* src, size_t bytes);   // AXI-DMA bulk copy w/ CPU fallback
 uint16_t panelPack565(uint8_t r, uint8_t g, uint8_t b);   // the panel's own packing (bgr-aware)
 bool panelLayerActive();                                   // an offscreen layer is open
 void panelBlitRowNative(int x, int y, int n, const uint16_t* row);   // pre-packed 565 row (gradient cache)
