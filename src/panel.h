@@ -110,6 +110,9 @@ void panelHealthTick();
 // Present the back buffer: re-point the live descriptor chain's tail at the other chain,
 // then wait one frame so the caller cannot draw into a buffer GDMA is still reading.
 void panelShow();
+// Incremental present (v0.4.2): PPA-rotate ONLY these logical rects (int16 quads x,y,w,h)
+// into the persistent scanout. No buffer swap -- single-buffer callers only (effects).
+void panelPresentRects(const int16_t* rects, int n);
 
 // Sync the back buffer to what is currently on screen, so a partial update (a rectangle, one
 // changed region) can be drawn on top of it instead of on a stale frame. Call before drawing a

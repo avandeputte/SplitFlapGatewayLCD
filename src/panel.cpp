@@ -908,6 +908,90 @@ static void rotateToScanout() {
                   ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 }
 
+// Incremental present (v0.4.2): rotate ONLY the given logical-space rects into the live
+// scanout instead of the whole frame. The scanout persists, so unchanged content needs no
+// traffic -- the aquarium's per-present PPA load drops from 4 MB to well under 1 MB, which
+// removes the PSRAM contention that starved the DSI FIFO (the flash/blink saga). Single-
+// buffer contract: does NOT swap drawBuf/liveBuf; the caller keeps drawing the same buffer.
+// (No overlay hook, no blip -- effect-only path.) Falls back to per-rect CPU rotate.
+void panelPresentRects(const int16_t* rects, int n) {
+  if (!info.ok || n <= 0) return;
+  if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY);
+  if (gPpa && gRotDone) xSemaphoreTake(gRotDone, portMAX_DELAY);   // any in-flight full rotate
+  // Sync ONLY the dirty row bands (v0.4.2 blink fix): a full 2 MB esp_cache_msync runs
+  // with interrupts disabled for ~1 ms -- longer than the ~0.75 ms vblank window in which
+  // the DSI's frame re-arm ISR must land. A missed re-arm scans a whole frame of
+  // substitute pixels: THE blink. Small per-rect row-band syncs keep every
+  // interrupts-off window far below the vblank budget.
+  for (int i = 0; gPpa && i < n; i++) {
+    int y = rects[i*4+1], h = rects[i*4+3];
+    if (y < 0) { h += y; y = 0; }
+    if (y + h > H) h = H - y;
+    if (h <= 0) continue;
+    esp_cache_msync((uint8_t*)fb[drawBuf] + (size_t)y * W * sizeof(px_t),
+                    (size_t)h * W * sizeof(px_t), ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+  }
+  for (int i = 0; i < n; i++) {
+    int x = rects[i*4], y = rects[i*4+1], w = rects[i*4+2], h = rects[i*4+3];
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > W) w = W - x;
+    if (y + h > H) h = H - y;
+    if (w <= 0 || h <= 0) continue;
+    bool done = false;
+    if (gPpa) {
+      ppa_srm_oper_config_t op = {};
+      op.in.buffer         = fb[drawBuf];
+      op.in.pic_w          = W;
+      op.in.pic_h          = H;
+      op.in.block_w        = w;
+      op.in.block_h        = h;
+      op.in.block_offset_x = x;
+      op.in.block_offset_y = y;
+      op.in.srm_cm         = PPA_SRM_COLOR_MODE_RGB565;
+      op.out.buffer        = gScanout;
+      op.out.buffer_size   = (size_t)PANEL_NATIVE_W * PANEL_NATIVE_H * sizeof(px_t);
+      op.out.pic_w         = PANEL_NATIVE_W;
+      op.out.pic_h         = PANEL_NATIVE_H;
+      if (!PANEL_ROT_180) {                        // angle 90 (PPA convention): (x,y) -> (y, NH-(x+w))
+        op.out.block_offset_x = y * gScale;
+        op.out.block_offset_y = PANEL_NATIVE_H - (x + w) * gScale;
+      } else {                                     // angle 270: (x,y) -> (NW-(y+h), x)
+        op.out.block_offset_x = PANEL_NATIVE_W - (y + h) * gScale;
+        op.out.block_offset_y = x * gScale;
+      }
+      op.out.srm_cm        = PPA_SRM_COLOR_MODE_RGB565;
+      op.rotation_angle    = PANEL_ROT_180 ? PPA_SRM_ROTATION_ANGLE_270 : PPA_SRM_ROTATION_ANGLE_90;
+      op.scale_x           = (float)gScale;
+      op.scale_y           = (float)gScale;
+      op.mode              = PPA_TRANS_MODE_BLOCKING;   // small blocks: total ~5-10 ms
+      done = (ppa_do_scale_rotate_mirror(gPpa, &op) == ESP_OK);
+    }
+    if (!done) {                                   // CPU fallback, this rect only
+      const px_t* src = fb[drawBuf];
+      px_t* dst = (px_t*)gScanout;
+      const int S = gScale, LW2 = W * S, LH2 = H * S;
+      for (int yy = y; yy < y + h; yy++)
+        for (int xx = x; xx < x + w; xx++) {
+          const px_t v = src[(size_t)yy * W + xx];
+          for (int dy = 0; dy < S; dy++)
+            for (int dx = 0; dx < S; dx++) {
+              const int lx = xx * S + dx, ly = yy * S + dy;
+              int nx, ny;
+              if (!PANEL_ROT_180) { nx = LH2 - 1 - ly; ny = lx; }
+              else                { nx = ly;           ny = LW2 - 1 - lx; }
+              dst[(size_t)ny * PANEL_NATIVE_W + nx] = v;
+            }
+        }
+      esp_cache_msync(gScanout, (size_t)PANEL_NATIVE_W * PANEL_NATIVE_H * sizeof(px_t),
+                      ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    }
+  }
+  if (gPpa && gRotDone) xSemaphoreGive(gRotDone);  // blocking ops: the engine is idle again
+  gLastShowMs = millis();                          // the wedge detector counts this as presenting
+  if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
+}
+
 void panelShow() {
   if (!info.ok) return;
   if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY);   // one present at a time
@@ -923,7 +1007,13 @@ void panelShow() {
   // outright by esp_cache_msync, not partially done -- the boot log said so.
   const size_t liveBytes = ((size_t)W * H * sizeof(px_t) + 127u) & ~((size_t)127u);
   if (gPpa && gRotDone) xSemaphoreTake(gRotDone, portMAX_DELAY);   // previous rotate must land first
-  if (gPpa) esp_cache_msync(fb[drawBuf], liveBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+  if (gPpa) {                                      // CHUNKED writeback (v0.4.2): one 2 MB msync
+    const uint8_t* base = (const uint8_t*)fb[drawBuf];   // disables interrupts ~1 ms -- past the
+    const size_t CH = 64 * 1024;                         // ~0.75 ms vblank re-arm budget = blink
+    for (size_t off = 0; off < liveBytes; off += CH)
+      esp_cache_msync((void*)(base + off), (liveBytes - off > CH) ? CH : liveBytes - off,
+                      ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+  }
   const uint32_t t1 = micros();
   rotateToScanout();
   const uint32_t t2 = micros();

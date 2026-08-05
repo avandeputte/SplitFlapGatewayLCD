@@ -826,19 +826,20 @@ static bool aqBgValid = false; static int aqBgHue = -1; static uint16_t aqBgW = 
 // PSRAM traffic, faster frames.
 struct AqRect { int16_t x, y, w, h; };
 #define AQ_MAX_RECT (AQ_MAX_FISH + AQ_MAX_PLNT + AQ_MAX_BUB + 2)
-// TWO lists, indexed by frame parity: the framebuffer double-buffers (panelShow swaps),
-// so the rects to erase are the ones drawn into THIS buffer two frames ago.
-static AqRect aqDirty[2][AQ_MAX_RECT]; static int aqDirtyN[2] = {0, 0};
-static int  aqParity = 0;
+// SINGLE-buffer dirty model (v0.4.2): the aquarium now presents incrementally via
+// panelPresentRects (no buffer swap), so one prev-frame list suffices: restore prev
+// rects to background, draw this frame's entities (marking cur), then present
+// prev ∪ cur -- the scanout erases old positions and paints new ones in one pass.
+static AqRect aqDirty[2][AQ_MAX_RECT]; static int aqDirtyN[2] = {0, 0};   // [0]=prev [1]=cur
 static bool aqFirstFrame = true;
 static inline void aqMark(int x, int y, int w, int h) {
-  if (aqDirtyN[aqParity] >= AQ_MAX_RECT || w <= 0 || h <= 0) return;
-  aqDirty[aqParity][aqDirtyN[aqParity]++] = { (int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h };
+  if (aqDirtyN[1] >= AQ_MAX_RECT || w <= 0 || h <= 0) return;
+  aqDirty[1][aqDirtyN[1]++] = { (int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h };
 }
-static void aqRestoreDirty(int W, int H) {
-  for (int i = 0; i < aqDirtyN[aqParity]; i++) {
-    int x = aqDirty[aqParity][i].x, y = aqDirty[aqParity][i].y;
-    int w = aqDirty[aqParity][i].w, h = aqDirty[aqParity][i].h;
+static void aqRestoreDirty(int W, int H) {         // prev rects -> background
+  for (int i = 0; i < aqDirtyN[0]; i++) {
+    int x = aqDirty[0][i].x, y = aqDirty[0][i].y;
+    int w = aqDirty[0][i].w, h = aqDirty[0][i].h;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > W) w = W - x;
@@ -846,7 +847,6 @@ static void aqRestoreDirty(int W, int H) {
     for (int yy = 0; yy < h; yy++)
       panelBlitRowNative(x, y + yy, w, aqBg + (size_t)(y + yy) * W + x);
   }
-  aqDirtyN[aqParity] = 0;
 }
 
 static const uint8_t AQ_BAYER[16] = { 0,8,2,10, 12,4,14,6, 3,11,1,9, 15,7,13,5 };
@@ -1004,13 +1004,10 @@ static void renderAquarium() {
     aqComposeBg(W, H, hue);
     aqBgValid = panelSnapshotFull(&aqBg, &aqBgCap);
     aqBgHue = hue; aqBgW = W; aqBgH = H;
-    aqDirtyN[0] = aqDirtyN[1] = 0; aqParity = 0; aqFirstFrame = true;
+    aqDirtyN[0] = aqDirtyN[1] = 0; aqFirstFrame = true;
     if (aqBgValid) aqSeed(W, H);                   // seed on the first good compose
-  } else if (aqFirstFrame) {
-    panelRestoreFull(aqBg);                        // the other double-buffer half, once
-    aqFirstFrame = false;
   } else {
-    aqRestoreDirty(W, H);                          // only the strips that moved (v0.4.1)
+    aqRestoreDirty(W, H);                          // prev-frame strips -> background
   }
   // Surface shimmer: two light rows sliding slowly (their band restores every frame).
   { const int sy = H / 24 + 1;
@@ -1067,8 +1064,24 @@ static void renderAquarium() {
     if (bu.r > 1) panelPixel((int)bu.x - 1, (int)bu.y - 1, 245, 250, 255);
   }
   tmPl = millis();
-  panelShow();
-  aqParity ^= 1;                                   // next frame draws into the other buffer
+  if (aqFirstFrame) {
+    panelShow();                                   // seed the scanout with the full frame...
+    panelCloneToBack();                            // ...then collapse to single-buffer drawing
+    aqFirstFrame = false;
+    aqDirtyN[0] = aqDirtyN[1]; memcpy(aqDirty[0], aqDirty[1], sizeof(AqRect) * aqDirtyN[1]);
+    aqDirtyN[1] = 0;
+  } else {
+    // present prev ∪ cur: erases old entity positions, paints new ones. int16 quads.
+    static int16_t quads[2 * AQ_MAX_RECT * 4]; int qn = 0;
+    for (int li = 0; li < 2; li++)
+      for (int i = 0; i < aqDirtyN[li]; i++) {
+        quads[qn*4] = aqDirty[li][i].x; quads[qn*4+1] = aqDirty[li][i].y;
+        quads[qn*4+2] = aqDirty[li][i].w; quads[qn*4+3] = aqDirty[li][i].h; qn++;
+      }
+    panelPresentRects(quads, qn);
+    aqDirtyN[0] = aqDirtyN[1]; memcpy(aqDirty[0], aqDirty[1], sizeof(AqRect) * aqDirtyN[1]);
+    aqDirtyN[1] = 0;
+  }
   tmShow = millis();
   if (gSerialDebug) { static uint32_t lastAq = 0;
     if (tmShow - lastAq > 2000) { lastAq = tmShow;
