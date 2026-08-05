@@ -68,7 +68,12 @@ display** (800×1280 portrait, mounted landscape 1280×800).
 ## Milestone 2 — the network the board deserves
 
 - **Ethernet** (ETH library, IP101, PoE) alongside WiFi; advertise which is up.
-- SD pins from schematic → card + event log + backup work as on Matrix.
+- ~~SD pins from schematic → card + event log + backup work as on Matrix.~~
+  **DONE (v0.4.2)**: pins were right all along (SLOT 0 IOMUX 43/44/39-42, LDO4
+  rail); the mount failed because Arduino SD_MMC hardcodes SLOT 1 — the slot the
+  C6 radio (esp_hosted SDIO) owns. Fixed with `BOARD_HAS_SDMMC` +
+  `BOARD_SDMMC_SLOT=0` + `BOARD_SDMMC_POWER_CHANNEL=4` build flags; sdInit()
+  must stay ordered before radio init (see sdcard.cpp header comment).
 - ES8311 speaker on the P4's I2S pins; mic capture path (single SMD mic — the clap
   detector's not-bass gate needs re-calibration for it, ES7210 assumptions removed).
 
