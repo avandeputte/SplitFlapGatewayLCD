@@ -813,7 +813,7 @@ struct AqFish { float x, y, vx, bob; uint8_t size, hue; float phase; int8_t dir;
 struct AqBub  { float x, y, vy, phase; uint8_t r; bool live; };
 struct AqPlant{ int x, h; float phase; uint8_t shade; bool front; };
 #define AQ_MAX_FISH 24
-#define AQ_MAX_BUB  20
+#define AQ_MAX_BUB  36
 #define AQ_MAX_PLNT 7
 static AqFish  aqFish[AQ_MAX_FISH]; static int aqFishN = 0;
 static AqBub   aqBub[AQ_MAX_BUB];
@@ -1037,7 +1037,7 @@ static void renderAquarium() {
       if (f.y < yMin) f.y = yMin; if (f.y > yMax) f.y = yMax;
       aqDrawFish(f, t);
       // occasional bubble from the mouth
-      if (((fxTick + i * 37) % 256) == 0)
+      if (((fxTick + i * 37) % 128) == 0)
         for (int bi = 0; bi < AQ_MAX_BUB; bi++) if (!aqBub[bi].live) {
           aqBub[bi] = { f.x + f.dir * (f.size / 2), f.y - 2, 0.5f + (float)(i % 3) / 4, (float)i,
                         (uint8_t)((1 + (i % 2)) * (panelInfo().height / 200 > 0 ? panelInfo().height / 200 : 1)), true };
@@ -1047,12 +1047,15 @@ static void renderAquarium() {
   tmFish = millis();
   for (int i = 0; i < aqPlantN; i++) if (aqPlant[i].front) aqDrawPlant(aqPlant[i], W, H, t);
   // Bubbles: rise with wobble, pop near the surface. A vent by the second plant.
-  if ((fxTick % 96) == 0 && aqPlantN > 1)
+  if ((fxTick % 48) == 0 && aqPlantN > 1) {
+    const int vent = (fxTick % 96) ? 1 : (aqPlantN - 1);   // two vents, alternating
     for (int bi = 0; bi < AQ_MAX_BUB; bi++) if (!aqBub[bi].live) {
-      aqBub[bi] = { (float)aqPlant[1].x, (float)(H * 84 / 100), 0.6f, (float)(fxTick % 7),
-                    (uint8_t)(2 * (H / 200 > 0 ? H / 200 : 1)), true };
+      aqBub[bi] = { (float)aqPlant[vent].x + (float)((fxTick >> 3) % 5) - 2.0f,
+                    (float)(H * 84 / 100), 0.55f + (float)(fxTick % 3) / 8.0f,
+                    (float)(fxTick % 7), (uint8_t)(2 * (H / 200 > 0 ? H / 200 : 1)), true };
       break;
     }
+  }
   for (int bi = 0; bi < AQ_MAX_BUB; bi++) {
     AqBub& bu = aqBub[bi];
     if (!bu.live) continue;
