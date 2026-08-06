@@ -939,11 +939,14 @@ static void rotateToScanout() {
 // traffic -- the aquarium's per-present PPA load drops from 4 MB to well under 1 MB, which
 // removes the PSRAM contention that starved the DSI FIFO (the flash/blink saga). Single-
 // buffer contract: does NOT swap drawBuf/liveBuf; the caller keeps drawing the same buffer.
-// (No overlay hook, no blip -- effect-only path.) Falls back to per-rect CPU rotate.
+// The overlay hook DOES ride this path (v0.4.6: the ticker band froze over the aquarium
+// without it -- callers include canvasTickerBand() in their dirty union so the hook's
+// output reaches the glass); the blip stays panelShow-only. Falls back to CPU rotate.
 void panelPresentRects(const int16_t* rects, int n) {
   if (!info.ok || n <= 0) return;
   if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY);
   if (gPpa && gRotDone) xSemaphoreTake(gRotDone, portMAX_DELAY);   // any in-flight full rotate
+  if (sOverlay) sOverlay();   // overlay rides every present path (see header comment)
   // Sync ONLY the dirty row bands (v0.4.2 blink fix): a full 2 MB esp_cache_msync runs
   // with interrupts disabled for ~1 ms -- longer than the ~0.75 ms vblank window in which
   // the DSI's frame re-arm ISR must land. A missed re-arm scans a whole frame of

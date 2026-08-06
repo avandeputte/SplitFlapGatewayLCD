@@ -18,6 +18,7 @@
 #include "audio.h"         // microphone features for the audio-reactive effects (v3.4)
 #include "vmodule.h"       // soundwall pokes flap targets directly
 #include "reel.h"          // VM_COLOUR_BASE: the colour flap indices
+#include "canvas.h"        // canvasTickerBand: the aquarium keeps the overlay band fresh
 
 volatile uint8_t gEffect      = EFFECT_NONE;
 volatile bool    gEffectAudioMod = false;   // "audio":true -- mic modulates the effect
@@ -1013,6 +1014,9 @@ static void renderAquarium() {
   } else {
     aqRestoreDirty(W, H);                          // prev-frame strips -> background
   }
+  // Overlay ticker (v0.4.6): mark its band FIRST so it always wins a dirty slot --
+  // the union present plus the hook inside panelPresentRects repaint it every frame.
+  { int tby, tbh; if (canvasTickerBand(&tby, &tbh)) aqMark(0, tby, W, tbh); }
   // Surface shimmer: two light rows sliding slowly (their band restores every frame).
   { const int sy = H / 24 + 1;
     aqMark(0, sy - 1, W, 5);

@@ -1089,45 +1089,78 @@ static int tickerPos(uint32_t now) {
 }
 
 static const Font1252* tickerFace() {
-  int H = gPanel.panelH;
-  if (H >= 60) return &FONT_10x20;
-  if (H >= 28) return &FONT_8x13;
-  return &FONT_6x9;
+  // Bitmap fallback only -- the TTF path is the default and the panel is fixed at
+  // 800 px tall, so the old height ladder (H>=60 / H>=28 / 6x9) was dead code (audit).
+  return &FONT_10x20;
 }
 
 volatile bool gTickerOverlay = false;
 static bool tickBand = true;
 
-// Overlay draw pass, installed as the panelShow() hook while an overlay ticker runs: a
+// Overlay draw pass, installed as the present hook while an overlay ticker runs: a
 // lower-third band + the scrolled text, drawn into every presented frame regardless of
-// who rendered it. Uses only pixel-level calls; never calls panelShow.
+// who rendered it -- panelShow AND panelPresentRects both invoke it (v0.4.6), so
+// incremental-present renderers (aquarium) carry the overlay too. Draws in the CURRENT
+// SURFACE's coordinates (a scale-5 effect presents 256x160; the PPA upscale keeps the
+// band the same physical size on glass at any scale). Drawing native coordinates here
+// used to land entirely OFF a scaled surface: invisible text, wasted work (audit).
 static void tickerOverlayDraw() {
-  // Advance the scroll here, time-gated: the hook runs once per presented frame,
-  // whoever presents it (effect at ~70 fps, animation, canvas push, wall repaint),
-  // so the overlay animates without the base renderer's cooperation.
-  tickScroll = tickerPos(millis());         // sampled per presented frame -- see tickStartMs
+  const PanelInfo& pi = panelInfo();
+  const int sw = pi.width, sh = pi.height;
+  if (sw <= 0 || sh <= 0) return;
+  const uint32_t now = millis();
   if (tickTtf) {                            // scalable lower-third (see canvasTickerSet)
-    const int bandH = tickSize * 13 / 10;
-    const int by = gPanel.panelH - bandH;
-    if (tickBand) panelFillRect(0, by, gPanel.panelW, bandH, 0, 0, 0);
-    ttfDrawText(gPanel.panelW - tickScroll, by + (bandH - tickSize) / 2, tickSize, TTF_SANS,
-                tickText, 0, tickR, tickG, tickB, true, 0,
+    int size = sh / 10;
+    if (size < TTF_MIN_SIZE) size = TTF_MIN_SIZE;
+    if (size > TTF_MAX_SIZE) size = TTF_MAX_SIZE;
+    const int bandH = size * 13 / 10;
+    const int by = sh - bandH;
+    // Width, rate and phase all in surface units, derived per draw (the glyph cache
+    // makes the width walk cheap): px/s scales with the surface so the on-glass speed
+    // is identical at every effect scale, and the phase stays time-based (smooth).
+    const int textW = ttfTextWidth(TTF_SANS, size, tickText, 0);
+    int pxs = (int)((int64_t)tickPxSec * sw / (gPanel.panelW ? gPanel.panelW : sw));
+    if (pxs < 1) pxs = 1;
+    uint32_t period = (uint32_t)(textW + sw) * 1000u / (uint32_t)pxs;
+    if (!period) period = 1;
+    const int scroll = (int)((uint64_t)((now - tickStartMs) % period) * (uint32_t)pxs / 1000u);
+    if (tickBand) panelFillRect(0, by, sw, bandH, 0, 0, 0);
+    ttfDrawText(sw - scroll, by + (bandH - size) / 2, size, TTF_SANS, tickText, 0,
+                tickR, tickG, tickB, true, 0,
                 false, 0, 0, 0, false, 0, 0, 0);
     return;
   }
   const Font1252* f = tickFont;
   const int gw = f->width + 1;
   const int bandH = f->height + 2;
-  const int by = gPanel.panelH - bandH;
-  if (tickBand) panelFillRect(0, by, gPanel.panelW, bandH, 0, 0, 0);
+  const int by = sh - bandH;
+  tickScroll = tickerPos(now);              // uploaded-face path: native-rate scroll
+  if (tickBand) panelFillRect(0, by, sw, bandH, 0, 0, 0);
   const int y0 = by + 1;
-  const int startX = gPanel.panelW - tickScroll;
+  const int startX = sw - tickScroll;
   for (size_t i = 0; tickText[i]; i++) {
     int gx = startX + (int)i * gw;
-    if (gx >= gPanel.panelW) break;
+    if (gx >= sw) break;
     if (gx + f->width < 0) continue;
     dispDrawGlyph1252(gx, y0, f, (uint8_t)tickText[i], 0, 255, tickR, tickG, tickB);
   }
+}
+
+// The overlay band's rect in CURRENT surface coordinates -- incremental-present
+// renderers (aquarium) include it in their dirty union so the per-present hook
+// draw actually reaches the glass every frame.
+bool canvasTickerBand(int* y, int* h) {
+  if (!gTickerOverlay || !gTickerActive) return false;
+  const PanelInfo& pi = panelInfo();
+  int bandH;
+  if (tickTtf) {
+    int size = pi.height / 10;
+    if (size < TTF_MIN_SIZE) size = TTF_MIN_SIZE;
+    if (size > TTF_MAX_SIZE) size = TTF_MAX_SIZE;
+    bandH = size * 13 / 10;
+  } else bandH = tickFont->height + 2;
+  *y = pi.height - bandH; *h = bandH;
+  return true;
 }
 
 void canvasTickerSet(const char* text, uint8_t r, uint8_t g, uint8_t b, int speed,
@@ -1149,7 +1182,7 @@ void canvasTickerSet(const char* text, uint8_t r, uint8_t g, uint8_t b, int spee
   // 1280x800 panel. With no uploaded face, render through the TTF engine at a size cut
   // from the panel instead; the glyph cache makes the steady-state scroll a coverage
   // blit. An explicitly uploaded Font1252 still wins.
-  tickTtf = !font && ttfFaceReady(TTF_SANS) && gPanel.panelH >= 240;
+  tickTtf = !font && ttfFaceReady(TTF_SANS);
   if (tickTtf) {
     tickSize = overlay ? gPanel.panelH / 10 : gPanel.panelH / 6;   // band vs full-screen
     if (tickSize > TTF_MAX_SIZE) tickSize = TTF_MAX_SIZE;

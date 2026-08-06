@@ -123,6 +123,8 @@ void canvasTickerSet(const char* text, uint8_t r, uint8_t g, uint8_t b, int spee
                      bool overlay = false, bool band = true, const Font1252* font = nullptr);
 void canvasTickerRender();     // taskDisplay: exclusive mode -- draw + advance one step
 void canvasTickerTick(uint32_t now);  // taskDisplay: overlay mode -- advance scroll, repaint idle wall
+bool canvasTickerBand(int* y, int* h); // overlay band rect in CURRENT surface coords (false = no overlay);
+                                       //  incremental-present renderers add it to their dirty union
 void canvasTickerStop();              // stops an exclusive ticker; overlay survives (see force)
 void canvasTickerStopForce();         // stops any ticker, overlay included (Quiet Time, explicit)
 extern volatile bool gTickerOverlay;
