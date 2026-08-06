@@ -837,6 +837,30 @@ static inline void aqMark(int x, int y, int w, int h) {
   if (aqDirtyN[1] >= AQ_MAX_RECT || w <= 0 || h <= 0) return;
   aqDirty[1][aqDirtyN[1]++] = { (int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h };
 }
+// Merge overlapping / near-adjacent rects in place (swap-remove). Fewer, fatter rects
+// mean fewer blocking PPA ops and less double-restored background: the unmerged worst
+// case was 138 ops per frame with heavily overlapping fish rects (audit). O(n^2) per
+// pass over <=138 entries is microseconds.
+static int aqMergeRects(AqRect* r, int n) {
+  bool again = true;
+  while (again) {
+    again = false;
+    for (int i = 0; i < n; i++)
+      for (int j = i + 1; j < n; j++) {
+        if (r[i].x > r[j].x + r[j].w + 8 || r[j].x > r[i].x + r[i].w + 8 ||
+            r[i].y > r[j].y + r[j].h + 8 || r[j].y > r[i].y + r[i].h + 8) continue;
+        const int x0 = r[i].x < r[j].x ? r[i].x : r[j].x;
+        const int y0 = r[i].y < r[j].y ? r[i].y : r[j].y;
+        const int x1 = (r[i].x + r[i].w > r[j].x + r[j].w) ? r[i].x + r[i].w : r[j].x + r[j].w;
+        const int y1 = (r[i].y + r[i].h > r[j].y + r[j].h) ? r[i].y + r[i].h : r[j].y + r[j].h;
+        r[i] = { (int16_t)x0, (int16_t)y0, (int16_t)(x1 - x0), (int16_t)(y1 - y0) };
+        r[j] = r[--n];
+        again = true;
+      }
+  }
+  return n;
+}
+
 static void aqRestoreDirty(int W, int H) {         // prev rects -> background
   for (int i = 0; i < aqDirtyN[0]; i++) {
     int x = aqDirty[0][i].x, y = aqDirty[0][i].y;
@@ -1012,6 +1036,7 @@ static void renderAquarium() {
     aqDirtyN[0] = aqDirtyN[1] = 0; aqFirstFrame = true;
     if (aqBgValid) aqSeed(W, H);                   // seed on the first good compose
   } else {
+    aqDirtyN[0] = aqMergeRects(aqDirty[0], aqDirtyN[0]);   // dedup overlap before the CPU restore
     aqRestoreDirty(W, H);                          // prev-frame strips -> background
   }
   // Overlay ticker (v0.4.6): mark its band FIRST so it always wins a dirty slot --
@@ -1082,13 +1107,17 @@ static void renderAquarium() {
     aqDirtyN[0] = aqDirtyN[1]; memcpy(aqDirty[0], aqDirty[1], sizeof(AqRect) * aqDirtyN[1]);
     aqDirtyN[1] = 0;
   } else {
-    // present prev ∪ cur: erases old entity positions, paints new ones. int16 quads.
-    static int16_t quads[2 * AQ_MAX_RECT * 4]; int qn = 0;
+    // present prev ∪ cur: erases old entity positions, paints new ones -- merged first,
+    // so overlapping fish/band rects become a few fat blocks instead of ~138 PPA ops.
+    static AqRect comb[2 * AQ_MAX_RECT]; int cn = 0;
     for (int li = 0; li < 2; li++)
-      for (int i = 0; i < aqDirtyN[li]; i++) {
-        quads[qn*4] = aqDirty[li][i].x; quads[qn*4+1] = aqDirty[li][i].y;
-        quads[qn*4+2] = aqDirty[li][i].w; quads[qn*4+3] = aqDirty[li][i].h; qn++;
-      }
+      for (int i = 0; i < aqDirtyN[li]; i++) comb[cn++] = aqDirty[li][i];
+    cn = aqMergeRects(comb, cn);
+    static int16_t quads[2 * AQ_MAX_RECT * 4]; int qn = 0;
+    for (int i = 0; i < cn; i++) {
+      quads[qn*4] = comb[i].x; quads[qn*4+1] = comb[i].y;
+      quads[qn*4+2] = comb[i].w; quads[qn*4+3] = comb[i].h; qn++;
+    }
     panelPresentRects(quads, qn);
     aqDirtyN[0] = aqDirtyN[1]; memcpy(aqDirty[0], aqDirty[1], sizeof(AqRect) * aqDirtyN[1]);
     aqDirtyN[1] = 0;

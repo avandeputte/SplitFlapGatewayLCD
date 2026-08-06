@@ -772,7 +772,10 @@ void panelEllipse(int cx, int cy, int a, int b, bool fill, uint8_t r, uint8_t g,
 
 void panelCloneToBack() {
   if (!info.ok) return;
-  memcpy(fb[drawBuf], fb[liveBuf], (size_t)W * H * sizeof(px_t));
+  // DMA when the gates pass (they always do here: 128-aligned allocs, 128-divisible
+  // geometries) -- the native 2 MB clone drops from ~29 ms CPU to ~18 ms mostly-DMA,
+  // and panelFastCopy falls back to memcpy itself otherwise. (audit)
+  panelFastCopy(fb[drawBuf], fb[liveBuf], (size_t)W * H * sizeof(px_t));
 }
 
 void panelReadback(uint8_t* out, bool rgb565) {
@@ -803,6 +806,25 @@ void panelReadback(uint8_t* out, bool rgb565) {
 void panelScroll(int dx, int dy, uint8_t fr, uint8_t fg, uint8_t fb_) {
   if (!info.ok) return;
   const uint8_t src = liveBuf;
+  // Span fast path (audit: the per-pixel loop was ~1M unpack/repack round-trips per
+  // native scroll op): whole packed rows via memcpy when nothing needs compositing
+  // and the clip is fully open. Source and destination are different buffers, so
+  // copy order is free.
+  if (!gBlendActive && !gLayerBuf && clipX0 == 0 && clipY0 == 0 && clipX1 == W && clipY1 == H) {
+    const px_t fill = pack565(fr, fg, fb_);
+    for (int y = 0; y < H; y++) {
+      px_t* drow = fb[drawBuf] + (size_t)y * W;
+      const int sy = y - dy;
+      if (sy < 0 || sy >= H) { for (int x = 0; x < W; x++) drow[x] = fill; continue; }
+      const px_t* srow = fb[src] + (size_t)sy * W;
+      const int x0 = dx > 0 ? (dx < W ? dx : W) : 0;          // dest cols with a valid source
+      const int x1 = dx < 0 ? (W + dx > 0 ? W + dx : 0) : W;
+      for (int x = 0; x < x0; x++) drow[x] = fill;
+      if (x1 > x0) memcpy(drow + x0, srow + (x0 - dx), (size_t)(x1 - x0) * sizeof(px_t));
+      for (int x = x1; x < W; x++) drow[x] = fill;
+    }
+    return;
+  }
   for (int y = 0; y < H; y++)
     for (int x = 0; x < W; x++) {
       int sx = x - dx, sy = y - dy;
@@ -1059,11 +1081,11 @@ void panelShow() {
   const uint32_t t1 = micros();
   rotateToScanout();
   const uint32_t t2 = micros();
-  // TEMP flash-hunt (v0.3 diag): log the ONSET of any bright full-frame present -- the
-  // "app-switch flash". Samples EVERY present (no rate limit) so a flash lasting a single
-  // frame (~16 ms) can't slip between samples; edge-triggered (not-bright -> bright) so a
-  // sustained bright app logs once, not 60x/s. ~3000 sparse reads/present, negligible cost.
-  {
+  // Flash-hunt diag (v0.3): log the ONSET of any bright full-frame present -- the
+  // "app-switch flash". Edge-triggered (not-bright -> bright) so a sustained bright app
+  // logs once. gSerialDebug-gated (audit): the ~3000 sparse PSRAM reads are ~0.5-0.8 ms
+  // per present INSIDE the show lock -- diagnostic-priced, not always-on-priced.
+  if (gSerialDebug) {
     uint32_t sr = 0, sg = 0, sb = 0, cnt = 0;
     const px_t* p = fb[drawBuf];
     const size_t total = (size_t)W * H;

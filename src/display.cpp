@@ -453,14 +453,74 @@ bool dispRender() {
   uint8_t want = cfg.panelBright ? cfg.panelBright : DEFAULT_BRIGHTNESS;
   if (want != lastBright) { panelSetBrightness(want); lastBright = want; }
 
-  panelClear();
-  for (int i = 0; i < n; i++) {
-    int col = i % gPanel.cols;
-    int row = i / gPanel.cols;
-    if (row >= gPanel.rows) break;      // more modules than cells: nothing to draw
-    drawCell(col, row, snap[i]);
+  // Dirty-cell repaint (audit: the all-or-nothing path -- full 2 MB clear, all ~75
+  // cells, full present -- capped ANY wall activity at ~18 fps and made a single
+  // flap tick cost a whole frame). Track what each cell last showed; redraw only
+  // cells that changed and present just their rects. Ownership is inferred by gap
+  // detection, same as the ticker: if the wall hasn't presented recently, someone
+  // else (effect/canvas/alert/boot) painted the panel and we start from a full frame.
+  static CellSnap lastDrawn[VM_MAX_MODULES];
+  static bool     wallValid = false;
+  static uint32_t lastWallMs = 0;
+  static int16_t  wallRects[4 * VM_MAX_MODULES];
+  const uint32_t now = millis();
+  if (now - lastWallMs > 500) wallValid = false;
+  lastWallMs = now;
+
+  int tby = 0, tbh = 0;
+  const bool oband = canvasTickerBand(&tby, &tbh);   // overlay band: keep its strip fresh
+
+  int changed = 0;
+  if (wallValid)
+    for (int i = 0; i < n; i++)
+      if (memcmp(&snap[i], &lastDrawn[i], sizeof(CellSnap)) != 0) changed++;
+
+  if (!wallValid || changed > n / 2) {
+    // Full path: first frame after losing the panel, or most of the wall moved
+    // anyway. panelShow runs the overlay hook itself; the clone collapses us to
+    // single-buffer drawing so the incremental path below edits the live frame.
+    panelClear();
+    for (int i = 0; i < n; i++) {
+      int col = i % gPanel.cols;
+      int row = i / gPanel.cols;
+      if (row >= gPanel.rows) break;    // more modules than cells: nothing to draw
+      drawCell(col, row, snap[i]);
+      lastDrawn[i] = snap[i];
+    }
+    panelShow();
+    panelCloneToBack();
+    wallValid = true;
+    return true;
   }
-  panelShow();
+  if (!changed && !oband) return true;   // verified current: the dirty poke changed no pixels
+                                         // (e.g. brightness-only). TRUE, or the caller's
+                                         // pending flag would retry this forever.
+
+  int rn = 0;
+  for (int i = 0; i < n; i++) {
+    const int col = i % gPanel.cols;
+    const int row = i / gPanel.cols;
+    if (row >= gPanel.rows) break;
+    const int cy = gPanel.originY + row * (gPanel.cellH + gPanel.rowGap);
+    // Cells under the overlay band redraw every frame: the band (opaque or not)
+    // overwrites them at present time, and a stale cell under a transparent band
+    // would smear old text.
+    const bool underBand = oband && (cy + gPanel.cellH > tby);
+    if (!underBand && memcmp(&snap[i], &lastDrawn[i], sizeof(CellSnap)) == 0) continue;
+    const int cx = gPanel.originX + col * gPanel.cellW;
+    panelFillRect(cx, cy, gPanel.cellW, gPanel.cellH, 0, 0, 0);
+    drawCell(col, row, snap[i]);
+    lastDrawn[i] = snap[i];
+    wallRects[rn*4] = (int16_t)cx;            wallRects[rn*4+1] = (int16_t)cy;
+    wallRects[rn*4+2] = (int16_t)gPanel.cellW; wallRects[rn*4+3] = (int16_t)gPanel.cellH;
+    rn++;
+  }
+  if (oband) {                                       // the hook draws the band inside the present
+    wallRects[rn*4] = 0;                       wallRects[rn*4+1] = (int16_t)tby;
+    wallRects[rn*4+2] = (int16_t)gPanel.panelW; wallRects[rn*4+3] = (int16_t)tbh;
+    rn++;
+  }
+  if (rn) panelPresentRects(wallRects, rn);
   return true;
 }
 
