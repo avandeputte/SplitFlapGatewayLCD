@@ -1064,8 +1064,21 @@ static int             tickScroll = 0, tickTextW = 0;
 static const Font1252* tickFont = &FONT_6x10;
 static bool            tickTtf  = false;   // scalable path: TTF sans at a panel-proportional size
 static int             tickSize = 0;       // em size when tickTtf
-static int             tickMult = 1;       // speed multiplier: keep px/step proportional to glyph size
+static int             tickMult = 1;       // speed multiplier: keep px/s proportional to glyph size
 static uint32_t        tickLastMs = 0;
+// Time-based scroll (v0.4.5): position is a pure function of elapsed time, computed at
+// every draw. The old 33 ms step clock moved big-glyph text in ~15 px lurches that also
+// BEAT against the present cadence -- visibly unsmooth. Now each presented frame samples
+// the true position, so motion is as smooth as the presents themselves.
+static uint32_t        tickStartMs = 0, tickPeriodMs = 1;
+static int             tickPxSec = 60;     // scroll rate, px/s (speed * mult * legacy 30 steps/s)
+static bool            tickPrimed = false; // exclusive mode: full frame shown, band presents valid
+static uint32_t        tickPrimedMs = 0;
+
+static int tickerPos(uint32_t now) {
+  const uint32_t ph = (now - tickStartMs) % (tickPeriodMs ? tickPeriodMs : 1);
+  return (int)((uint64_t)ph * (uint32_t)tickPxSec / 1000u);
+}
 
 static const Font1252* tickerFace() {
   int H = gPanel.panelH;
@@ -1084,12 +1097,7 @@ static void tickerOverlayDraw() {
   // Advance the scroll here, time-gated: the hook runs once per presented frame,
   // whoever presents it (effect at ~70 fps, animation, canvas push, wall repaint),
   // so the overlay animates without the base renderer's cooperation.
-  uint32_t now = millis();
-  if (now - tickLastMs >= 33) {
-    tickLastMs = now;
-    tickScroll += tickSpeed * tickMult;
-    if (tickScroll > tickTextW + gPanel.panelW) tickScroll = 0;
-  }
+  tickScroll = tickerPos(millis());         // sampled per presented frame -- see tickStartMs
   if (tickTtf) {                            // scalable lower-third (see canvasTickerSet)
     const int bandH = tickSize * 13 / 10;
     const int by = gPanel.panelH - bandH;
@@ -1133,7 +1141,8 @@ void canvasTickerSet(const char* text, uint8_t r, uint8_t g, uint8_t b, int spee
   if (tickTtf) {
     tickSize = overlay ? gPanel.panelH / 10 : gPanel.panelH / 6;   // band vs full-screen
     if (tickSize > TTF_MAX_SIZE) tickSize = TTF_MAX_SIZE;
-    tickMult = tickSize / 16; if (tickMult < 1) tickMult = 1;      // px/step scales with glyphs
+    tickMult = tickSize / 24; if (tickMult < 1) tickMult = 1;      // px/s scales with glyph size
+                                                                   // (~180 px/s at speed 2 @ 800p)
     tickTextW = ttfTextWidth(TTF_SANS, tickSize, tickText, 0);
   } else {
     tickSize = 0; tickMult = 1;
@@ -1141,6 +1150,11 @@ void canvasTickerSet(const char* text, uint8_t r, uint8_t g, uint8_t b, int spee
     tickTextW = (int)strlen(tickText) * gw;
   }
   tickScroll = 0; tickLastMs = 0;
+  tickPxSec = tickSpeed * tickMult * 30;     // same net rate the 33 ms step clock produced
+  if (tickPxSec < 1) tickPxSec = 1;
+  tickPeriodMs = (uint32_t)(tickTextW + gPanel.panelW) * 1000u / (uint32_t)tickPxSec;
+  if (!tickPeriodMs) tickPeriodMs = 1;
+  tickStartMs = millis(); tickPrimed = false;
   if (overlay) {
     // Composite over whatever is presenting: no panel claim, no mode change.
     gTickerOverlay = true;
@@ -1176,18 +1190,41 @@ void canvasTickerTick(uint32_t now) {
 
 void canvasTickerRender() {
   uint32_t now = millis();
-  if (now - tickLastMs < 33) { vTaskDelay(pdMS_TO_TICKS(2)); return; }   // ~30 steps/s
-  tickLastMs = now;
   if (tickTtf) {                            // scalable full-screen line (see canvasTickerSet)
-    panelClear();
-    ttfDrawText(gPanel.panelW - tickScroll, (gPanel.panelH - tickSize) / 2, tickSize, TTF_SANS,
-                tickText, 0, tickR, tickG, tickB, true, 0,
-                false, 0, 0, 0, false, 0, 0, 0);
-    panelShow();
-    tickScroll += tickSpeed * tickMult;
-    if (tickScroll > tickTextW + gPanel.panelW) tickScroll = 0;
+    tickScroll = tickerPos(now);
+    const int pad = tickSize / 6 + 2;       // TTF descenders/AA can spill past the em box
+    int by = (gPanel.panelH - tickSize) / 2 - pad;
+    if (by < 0) by = 0;
+    int bh = tickSize + 2 * pad;
+    if (by + bh > gPanel.panelH) bh = gPanel.panelH - by;
+    const int ty = (gPanel.panelH - tickSize) / 2;
+    if (!tickPrimed || now - tickPrimedMs > 2000) {
+      // Full present: first frame, then a 2 s refresh so anything that overdrew the
+      // panel (an alert flashing through) self-heals -- and the back buffer the band
+      // presents depend on is re-synced.
+      panelClear();
+      ttfDrawText(gPanel.panelW - tickScroll, ty, tickSize, TTF_SANS, tickText, 0,
+                  tickR, tickG, tickB, true, 0, false, 0, 0, 0, false, 0, 0, 0);
+      panelShow();
+      panelCloneToBack();
+      tickPrimed = true; tickPrimedMs = now;
+      return;
+    }
+    // Steady state: only the text band changes, so redraw and present just that rect.
+    // A full-frame present caps near 18 fps at native (2 MB writeback + 53 ms rotate);
+    // the band is ~1/6 of the panel and sustains ~60, which with the time-sampled
+    // position is what reads as smooth motion.
+    panelFillRect(0, by, gPanel.panelW, bh, 0, 0, 0);
+    ttfDrawText(gPanel.panelW - tickScroll, ty, tickSize, TTF_SANS, tickText, 0,
+                tickR, tickG, tickB, true, 0, false, 0, 0, 0, false, 0, 0, 0);
+    const int16_t rc[4] = { 0, (int16_t)by, (int16_t)gPanel.panelW, (int16_t)bh };
+    panelPresentRects(rc, 1);
+    vTaskDelay(1);                          // pace between band presents
     return;
   }
+  if (now - tickLastMs < 33) { vTaskDelay(pdMS_TO_TICKS(2)); return; }   // ~30 steps/s
+  tickLastMs = now;
+  tickScroll = tickerPos(now);              // time-based here too: no step/present beat
   const Font1252* f = tickFont;
   const int gw = f->width + 1;
   const int y0 = (gPanel.panelH - f->height) / 2;
@@ -1200,8 +1237,6 @@ void canvasTickerRender() {
     dispDrawGlyph1252(gx, y0, f, (uint8_t)tickText[i], 0, 255, tickR, tickG, tickB);
   }
   panelShow();
-  tickScroll += tickSpeed;
-  if (tickScroll > tickTextW + gPanel.panelW) tickScroll = 0;   // whole line has passed: wrap
 }
 
 // ---- uploadable fonts (v2.1) -------------------------------------------------------------------
