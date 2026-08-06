@@ -1073,7 +1073,7 @@ static uint32_t        tickLastMs = 0;
 static uint32_t        tickStartMs = 0, tickPeriodMs = 1;
 static int             tickPxSec = 60;     // scroll rate, px/s (speed * mult * legacy 30 steps/s)
 static bool            tickPrimed = false; // exclusive mode: full frame shown, band presents valid
-static uint32_t        tickPrimedMs = 0;
+static uint32_t        tickPrimedMs = 0;   // last render stamp: a >200 ms gap = we lost the panel
 
 static int tickerPos(uint32_t now) {
   const uint32_t ph = (now - tickStartMs) % (tickPeriodMs ? tickPeriodMs : 1);
@@ -1198,10 +1198,11 @@ void canvasTickerRender() {
     int bh = tickSize + 2 * pad;
     if (by + bh > gPanel.panelH) bh = gPanel.panelH - by;
     const int ty = (gPanel.panelH - tickSize) / 2;
-    if (!tickPrimed || now - tickPrimedMs > 2000) {
-      // Full present: first frame, then a 2 s refresh so anything that overdrew the
-      // panel (an alert flashing through) self-heals -- and the back buffer the band
-      // presents depend on is re-synced.
+    if (!tickPrimed || now - tickPrimedMs > 200) {
+      // Full present on the first frame -- and again only after a >200 ms gap in our
+      // own render cadence, the signal that something else (an alert) had the panel
+      // and overdrew it. The earlier fixed 2 s refresh was itself the residual jerk:
+      // a ~100 ms hitch (full show + 2 MB clone) on a metronome.
       panelClear();
       ttfDrawText(gPanel.panelW - tickScroll, ty, tickSize, TTF_SANS, tickText, 0,
                   tickR, tickG, tickB, true, 0, false, 0, 0, 0, false, 0, 0, 0);
@@ -1219,6 +1220,7 @@ void canvasTickerRender() {
                 tickR, tickG, tickB, true, 0, false, 0, 0, 0, false, 0, 0, 0);
     const int16_t rc[4] = { 0, (int16_t)by, (int16_t)gPanel.panelW, (int16_t)bh };
     panelPresentRects(rc, 1);
+    tickPrimedMs = now;                     // cadence stamp: keeps the reprime gap-detector quiet
     vTaskDelay(1);                          // pace between band presents
     return;
   }
