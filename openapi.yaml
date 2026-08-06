@@ -680,12 +680,6 @@ paths:
       tags: [Status]
       summary: Play tones or a WAV from the SD card (v3.6 / v3.13)
       description: |
-        Tones: `{freq,ms,vol}` or `{notes:[[f,ms],…],vol}`; `{stop:true}` halts anything.
-        **WAV (v3.13):** `{"wav":"/sounds/x.wav","vol":80}` streams a file from the SD
-        card — strict 16-bit 16 kHz mono/stereo PCM (the duplex I2S clock is fixed).
-        Replaces queued tones; a newer request replaces it; Quiet Time silences it.
-        Format problems are logged on-device (the request 200s once the file exists).
-      description: |
         On-device tone synthesis through the ES8311 DAC and power amp: one tone
         (`freq` 20–8000 Hz, `ms` ≤ 2000) or a `notes` sequence (`[[freq,ms],…]`,
         freq 0 = rest, ≤ 32 notes), `vol` 0–100. `{"stop":true}` stops immediately.
@@ -693,6 +687,11 @@ paths:
         the speaker**: a play is refused with `409`, and turning Quiet Time on stops any
         tone mid-play. The settings master enable (`403` when off) and master volume
         (scales `vol`, v3.6.1) apply too. No PCM upload — tones only, by design.
+
+        **WAV (v3.13):** `{"wav":"/sounds/x.wav","vol":80}` streams a file from the SD
+        card — strict 16-bit 16 kHz mono/stereo PCM (the duplex I2S clock is fixed).
+        Replaces queued tones; a newer request replaces it; Quiet Time silences it.
+        Format problems are logged on-device (the request 200s once the file exists).
       requestBody:
         required: true
         content:
@@ -1716,9 +1715,13 @@ paths:
         lower-third band over **whatever else is presenting** — the flap wall, an effect, an
         animation, a pushed canvas frame — via a hook on every presented frame. An overlay
         ticker **survives page and mode changes**; only an explicit stop (`{"text":""}`), Quiet
-        Time, or replacing it with a non-overlay ticker removes it. `band` (default `true`)
-        draws the black band behind the text; `false` scrolls the glyphs straight over the
-        content beneath.
+        Time, replacing it with a non-overlay ticker, or its own `seconds` TTL removes it.
+        `band` (default `true`) draws the black band behind the text; `false` scrolls the
+        glyphs straight over the content beneath.
+
+        `seconds` (v0.4.7) auto-dismisses the ticker after that many seconds — an exclusive
+        ticker hands the panel back to the wall, an overlay one simply vanishes. `0` (the
+        default) keeps the old behaviour: it stays until replaced or stopped.
 
         `font` (v2.1) names a face for the text: `custom` is the uploaded slot
         (`PUT /api/canvas/font`), any other name loads `/fonts/<name>.fnt` from the library.
@@ -1748,6 +1751,12 @@ paths:
                   type: boolean
                   default: true
                   description: "Draw the black band behind the text (v2.1). false scrolls the glyphs over the content beneath."
+                seconds:
+                  type: integer
+                  minimum: 0
+                  maximum: 86400
+                  default: 0
+                  description: "Auto-dismiss after this many seconds (v0.4.7). 0 = persistent until replaced or stopped."
                 font:
                   type: string
                   description: "Face for the text (v2.1): \"custom\" or a library name. Unknown names fall back to the built-in face."

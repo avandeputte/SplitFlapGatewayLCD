@@ -473,6 +473,9 @@ bool dispRender() {
 
   int tby = 0, tbh = 0;
   const bool oband = canvasTickerBand(&tby, &tbh);   // overlay band: keep its strip fresh
+  static bool hadBand = false;
+  if (hadBand && !oband) wallValid = false;  // overlay just ended (TTL/stop): its strip
+  hadBand = oband;                           // is stale on glass -- full repaint clears it
 
   int changed = 0;
   if (wallValid)

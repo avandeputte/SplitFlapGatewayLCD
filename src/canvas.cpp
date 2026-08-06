@@ -1081,6 +1081,10 @@ static uint32_t        tickLastMs = 0;
 // BEAT against the present cadence -- visibly unsmooth. Now each presented frame samples
 // the true position, so motion is as smooth as the presents themselves.
 static uint32_t        tickStartMs = 0, tickPeriodMs = 1;
+static uint32_t        tickExpireAt = 0;   // millis deadline (v0.4.7); 0 = persistent
+static bool tickerExpired(uint32_t now) {
+  return tickExpireAt && (int32_t)(now - tickExpireAt) >= 0;
+}
 static int             tickPxSec = 60;     // scroll rate, px/s (speed * mult * legacy 30 steps/s)
 static bool            tickPrimed = false; // exclusive mode: full frame shown, band presents valid
 static uint32_t        tickPrimedMs = 0;   // last render stamp: a >200 ms gap = we lost the panel
@@ -1111,6 +1115,11 @@ static void tickerOverlayDraw() {
   const int sw = pi.width, sh = pi.height;
   if (sw <= 0 || sh <= 0) return;
   const uint32_t now = millis();
+  if (tickerExpired(now)) {                 // TTL (v0.4.7): self-dismiss from any present path.
+    canvasTickerStopForce();                // Clearing the hook mid-call is safe (checked per
+    dispMarkDirty();                        // present); the wall notices the band vanished and
+    return;                                 // full-repaints; effects repaint their surface anyway.
+  }
   if (tickTtf) {                            // scalable lower-third (see canvasTickerSet)
     int size = sh / 10;
     if (size < TTF_MIN_SIZE) size = TTF_MIN_SIZE;
@@ -1174,7 +1183,7 @@ bool canvasTickerBand(int* y, int* h) {
 }
 
 void canvasTickerSet(const char* text, uint8_t r, uint8_t g, uint8_t b, int speed,
-                     bool overlay, bool band, const Font1252* font) {
+                     bool overlay, bool band, const Font1252* font, int seconds) {
   gTickerActive = false;                     // stop the renderer reading half-updated state
   panelSetOverlay(nullptr);
   gTickerOverlay = false;
@@ -1210,6 +1219,7 @@ void canvasTickerSet(const char* text, uint8_t r, uint8_t g, uint8_t b, int spee
   tickPeriodMs = (uint32_t)(tickTextW + gPanel.panelW) * 1000u / (uint32_t)tickPxSec;
   if (!tickPeriodMs) tickPeriodMs = 1;
   tickStartMs = millis(); tickPrimed = false;
+  tickExpireAt = seconds > 0 ? tickStartMs + (uint32_t)seconds * 1000u : 0;
   panelPresentUnlock();
   if (overlay) {
     // Composite over whatever is presenting: no panel claim, no mode change.
@@ -1240,12 +1250,17 @@ void canvasTickerTick(uint32_t now) {
   // tick exists for one case: the IDLE wall, which presents nothing on its own --
   // mark it dirty at the scroll cadence so repaints keep coming.
   if (!gTickerOverlay || !gTickerActive) return;
-  (void)now;
+  if (tickerExpired(now)) { canvasTickerStopForce(); dispMarkDirty(); return; }
   dispMarkDirty();
 }
 
 void canvasTickerRender() {
   uint32_t now = millis();
+  if (tickerExpired(now)) {                 // TTL (v0.4.7): exclusive ticker owns the panel,
+    canvasTickerStopForce();                // so expiry hands it back to the wall.
+    dispReturnToWall();
+    return;
+  }
   panelPresentLock();   // excludes canvasTickerSet's state rewrite (this renderer reads the
                         // same fields the overlay hook does) and makes the show/clone and
                         // rect-present sequences atomic against foreign presents (review)
