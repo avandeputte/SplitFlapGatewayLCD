@@ -51,7 +51,14 @@ display** (800×1280 portrait, mounted landscape 1280×800).
   preflights 0x45 and runs headless instead of hanging in the JD9365 ID read.
 - Ethernet wired in (IP101, IDF-default P4 RMII pins) — silent init, awaiting link.
 
-## Milestone 1 — first pixels (needs the hardware on the desk)
+## Milestone 1 — first pixels — **DONE (v0.1, bench session 2026-08-03)**
+
+> Status refresh (v0.4.6 audit): everything below happened. Panel lives at
+> 1280×800/60 native; rotation correct as written; WiFi runs through the C6
+> (slave updated to 2.12.8 via /api/system/c6ota); the flash ceiling was
+> resolved (32 MB partitions, OTA works and is the normal flash path); the
+> wall renders with per-cell dirty presents and TTF scalable text. Kept
+> verbatim below as the bring-up record.
 
 1. Flash over USB; watch USB-Serial-JTAG console.
 2. **Panel lights?** JD9365 init + backlight sequence are exactly Waveshare's; the
@@ -67,15 +74,19 @@ display** (800×1280 portrait, mounted landscape 1280×800).
 
 ## Milestone 2 — the network the board deserves
 
-- **Ethernet** (ETH library, IP101, PoE) alongside WiFi; advertise which is up.
+- ~~**Ethernet** (ETH library, IP101, PoE) alongside WiFi; advertise which is up.~~
+  **DONE**: ETH primary at .202; WiFi stays down while ETH is up (by design).
 - ~~SD pins from schematic → card + event log + backup work as on Matrix.~~
   **DONE (v0.4.2)**: pins were right all along (SLOT 0 IOMUX 43/44/39-42, LDO4
   rail); the mount failed because Arduino SD_MMC hardcodes SLOT 1 — the slot the
   C6 radio (esp_hosted SDIO) owns. Fixed with `BOARD_HAS_SDMMC` +
   `BOARD_SDMMC_SLOT=0` + `BOARD_SDMMC_POWER_CHANNEL=4` build flags; sdInit()
   must stay ordered before radio init (see sdcard.cpp header comment).
-- ES8311 speaker on the P4's I2S pins; mic capture path (single SMD mic — the clap
-  detector's not-bass gate needs re-calibration for it, ES7210 assumptions removed).
+- ~~ES8311 speaker on the P4's I2S pins; mic capture path (single SMD mic — the clap
+  detector's not-bass gate needs re-calibration for it, ES7210 assumptions removed).~~
+  **DONE**: duplex ES8311 (speaker + codec-ADC mic on one I2S port, RX as clock
+  heartbeat); audio-reactive effects verified live. Clap detection was not ported —
+  the touchscreen double-tap replaced it as the physical dismiss gesture.
 
 ## Milestone 3 — what only this surface can do
 

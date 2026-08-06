@@ -805,7 +805,7 @@ static void renderRipple() {
 /* ---- Aquarium (v0.4) --------------------------------------------------------------
    The companion's aquarium reimagined as a native effect: no streaming, rendered at
    panel rate on taskDisplay. Everything is sized from W/H so the same renderer serves
-   the LCD (scale-2 surface, 640x400) and the HUB75 matrix (native).
+   the LCD (NATIVE 1280x800 since v0.4.1 -- see effectScaleFor) and the HUB75 matrix.
    Layers, back to front: cached background (water gradient + light shafts + sand --
    composed ONCE into the framebuffer and snapshot; restored per frame with one DMA
    copy), surface shimmer, back plants, fish (small first), front plants, bubbles.

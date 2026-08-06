@@ -8,4 +8,4 @@ __pycache__/
 .dummy/
 managed_components/
 sdkconfig.defaults
-sdkconfig.waveshare_matrix*
+sdkconfig.waveshare_p4_lcd*

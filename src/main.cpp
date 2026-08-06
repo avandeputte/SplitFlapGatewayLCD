@@ -152,7 +152,7 @@ void setup() {
   rtcHwInit();
   rtcRead();
 
-  // 3b. Microphone ADC (ES7210) register bring-up -- HERE, single-threaded, because
+  // 3b. Audio codec (ES8311, duplex mic+speaker) register bring-up -- HERE, single-threaded, because
   //     rtc.cpp's raw Wire access holds no bus lock; after this the audio module
   //     never touches I2C again (capture start/stop is I2S-only). See audio.h.
   audioInit();

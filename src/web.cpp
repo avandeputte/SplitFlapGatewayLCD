@@ -660,7 +660,8 @@ static size_t capSinkLen = 0, capSinkCap = 0;
 static void capEmit(const char* str, size_t n) {
   if (capSink) {                                   // buffered mode
     if (capSinkLen + n < capSinkCap) { memcpy(capSink + capSinkLen, str, n); capSinkLen += n; }
-    // silently drop past cap -- callers size the buffer with headroom; verified below
+    else printf("[CAPS] sink overflow: %u + %u >= %u -- capabilities JSON truncated\n",
+                (unsigned)capSinkLen, (unsigned)n, (unsigned)capSinkCap);   // loud, not silent (audit)
     return;
   }
   httpxChunkStr(gStreamReq, str);
@@ -705,7 +706,7 @@ static esp_err_t handleApiCapabilities(httpd_req_t* r) {
   // a client can never mistake a truncated read for a down device (see capEmit).
   gStreamReq = r;
   capLen = 0;
-  capSinkCap = 8192; capSinkLen = 0;
+  capSinkCap = 16384; capSinkLen = 0;   // 16 KB: the 8 KB cap was ~1 growth spurt from silent truncation (audit)
   capSink = (char*)heap_caps_malloc(capSinkCap, MALLOC_CAP_SPIRAM);
   if (!capSink) capSink = (char*)malloc(capSinkCap);
 
@@ -890,7 +891,7 @@ size_t statusJson(char* outBuf, size_t outCap) {
     "\"heap\":%u,\"minheap\":%u,\"modules\":%d,"
     "\"stk\":{\"frames\":%u,\"web\":%u,\"net\":%u,\"httpd\":%u,\"rtc\":%u,\"disp\":%u},"
     "\"panel\":{\"ok\":%s,\"w\":%u,\"h\":%u,\"cols\":%u,\"rows\":%u,"
-    "\"cellW\":%u,\"cellH\":%u,\"depth\":%u,\"fbPsram\":%s,\"refreshHz\":%u,\"font\":\"%s\",\"vmods\":%d},"
+    "\"cellW\":%u,\"cellH\":%u,\"rowGap\":%u,\"depth\":%u,\"refreshHz\":%u,\"font\":\"%s\",\"vmods\":%d},"
     "\"time\":\"%s\",\"ntpSynced\":%s,\"quiet\":%s,"
     "\"companion\":{\"url\":\"%s\",\"status\":\"%s\",\"age\":%ld},\"env\":%s,\"sd\":%s,\"resets\":%s}",
     millis()/1000, txCount,
@@ -902,8 +903,8 @@ size_t statusJson(char* outBuf, size_t outCap) {
     vmCount,
     stkFrm, stkWeb, stkNet, stkHtp, stkRtc, stkDsp,
     gPanel.ready?"true":"false", gPanel.panelW, gPanel.panelH,
-    gPanel.cols, gPanel.rows, gPanel.cellW, gPanel.cellH, (unsigned)panelInfo().depth,
-    panelFbInPsram() ? "true" : "false", (unsigned)panelInfo().refreshHz,
+    gPanel.cols, gPanel.rows, gPanel.cellW, gPanel.cellH, (unsigned)gPanel.rowGap,
+    (unsigned)panelInfo().depth, (unsigned)panelInfo().refreshHz,
     dispFontName(), vmCount,
     rtcBuf,
     ntpSynced?"true":"false",
@@ -944,7 +945,6 @@ static esp_err_t handleApiConfigGet(httpd_req_t* r) {
   // gridRows/gridCols above are the emulated WALL: one virtual module per cell.
   // These describe the LED panel it is drawn on. Additive fields -- the companion
   // ignores anything it does not name.
-  doc["panelBGR"]      = cfg.panelBGR;
   doc["panelBright"]   = cfg.panelBright;
   doc["dimEnabled"]    = cfg.dimEnabled;
   doc["dimStart"]      = cfg.dimStart;
@@ -1027,12 +1027,9 @@ static esp_err_t handleApiConfigSettings(httpd_req_t* r) {
         gr, gc, gr * gc);
   }
   // ---- panel: reel speed + backlight ----
-  // The DSI panel is a fixed geometry; only the reel/flip timing, brightness and the
-  // BGR swap are settable (all applied on the next frame -- nothing to re-allocate).
-  if (doc["panelBGR"].is<bool>()) {
-    cfg.panelBGR = doc["panelBGR"].as<bool>();
-    panelSetColourOrder(cfg.panelBGR);
-  }
+  // The DSI panel is a fixed geometry; only the reel/flip timing and brightness are
+  // settable (applied on the next frame -- nothing to re-allocate). panelBGR is gone
+  // (v0.4.6): this panel is RGB by construction, the knob only mis-coloured it.
   // Brightness schedule (v3.13). dimTzOffsetMin shares cfg.quietTzOffsetMin -- one
   // browser, one local-time offset for both schedules.
   if (doc["dimEnabled"].is<bool>()) cfg.dimEnabled = doc["dimEnabled"].as<bool>();
@@ -1040,7 +1037,8 @@ static esp_err_t handleApiConfigSettings(httpd_req_t* r) {
   if (doc["dimEnd"].is<const char*>())   strlcpy(cfg.dimEnd,   doc["dimEnd"],   sizeof(cfg.dimEnd));
   if (doc["dimLevel"].is<int>()) { int v = doc["dimLevel"];
     if (v >= 1 && v <= 255) cfg.dimLevel = (uint8_t)v; }
-  if (doc["dimTzOffsetMin"].is<int>()) cfg.quietTzOffsetMin = (int16_t)doc["dimTzOffsetMin"].as<int>();
+  if (doc["dimTzOffsetMin"].is<int>()) { int v = doc["dimTzOffsetMin"];   // clamp like the
+    if (v >= -720 && v <= 840) cfg.quietTzOffsetMin = (int16_t)v; }         // quiet handler (audit)
   if (doc["touchEnabled"].is<bool>()) cfg.touchEnabled = doc["touchEnabled"].as<bool>();
   if (doc["backupEnabled"].is<bool>()) cfg.backupEnabled = doc["backupEnabled"].as<bool>();
   if (doc["panelBright"].is<int>())   { int v = doc["panelBright"];
@@ -4625,7 +4623,10 @@ static esp_err_t handleApiFsDelete(httpd_req_t* r) {
   bool isDir = false;
   { File f = FFat.open(path, "r"); isDir = f && f.isDirectory(); if (f) f.close(); }
   if (!(isDir ? FFat.rmdir(path) : FFat.remove(path))) {
-    httpxErr(r, 507, isDir ? "Directory not empty or remove failed" : "Remove failed");
+    // 409 for a non-empty directory, matching /api/sd/delete (audit: same failure,
+    // two different status codes across the two file surfaces).
+    if (isDir) { httpxErr(r, 409, "Directory not empty"); return ESP_OK; }
+    httpxErr(r, 507, "Remove failed");
     return ESP_OK;
   }
   { char cd[64]; snprintf(cd, sizeof(cd), "fs delete %.48s", path); logCommand('R', cd); }

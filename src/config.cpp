@@ -13,7 +13,6 @@ void cfgSetDefaults() {
   strlcpy(cfg.ntpServer, DEFAULT_NTP_SERVER, sizeof(cfg.ntpServer));
   cfg.gridRows = DEFAULT_GRID_ROWS;
   cfg.gridCols = DEFAULT_GRID_COLS;
-  cfg.panelBGR      = DEFAULT_PANEL_BGR;
   cfg.panelBright   = DEFAULT_BRIGHTNESS;
   cfg.flapMs        = DEFAULT_FLAP_MS;
   cfg.flapMax       = DEFAULT_FLAP_MAX;
@@ -59,7 +58,6 @@ void loadConfig() {
   cfg.gridCols = (uint8_t)prefs.getInt("gCols", DEFAULT_GRID_COLS);
   if (cfg.gridRows < 1) cfg.gridRows = 1;
   if (cfg.gridCols < 1) cfg.gridCols = 1;
-  cfg.panelBGR      =           prefs.getBool ("pBGR",   DEFAULT_PANEL_BGR);
   cfg.panelBright   =           prefs.getUChar("pBright",DEFAULT_BRIGHTNESS);
   cfg.flapMs        = (uint16_t)prefs.getInt  ("flapMs", DEFAULT_FLAP_MS);
   cfg.flapMax       =           prefs.getUChar("flapMax",DEFAULT_FLAP_MAX);
@@ -124,7 +122,6 @@ void saveConfig() {
   prefs.putUChar ("qsDays",    cfg.quietDays);
   prefs.putShort ("qsTzOff",   cfg.quietTzOffsetMin);
   // panel
-  prefs.putBool  ("pBGR",     cfg.panelBGR);
   prefs.putUChar ("pBright",  cfg.panelBright);
   prefs.putInt   ("flapMs",   cfg.flapMs);
   prefs.putUChar ("flapMax",  cfg.flapMax);
@@ -173,7 +170,6 @@ void cfgExportJson(JsonDocument& doc) {
   doc["quietEnd"]   = cfg.quietEnd;
   doc["quietDays"]  = cfg.quietDays;
   doc["quietTzOffsetMin"] = cfg.quietTzOffsetMin;
-  doc["panelBGR"]      = cfg.panelBGR;
   doc["panelBright"]   = cfg.panelBright;
   doc["flapMs"]        = cfg.flapMs;
   doc["flapMax"]       = cfg.flapMax;
@@ -224,7 +220,8 @@ bool cfgImportJson(const JsonDocument& doc, int& applied, bool& rebootNeeded) {
   IMP_HHMM("quietEnd",   cfg.quietEnd);
   IMP_NUM ("quietDays", cfg.quietDays, 0, 0x7F);
   IMP_NUM ("quietTzOffsetMin", cfg.quietTzOffsetMin, -14*60, 14*60);
-  IMP_BOOL("panelBGR", cfg.panelBGR);
+  // panelBGR intentionally NOT imported (v0.4.6): the DSI panel is RGB by construction,
+  // and a Matrix-export import silently swapping every colour was a real hazard (audit).
   IMP_NUM ("panelBright", cfg.panelBright, 1, 255);
   IMP_NUM ("flapMs", cfg.flapMs, 2, 500);
   IMP_NUM ("flapMax", cfg.flapMax, 1, FLAP_ANIM_MAX);

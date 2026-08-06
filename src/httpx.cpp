@@ -297,7 +297,8 @@ void httpxStart() {
   if (gHttpd) return;
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port      = 80;
-  cfg.core_id          = 0;        // where taskWeb always lived: core 1 belongs to WiFi + the panel
+  cfg.core_id          = 0;        // deliberate: core 0 keeps HTTP + WiFi-SDIO together; taskWeb
+                                   // (stream rendering) moved to core 1 in v0.2 -- see main.cpp
   cfg.task_priority    = 2;        // same as the old taskWeb
   cfg.stack_size       = 10240;    // handlers run here now; canvas/OTA paths are the deep ones
   // 4, deliberately tight: dashboard + SSE + companion + one more (curl/OTA). Every OPEN

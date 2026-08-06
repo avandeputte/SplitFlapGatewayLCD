@@ -111,7 +111,7 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 // and as "fw" in capabilities. Clients key product-specific behaviour on "product" and on
 // capability tokens, never on version heuristics (the old API_VERSION="3.1.0" masquerade
 // for the physical-gateway companion gate was removed in v3.12).
-#define FW_VERSION           "0.4.5"    // this product's version (UI + boot log)
+#define FW_VERSION           "0.4.6"    // this product's version (UI + boot log)
 #define PRODUCT_NAME         "LCD Gateway"
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
@@ -150,7 +150,6 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 #define FLAP_ASPECT_NUM      18     // card height = width * 18/10: ~10% squatter than the
 #define FLAP_ASPECT_DEN      10     //  classic 1:2 (tuned by eye in 5% steps, v0.4.3/0.4.4)
 #define FLAP_ROW_GAP_DIV     10     // inter-row gap = cellH/10 (dispPlan centres for it)
-#define DEFAULT_PANEL_BGR    false  // true if the panel is wired BGR (see panelSetColourOrder)
 #define DEFAULT_BRIGHTNESS   160    // 1..255, scales every colour before output
 // A real module flips a handful of flaps per second, not fifty. This also sets the
 // repaint rate: one flap is two half-steps, so the panel redraws at 2000/flapMs Hz

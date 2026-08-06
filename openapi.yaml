@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: LCD Gateway API
-  version: "0.1.0"
+  version: "0.4.6"
   description: |
     REST API for the **LCD Gateway** firmware, running on a Waveshare
     ESP32-P4-WIFI6-POE-ETH board driving a 10.1" MIPI-DSI touch LCD (1280x800). It emulates a
@@ -2590,16 +2590,6 @@ paths:
                 soundEnabled:  { type: boolean, description: "Master speaker enable (v3.6): false silences the speaker (POST /api/sound -> 403, and disabling mid-play stops the tone)." }
                 soundVolume:   { type: integer, minimum: 0, maximum: 100, description: "Master speaker volume 0..100 (v3.6): scales every POST /api/sound call." }
                 tempOffset:    { type: number, minimum: -30, maximum: 30, description: "Temperature calibration offset in degC (v3.7), added to the SHTC3 reading to correct board self-heating." }
-                panelBGR:
-                  type: boolean
-                  example: true
-                  description: >
-                    The panel is wired **BGR** rather than RGB — its own hardware colour order,
-                    which the firmware cannot detect. On a BGR panel every colour is wrong in a
-                    specific pattern: **red draws blue, blue draws orange, yellow draws cyan,
-                    purple draws pink** — while **green and white look correct** (green is its own
-                    channel, white is all three). That is why it hides: text is white.
-                    Applies on the **next frame**, no reboot, so you can tick it and see the answer.
                 flapMs:        { type: integer, minimum: 2, maximum: 500, example: 60, description: "ms per flap. Next flap." }
                 flapMax:       { type: integer, minimum: 1, maximum: 64, example: 64, description: "Max flips per change. Next change." }
                 hostname:      { type: string, example: "flapwall", description: "1–31 chars of a-z 0-9 '-' (lowercased for you). Empty string reverts to the MAC-derived name. **Reboot to apply.**" }
@@ -2984,7 +2974,6 @@ components:
         serialDebug:  { type: boolean, example: false }
         hostname:     { type: string,  description: "The effective hostname (mDNS + AP SSID) — MAC-derived when not pinned", example: "matrix-gw-3f2a" }
         hostnameAuto: { type: boolean, description: "true when the hostname is derived from the MAC rather than pinned", example: true }
-        panelBGR:      { type: boolean, description: "Panel is wired BGR rather than RGB", example: false }
         panelBright:   { type: integer, description: "Panel brightness 1–255", example: 160 }
         soundEnabled:  { type: boolean, description: "Master speaker enable (v3.6)" }
         soundVolume:   { type: integer, description: "Master speaker volume 0-100 (v3.6)" }

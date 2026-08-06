@@ -34,7 +34,6 @@ struct GwConfig {
                                    // user just enters their own local time. See quietScheduleTick.
   // ---- panel ----
   // The DSI panel is one fixed geometry (1280x800, RGB565); only these knobs are live.
-  bool          panelBGR;      // swap red and blue on output (a BGR-wired panel)
   uint8_t       panelBright;   // 1..255 backlight level
   uint16_t      flapMs;        // ms per flap step -- the reel's speed
   uint8_t       flapMax;       // flips drawn for one change, 1..FLAP_ANIM_MAX

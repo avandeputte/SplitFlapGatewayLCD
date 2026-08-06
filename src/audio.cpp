@@ -288,6 +288,10 @@ static void audioTask(void* pv) {
   gBeatLatch = false;
   taskEXIT_CRITICAL(&gFrameMux);
   gAudioRun = false;
+  // Lost-start race (audit): a consumer arriving between the exit decision and the
+  // flag clear saw gAudioRun==true and spawned nothing. Now the flag is down,
+  // re-check -- if someone is waiting, hand off to a fresh task before dying.
+  if (audioHasConsumer()) audioMaybeStart();
   printf("[AUDIO] capture stopped\n");
   vTaskDelete(NULL);
 }

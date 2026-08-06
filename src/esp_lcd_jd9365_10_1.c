@@ -2,6 +2,13 @@
  * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * VENDORED from waveshareteam/Waveshare-ESP32-components, component
+ * esp_lcd_jd9365_10_1 (the 10.1" DSI panel's vendor init table + esp_lcd panel
+ * driver), imported 2026-08-03 for the LCDGateway fork. Local changes are marked
+ * "Vendored change": i2c_bus backlight plumbing removed (panel.cpp owns the 0x45
+ * controller), and the DCS panel-ID read runs once per power-up (v0.4.5 -- the
+ * prebuilt HAL read poll has no timeout; see panelHealthTick's self-heal).
  */
 
 #include "soc/soc_caps.h"

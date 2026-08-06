@@ -19,9 +19,8 @@
 struct PanelInfo {
   bool     ok;           // output is running
   uint16_t width, height;
-  uint8_t  depth;        // bitplanes actually in use
-  uint32_t bytes;        // framebuffers + descriptors (fbPsram: framebuffers are in PSRAM,
-                         // descriptors stay internal -- see panelFbInPsram())
+  uint8_t  depth;        // colour depth: fixed 16 (RGB565) on the DSI panel
+  uint32_t bytes;        // framebuffers + descriptors (framebuffers live in PSRAM)
   uint32_t refreshHz;    // computed; nothing can steal these clocks
 };
 

@@ -141,7 +141,6 @@ void dispInit() {
   // the depth/fbPsram parameters are HUB75 vestiges it ignores (kept only so panel.h's
   // signature stays source-compatible with the Matrix driver).
   gPanel.ready = panelBegin(gPanel.panelW, gPanel.panelH, 0, false);
-  panelSetColourOrder(cfg.panelBGR);   // the panel's own wiring, not something we can detect
   if (!gPanel.ready) {
     // Headless is a legitimate state: the web UI and all the virtual modules still
     // work, so report the fault and carry on rather than refusing to boot.
@@ -211,7 +210,6 @@ void dispResume() {
   // the configured depth to fit RAM; asking for the configured value again
   // could refuse and leave the wall dark).
   if (panelBegin(gPanel.panelW, gPanel.panelH, 0, false)) {
-    panelSetColourOrder(cfg.panelBGR);
     panelSetBrightness(cfg.panelBright);
     gPanel.ready = true;
     dispMarkDirty();

@@ -94,7 +94,8 @@ static void panelRotSync() {                             // drain: wait out an i
   if (gPpa && gRotDone) { xSemaphoreTake(gRotDone, portMAX_DELAY); xSemaphoreGive(gRotDone); }
 }
 // Serialize the whole present. panelShow() is called from taskDisplay (core 1: wall/effects),
-// taskWeb (core 0: canvas stream + ticker) and the httpd worker (core 0: one-shot frames). The
+// taskWeb (core 1 since v0.2: canvas stream + ticker) and the httpd worker (core 0: one-shot
+// frames). The
 // single PPA client is NOT safe for concurrent use -- two presents at once (the window during an
 // app switch, canvas released while a stream is still presenting) corrupt its transaction queue
 // ("exceed maximum pending transactions") and can HARD-HANG the board. This mutex makes presents
@@ -780,6 +781,9 @@ void panelCloneToBack() {
 
 void panelReadback(uint8_t* out, bool rgb565) {
   if (!info.ok || !out) return;
+  // Under the present lock: liveBuf can swap mid-copy (panelShow on another task),
+  // stitching two frames into one screenshot (audit). Recursive, short holders.
+  if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY);
   const uint8_t buf = liveBuf;
   // Fast path: the live buffer already holds native-LE RGB565 (what the panel scans
   // out), so an rgb565 screenshot on an RGB panel is just a big-endian byte swap of
@@ -789,6 +793,7 @@ void panelReadback(uint8_t* out, bool rgb565) {
     const px_t* src = fb[buf];
     const size_t n = (size_t)W * H;
     for (size_t i = 0; i < n; i++) { px_t v = src[i]; out[i*2] = (uint8_t)(v >> 8); out[i*2+1] = (uint8_t)v; }
+    if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
     return;
   }
   size_t o = 0;
@@ -800,6 +805,7 @@ void panelReadback(uint8_t* out, bool rgb565) {
         out[o++] = (uint8_t)(v >> 8); out[o++] = (uint8_t)(v & 0xFF);
       } else { out[o++] = r; out[o++] = g; out[o++] = b; }
     }
+  if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
 }
 
 // Shift the live frame into the back buffer by (dx,dy); vacated pixels get the fill colour.
