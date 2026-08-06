@@ -100,19 +100,24 @@ PanelGeometry dispPlan(uint16_t panelW, uint16_t panelH, uint8_t cols, uint8_t r
 
   g.panelW  = panelW;  g.panelH = panelH;
   g.cols    = cols;    g.rows   = rows;
-  // A flap card keeps its 1:FLAP_ASPECT proportions no matter the grid: whichever
-  // axis is the constraint decides the card size, and a wall that does not fill the
-  // panel is centred on both axes (originX/originY margins). 32x10 of 40x80 cards
-  // fills exactly; 32x5 letterboxes; 5x10 pillarboxes.
+  // A flap card keeps its FLAP_ASPECT_NUM/DEN proportions no matter the grid:
+  // whichever axis is the constraint decides the card size, rows get rowGap air
+  // between them, and a wall that does not fill the panel is centred on both axes
+  // (originX/originY margins). 32x5 letterboxes; 5x10 pillarboxes.
   {
     uint16_t w = (uint16_t)(panelW / cols);
-    const uint16_t hMax = (uint16_t)(panelH / rows);
-    if (w * FLAP_ASPECT > hMax) w = (uint16_t)(hMax / FLAP_ASPECT);
-    g.cellW = w;
-    g.cellH = (uint16_t)(w * FLAP_ASPECT);
+    // Height budget per card once the inter-row gaps are counted: the wall is
+    // rows*cellH + (rows-1)*(cellH/GAP_DIV) tall, i.e. cellH*((GAP_DIV+1)*rows-1)/GAP_DIV.
+    const uint16_t hMax = (uint16_t)((uint32_t)panelH * FLAP_ROW_GAP_DIV /
+                                     ((FLAP_ROW_GAP_DIV + 1) * (uint32_t)rows - 1));
+    if ((uint32_t)w * FLAP_ASPECT_NUM / FLAP_ASPECT_DEN > hMax)
+      w = (uint16_t)((uint32_t)hMax * FLAP_ASPECT_DEN / FLAP_ASPECT_NUM);
+    g.cellW  = w;
+    g.cellH  = (uint16_t)((uint32_t)w * FLAP_ASPECT_NUM / FLAP_ASPECT_DEN);
+    g.rowGap = (uint16_t)(g.cellH / FLAP_ROW_GAP_DIV);
   }
   g.originX = (uint16_t)((panelW - g.cellW * cols) / 2);
-  g.originY = (uint16_t)((panelH - g.cellH * rows) / 2);
+  g.originY = (uint16_t)((panelH - (g.cellH * rows + g.rowGap * (rows - 1))) / 2);
   // The largest Helvetica flap face the cell affords, or null for the bitmap faces
   // (they still serve fliporama cells and tiny walls).
   g.flap = nullptr;
@@ -380,7 +385,7 @@ static inline Ink faceInk(const FaceSnap& f) {
 
 static void drawCell(int col, int row, const CellSnap& c) {
   int cx = gPanel.originX + col * gPanel.cellW;
-  int cy = gPanel.originY + row * gPanel.cellH;
+  int cy = gPanel.originY + row * (gPanel.cellH + gPanel.rowGap);
 
   Ink cur = faceInk(c.cur);
 

@@ -4,7 +4,7 @@
 // brightness value -- see panel.h for why that seam is where it is.
 //
 // Geometry falls out of the fixed panel size (1280x800) and the module grid:
-// a flap card keeps a 1:FLAP_ASPECT proportion, whichever axis constrains sets the
+// a flap card keeps its FLAP_ASPECT_NUM/DEN proportion, whichever axis constrains sets the
 // card size, and the wall is centred on both axes (short walls letterbox/pillarbox).
 // The renderer then picks the largest Helvetica flap face that fits the cell
 // (fontflap.h), falling back to the small CP1252 bitmap faces for tiny cells.
@@ -31,6 +31,7 @@ struct PanelGeometry {
   uint16_t panelW, panelH;
   uint8_t  cols, rows;
   uint16_t cellW, cellH;         // u16: an 800px panel makes 266px cells (u8 wrapped -- found the hard way)
+  uint16_t rowGap;               // vertical air between rows (cellH/FLAP_ROW_GAP_DIV)
   uint16_t originX, originY;     // centring margin (rows centre vertically: flap cards
                                  // keep their aspect, so short walls letterbox)
   const struct FlapFace* flap;   // Helvetica flap face for these cells, or null (bitmap faces)

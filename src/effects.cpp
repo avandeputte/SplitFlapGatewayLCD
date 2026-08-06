@@ -901,10 +901,14 @@ static void aqComposeBg(int W, int H, int hue) {
     const int px = (i * 2654435761u) % W, py = sandTop + ((i * 40503u) % (H - sandTop));
     panelPixel(px, py, 140, 118, 74);
   }
-  for (int i = 0; i < 6; i++) {                    // pebbles, sized to the panel (v0.4.1: the
-    const int px = W * (6 + i * 17) / 100;         //  old 2-4 px reads as specks at 1280x800)
-    const int pr = H / 64 + (i % 3) * (H / 90 > 0 ? H / 90 : 1);
-    const int py = H - (H - sandTop) / 3 + (i % 2) * (H / 160);
+  // Pebbles, sized to the panel (v0.4.1: the old 2-4 px reads as specks at 1280x800).
+  // Scattered by the effect PRNG -- uniform random x clumps naturally, which reads as
+  // riverbed; the old i*17% grid with cycling sizes read as a machined pattern.
+  const int bh = H - sandTop;
+  for (int i = 0; i < 8; i++) {
+    const int px = W / 50 + (int)(rnd() % (uint32_t)(W - W / 25 > 0 ? W - W / 25 : 1));
+    const int pr = H / 64 + (int)(rnd() % (uint32_t)(2 * (H / 90 > 0 ? H / 90 : 1) + 1));
+    const int py = sandTop + bh / 4 + (int)(rnd() % (uint32_t)(bh * 3 / 5 > 0 ? bh * 3 / 5 : 1));
     panelCircle(px, py, pr, true, 128, 110, 82);                       // body
     panelCircle(px, py, pr, false, 96, 82, 60);                        // rim
     panelCircle(px - pr / 3, py - pr / 3, pr / 3 > 0 ? pr / 3 : 1,     // light catch
@@ -1166,8 +1170,17 @@ static void renderFire() {
   const bool afire = fxAudOn && gEffectAudioMod;
   const uint8_t fbase = afire ? (uint8_t)(100 + fxAud.level * 123) : 160;
   const uint32_t sparkMask = (afire && fxAud.beat) ? 3 : 15;
-  for (int x = 0; x < W; x++)
-    fxBuf[(H - 1) * W + x] = (rnd() & sparkMask) ? (uint8_t)(fbase + (rnd() & 63)) : 255;
+  // Cooling must scale with sim height or flame height is fixed in ROWS: the authored
+  // 1..8 decay (avg 4.5) makes ~43-row tongues -- a full HUB75 panel, but only the
+  // bottom quarter of this panel's 160-row sim. Q8 factor keeps the hot loop on
+  // mask+multiply+shift; 48-row reference puts the tongue tips near 70% of H.
+  const int coolQ8 = (H > 48) ? (48 * 256) / H : 256;
+  for (int x = 0; x < W; x++) {
+    // Clamp, don't wrap: fbase can reach 223 in audio mode and 223+63 would wrap to
+    // near-black, punching dark holes in the fire base exactly when it should roar.
+    const int seed = (rnd() & sparkMask) ? (int)fbase + (int)(rnd() & 63) : 255;
+    fxBuf[(H - 1) * W + x] = (uint8_t)(seed > 255 ? 255 : seed);
+  }
   // Doom-style spread: carry each cell up one row with a random sideways DRIFT and a random decay.
   // That asymmetry -- not a symmetric blur -- is what breaks the sheet into flame tongues. Rows are
   // the outer loop (row-major) so each source row is fully read before the next iteration writes
@@ -1179,7 +1192,7 @@ static void renderFire() {
       uint32_t r = rnd();
       int nx = x + (int)(r & 3) - 1;                  // drift -1..+2
       if (nx < 0) nx = 0; else if (nx >= W) nx = W - 1;
-      int decay = 1 + (int)((r >> 2) & 7);            // cool 1..8 per row
+      int decay = 1 + (((int)((r >> 2) & 7) * coolQ8) >> 8);   // cool 1..8 per row, height-scaled
       int v = pixel - decay;
       fxBuf[(y - 1) * W + nx] = (uint8_t)(v < 0 ? 0 : v);
     }

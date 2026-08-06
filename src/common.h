@@ -111,7 +111,7 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 // and as "fw" in capabilities. Clients key product-specific behaviour on "product" and on
 // capability tokens, never on version heuristics (the old API_VERSION="3.1.0" masquerade
 // for the physical-gateway companion gate was removed in v3.12).
-#define FW_VERSION           "0.4.2"    // this product's version (UI + boot log)
+#define FW_VERSION           "0.4.3"    // this product's version (UI + boot log)
 #define PRODUCT_NAME         "LCD Gateway"
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
@@ -140,13 +140,16 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
    The panel geometry is fixed (the 800x1280 DSI panel mounted landscape, 1280x800).
    The grid is the emulated wall -- one virtual split-flap module per cell, IDs
    row-major from 0 -- and is runtime-configurable (Settings -> Module Wall, applied
-   on reboot). The default 15x5 gives 80x160 px flap cards; anything from 10x1 to
-   32x10 works, cards always 1:FLAP_ASPECT, wall centred (see dispPlan in display.cpp). */
+   on reboot). The default 15x5 gives 80x152 px flap cards; anything from 10x1 to
+   32x10 works, cards keep FLAP_ASPECT_NUM/DEN with rowGap air between rows, wall
+   centred (see dispPlan in display.cpp). */
 #define DEFAULT_PANEL_W      1280   // landscape: the 800x1280 portrait panel mounted wide
 #define DEFAULT_PANEL_H      800
-#define DEFAULT_GRID_COLS    15     // virtual modules across (80x160 px flap cards)
+#define DEFAULT_GRID_COLS    15     // virtual modules across (80x152 px flap cards)
 #define DEFAULT_GRID_ROWS    5      // virtual modules down; any 10x1..32x10 grid works
-#define FLAP_ASPECT          2      // card height is at most this x width (see dispPlan)
+#define FLAP_ASPECT_NUM      19     // card height = width * 19/10: 5% squatter than the
+#define FLAP_ASPECT_DEN      10     //  classic 1:2, freeing air between the rows
+#define FLAP_ROW_GAP_DIV     20     // inter-row gap = cellH/20 (dispPlan centres for it)
 #define DEFAULT_PANEL_BGR    false  // true if the panel is wired BGR (see panelSetColourOrder)
 #define DEFAULT_BRIGHTNESS   160    // 1..255, scales every colour before output
 // A real module flips a handful of flaps per second, not fifty. This also sets the
