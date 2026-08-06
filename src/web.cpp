@@ -1450,7 +1450,9 @@ static void canvasEnter(bool clear) {
     // execute before the pump re-checks the flag. Without this gate such a record
     // stands the canvas back up and cancels the pending gEffectReq -- the user-visible
     // "tapping an effect does nothing" race. Let the doomed stream die instead.
-    if (gCanvasStreamKill) return;
+    // Gate ONLY while a stream actually exists: a latched flag with no stream must
+    // not veto legitimate one-shot takeovers (audit 2026-08-05, confirmed no-op bug).
+    if (gCanvasStreamKill && canvasStreamActive()) return;
     canvasStandDown();
   }
   if (clear && gPanel.ready) { panelClear(); panelShow(); }
@@ -1617,6 +1619,9 @@ void canvasStreamPump() {
   // open: close it so a client that didn't stand its app down can't keep painting over the
   // newcomer. taskWeb is the one task allowed to touch the socket, so the close happens here.
   if (gCanvasStreamKill && cs.req) { gCanvasStreamKill = false; csClose(false, "superseded"); return; }
+  if (gCanvasStreamKill && !cs.req) gCanvasStreamKill = false;   // stale: nothing to evict. Left
+                                    // latched, it permanently no-ops canvasEnter's race gate and
+                                    // with it every one-shot canvas endpoint (audit 2026-08-05).
   if (!cs.req) return;
   if (gOtaInProgress) { csClose(false, "ota"); return; }
   cs.ticks++;
@@ -2228,7 +2233,7 @@ static esp_err_t handleApiCanvas(httpd_req_t* r) {
     // {"active":true} takeover likewise supersedes a left-open stream.
     JsonDocument doc;
     if (!httpxReadJson(r, doc)) return ESP_OK;
-    if (doc["active"] | false) { gCanvasStreamKill = true; canvasEnter(true); }
+    if (doc["active"] | false) { if (cs.req) gCanvasStreamKill = true; canvasEnter(true); }
     else canvasLeave();
     char buf[48];
     snprintf(buf, sizeof(buf), "{\"ok\":true,\"active\":%s}", gCanvasMode ? "true" : "false");
@@ -2238,7 +2243,7 @@ static esp_err_t handleApiCanvas(httpd_req_t* r) {
   // The atlas field (v3.1): the sticky-bound sheet and every resident one.
   char atlas[320];
   canvasAtlasStateJson(atlas, sizeof(atlas));
-  char buf[560];
+  char buf[768];   // worst case ~594 (audit): 154 fixed + 319 atlas + 121 effects list
   snprintf(buf, sizeof(buf),
            "{\"active\":%s,\"width\":%u,\"height\":%u,\"formats\":[\"rgb888\",\"rgb565\",\"qoi\",\"jpeg\"],"
            "\"effect\":\"%s\",\"anim\":%s,\"ticker\":%s,\"atlas\":%s,\"effects\":%s}",
@@ -3374,7 +3379,9 @@ static int canvasOpsRunBin(const uint8_t* p, size_t len, bool* shownOut, bool* o
       case 0x20: { BOPS_NEED(11); BXY(0);                                            // AALINE
         canvasAALine(x, y, xfX(bops16(p+i+4), bops16(p+i+6)), xfY(bops16(p+i+4), bops16(p+i+6)),
                      p[i+8], p[i+9], p[i+10]); i += 11; break; }
-      case 0x21: { BOPS_NEED(10); BXY(0);                                            // GTEXT (scalable AA)
+      case 0x21: { BOPS_NEED(11); BXY(0);   // GTEXT (scalable AA): fixed header is 11 bytes
+                                            // (x2 y2 size2 face1 fl1 rgb3) -- NEED(10) read
+                                            // p[i+10] one byte past the guarantee (audit fix)
         const uint16_t size = (uint16_t)((p[i+4] << 8) | p[i+5]);   // px, widened from the bitmap op's u8
         const uint8_t  face = p[i+6], fl = p[i+7];
         const uint8_t  cr = p[i+8], cg = p[i+9], cb = p[i+10];
@@ -4315,6 +4322,9 @@ static esp_err_t handleApiAtlasGet(httpd_req_t* r) {
   if (!canvasAtlasNameOk(name.c_str())) return atlasRawReply(r, 404);
   httpd_resp_set_type(r, "application/octet-stream");
   uint8_t hdr[12]; size_t bytes = 0;
+  canvasAtlasHold();   // the sheet buffer is only valid under the store lock, and this
+                       // send takes seconds -- lock-free streaming was a use-after-free
+                       // against a concurrent replace/evict (audit). Held to the end.
   const uint8_t* buf = canvasAtlasData(name.c_str(), hdr, &bytes);
   if (buf) {
     httpxChunk(r, (const char*)hdr, 12);
@@ -4323,8 +4333,10 @@ static esp_err_t handleApiAtlasGet(httpd_req_t* r) {
       httpxChunk(r, (const char*)(buf + off), c);
       wdgWebMs = millis();
     }
+    canvasAtlasRelease();
     return httpxChunkEnd(r);
   }
+  canvasAtlasRelease();
   if (sfFsReady) {                                    // persisted but not resident
     char path[64];
     snprintf(path, sizeof(path), "/atlas/%s.mpta", name.c_str());
@@ -4667,6 +4679,7 @@ static esp_err_t handleFsUpload(httpd_req_t* r) {
     return httpxErr(r, 413, "Not enough free space (64 KB must remain)");
   if (!strncmp(path, "/anim/",  6)) FFat.mkdir("/anim");    // idempotent
   if (!strncmp(path, "/fonts/", 7)) FFat.mkdir("/fonts");
+  if (!strncmp(path, "/atlas/", 7)) FFat.mkdir("/atlas");   // .mpta uploads route here too
   snprintf(tmp, sizeof(tmp), "%s.tmp", path);
   FFat.remove(tmp);                                         // clear a stale temp
   File f = FFat.open(tmp, "w");

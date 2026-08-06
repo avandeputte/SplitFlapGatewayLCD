@@ -77,6 +77,8 @@ int  canvasAtlasSave(const char* name);                    // 0 / 404 / 507 / 50
 int  canvasAtlasDelete(const char* name);                  // 0 / 404
 void canvasAtlasListJson(void (*sink)(const char*));       // [{name,tiles,w,h,fmt,bytes,resident,persisted},…]
 const uint8_t* canvasAtlasData(const char* name, uint8_t hdr[12], size_t* bytes);   // resident sheet bytes + its MPTA header
+void canvasAtlasHold();      // hold the store lock across a long read of canvasAtlasData's
+void canvasAtlasRelease();   //  buffer (HTTP streaming) -- else eviction is a use-after-free
 void canvasAtlasStateJson(char* out, size_t cap);          // {"bound":…,"loaded":[…]} for GET /api/canvas
 
 // ---- GIF import (v2.1) -------------------------------------------------------------------------

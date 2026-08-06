@@ -129,6 +129,11 @@ esp_err_t handleOTAUpload(httpd_req_t* r) {
   // Quiesce the gateway for the duration of the upload so the WiFi/TCP stack
   // has the contiguous heap the transfer needs.
   gOtaInProgress = true;
+  // Drain the canvas stream BEFORE touching the panel: the stream renders on taskWeb
+  // (the other core) and would keep drawing into the framebuffer dispBlank() is about
+  // to release -- a true-parallel use-after-free (audit). The pump csCloses it on its
+  // next tick because gOtaInProgress is set; wait for that, bounded.
+  for (int i = 0; i < 60 && canvasStreamActive(); i++) vTaskDelay(pdMS_TO_TICKS(25));
   // Blank the wall and stand the display + frame tasks down. The DMA engine keeps
   // clocking a black frame with no CPU help, so the panel stays quiet even while
   // Update.write() has the instruction cache disabled on both cores.

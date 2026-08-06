@@ -273,7 +273,10 @@ void setup() {
   // with margin, since it is a notch deeper (pump -> record dispatch -> canvasOpsRun -> ttf).
   xTaskCreatePinnedToCore(taskWeb,     "Web",     12288, NULL, 2, &hTaskWeb,   1);
   xTaskCreatePinnedToCore(taskNetwork, "Network", 6144, NULL, 1, &hTaskNet,   1);
-  xTaskCreatePinnedToCore(taskDisplay, "Display", 4096, NULL, 2, &hTaskDisp,  1);
+  // 12 KB, NOT 4 KB: taskDisplay runs the stb_truetype rasterizer since the scalable
+  // exclusive ticker (v0.4.5) -- the same stack class that boot-looped taskWeb at 4 KB
+  // on stream+gtext. A cold glyph-cache miss mid-ticker rasterizes on THIS stack.
+  xTaskCreatePinnedToCore(taskDisplay, "Display", 12288, NULL, 2, &hTaskDisp,  1);
 
   printf("[Boot] Ready\n");
 }

@@ -792,6 +792,14 @@ bool canvasAtlasBlitScaled(int handle, uint16_t i, int x, int y,
   return true;
 }
 
+// Long-hold pair for streaming a resident sheet out over HTTP: the returned buffer
+// stays valid only while the store lock is held, and a 2 MB sheet takes SECONDS on
+// the wire -- the send used to run lock-free, so a concurrent replace/evict free()d
+// the buffer mid-stream (audit: use-after-free). Recursive, same mutex as AtlasLock.
+void canvasAtlasHold()    { if (!gAtlasMx) gAtlasMx = xSemaphoreCreateRecursiveMutex();
+                            xSemaphoreTakeRecursive(gAtlasMx, portMAX_DELAY); }
+void canvasAtlasRelease() { xSemaphoreGiveRecursive(gAtlasMx); }
+
 const uint8_t* canvasAtlasData(const char* name, uint8_t hdr[12], size_t* bytes) {
   AtlasLock lk;   // serialize store access (see gAtlasMx)
   const int i = atlasFindResident(name);
@@ -1127,6 +1135,10 @@ void canvasTickerSet(const char* text, uint8_t r, uint8_t g, uint8_t b, int spee
   gTickerActive = false;                     // stop the renderer reading half-updated state
   panelSetOverlay(nullptr);
   gTickerOverlay = false;
+  // Clearing the hook pointer does not wait for an IN-FLIGHT hook call (it runs under
+  // the present lock inside panelShow, possibly on another task). Take that lock for
+  // the state rewrite so a mid-draw hook never reads torn text/size/font. (audit)
+  panelPresentLock();
   // UTF-8 -> CP1252 at the door (v3.0.1): the renderer walks bytes, so a raw copy drew
   // multi-byte characters as garbage pairs and inflated tickTextW.
   utf8ToCp1252(text ? text : "", tickText, sizeof(tickText));
@@ -1155,6 +1167,7 @@ void canvasTickerSet(const char* text, uint8_t r, uint8_t g, uint8_t b, int spee
   tickPeriodMs = (uint32_t)(tickTextW + gPanel.panelW) * 1000u / (uint32_t)tickPxSec;
   if (!tickPeriodMs) tickPeriodMs = 1;
   tickStartMs = millis(); tickPrimed = false;
+  panelPresentUnlock();
   if (overlay) {
     // Composite over whatever is presenting: no panel claim, no mode change.
     gTickerOverlay = true;

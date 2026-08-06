@@ -62,6 +62,14 @@ struct Glyph {
 // has 25 MB free and the table is only touched from the render path, never an ISR.
 static Glyph*   gCache = nullptr;
 static uint32_t gUseClock = 0, gCacheBytes = 0, gCacheCount = 0;
+// Cache lock (audit 2026-08-05): the cache is hit from THREE tasks -- taskDisplay
+// (ticker overlay/exclusive), taskWeb (stream gtext), httpd worker (one-shot ops,
+// canvasTickerSet width) -- and eviction free()s coverage buffers. Recursive: the
+// draw path nests width->blit->glyphGet. Created in ttfBegin() (single-threaded
+// boot), so a null mutex only ever means "boot, before tasks exist".
+static SemaphoreHandle_t gTtfMx = nullptr;
+static inline void ttfLock()   { if (gTtfMx) xSemaphoreTakeRecursive(gTtfMx, portMAX_DELAY); }
+static inline void ttfUnlock() { if (gTtfMx) xSemaphoreGiveRecursive(gTtfMx); }
 
 static inline uint32_t glyphKey(uint8_t face, int size, int cp) {
   return ((uint32_t)(face & 3) << 28) | ((uint32_t)(size & 0xFFF) << 16) | (uint32_t)(cp & 0xFFFF);
@@ -116,6 +124,10 @@ static Glyph* glyphGet(uint8_t face, int size, int cp) {
     }
   }
 
+  // OOM guard: a REAL glyph whose coverage allocation failed must not be cached as
+  // "blank forever" -- skip the insert and let a later, less-pressured frame retry.
+  if (gi && w > 0 && hh > 0 && !cov) return nullptr;
+
   // Re-find a free slot (eviction above may have opened one; re-probe from the hash).
   if (firstFree < 0 || gCache[firstFree].key) {
     firstFree = -1;
@@ -136,6 +148,7 @@ static Glyph* glyphGet(uint8_t face, int size, int cp) {
 
 // ---- public API -------------------------------------------------------------------------
 bool ttfBegin() {
+  if (!gTtfMx) gTtfMx = xSemaphoreCreateRecursiveMutex();   // boot is single-threaded here
   if (!gCache) {   // the glyph-cache table in PSRAM, not internal .bss (see gCache above)
     gCache = (Glyph*)heap_caps_calloc(TTF_CACHE_SLOTS, sizeof(Glyph), MALLOC_CAP_SPIRAM);
     if (!gCache) { printf("[TTF] glyph cache alloc failed -- gtext disabled\n"); return false; }
@@ -177,19 +190,23 @@ bool ttfSetCustom(const uint8_t* ttf, size_t len) {
   return true;
 }
 void ttfClearCustom() {
+  ttfLock();
   cacheClearFace(TTF_CUSTOM);
   gFace[TTF_CUSTOM].ready = false;
   if (gCustomTtf) { free(gCustomTtf); gCustomTtf = nullptr; }
+  ttfUnlock();
 }
 
 int ttfTextWidth(uint8_t face, int size, const char* s, int tracking) {
   if (face >= TTF_FACES || !gFace[face].ready || !s) return 0;
   if (size < TTF_MIN_SIZE) size = TTF_MIN_SIZE; else if (size > TTF_MAX_SIZE) size = TTF_MAX_SIZE;
   int w = 0;
+  ttfLock();   // hold across the walk: an eviction may recycle a slot mid-loop
   for (const uint8_t* p = (const uint8_t*)s; *p; p++) {
     const Glyph* g = glyphGet(face, size, cp1252ToUnicode(*p));
     if (g) w += g->advance + tracking;
   }
+  ttfUnlock();
   if (w && tracking) w -= tracking;   // no trailing gap
   return w;
 }
@@ -197,26 +214,33 @@ int ttfTextWidth(uint8_t face, int size, const char* s, int tracking) {
 // Blit one run of glyphs in a single colour at (startX, baselineY). aa=false hard-thresholds.
 static void ttfBlitRun(uint8_t face, int size, int startX, int baselineY, const char* s,
                        int tracking, uint8_t r, uint8_t g, uint8_t b, bool aa) {
-  static uint8_t rowBuf[TTF_MAX_SIZE + 8];   // thresholded row scratch (single-threaded ops path)
+  static uint8_t rowBuf[TTF_MAX_SIZE + 8];   // row scratch (serialized by the cache lock below)
   int penX = startX;
+  const int surfW = panelInfo().width;   // right-edge early-out bound
+  ttfLock();   // hold across the blit: eviction free()s coverage buffers, and gl->cov
+               // is read row-by-row here -- an unlocked evict is a use-after-free
   for (const uint8_t* p = (const uint8_t*)s; *p; p++) {
     Glyph* gl = glyphGet(face, size, cp1252ToUnicode(*p));
     if (!gl) continue;
+    if (penX + gl->xoff >= surfW) break;         // all glyphs from here start off the right edge
     if (gl->cov && gl->w > 0) {
       const int gx = penX + gl->xoff, gy = baselineY + gl->yoff;
       const int w = gl->w > (int)sizeof(rowBuf) ? (int)sizeof(rowBuf) : gl->w;
-      for (int row = 0; row < gl->h; row++) {
-        const uint8_t* src = gl->cov + (size_t)row * gl->w;
-        if (aa) {
-          panelBlitCoverRow(gx, gy + row, w, src, r, g, b);
-        } else {
-          for (int i = 0; i < w; i++) rowBuf[i] = src[i] >= 0x80 ? 255 : 0;
-          panelBlitCoverRow(gx, gy + row, w, rowBuf, r, g, b);
+      if (gx + w > 0) {                          // fully left of the surface: advance only --
+        for (int row = 0; row < gl->h; row++) {  // the scrolling ticker was paying ~18K clipped
+          const uint8_t* src = gl->cov + (size_t)row * gl->w;                 // row calls/frame
+          if (aa) {
+            panelBlitCoverRow(gx, gy + row, w, src, r, g, b);
+          } else {
+            for (int i = 0; i < w; i++) rowBuf[i] = src[i] >= 0x80 ? 255 : 0;
+            panelBlitCoverRow(gx, gy + row, w, rowBuf, r, g, b);
+          }
         }
       }
     }
     penX += gl->advance + tracking;
   }
+  ttfUnlock();
 }
 
 void ttfDrawText(int x, int y, int size, uint8_t face, const char* s, int align,
@@ -248,6 +272,8 @@ void ttfDrawText(int x, int y, int size, uint8_t face, const char* s, int align,
 }
 
 void ttfCacheStats(uint32_t* entries, uint32_t* bytes) {
+  ttfLock();
   if (entries) *entries = gCacheCount;
   if (bytes) *bytes = gCacheBytes;
+  ttfUnlock();
 }

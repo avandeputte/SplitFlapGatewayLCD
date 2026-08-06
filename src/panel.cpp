@@ -844,6 +844,10 @@ static void blipStamp() {                 // panelShow only: drawBuf holds the f
 
 void panelBlipService() {
   if (!info.ok || !blipUntil) return;
+  // Under the present lock END TO END (audit): this runs on taskWeb, and the
+  // clone + draw + show sequence torn against another task's present is a
+  // corrupted frame. Recursive mutex, so the nested panelShow re-take is fine.
+  if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY);
   const bool expired = (int32_t)(millis() - blipUntil) >= 0;
   if (!expired && !liveHasBlip) {
     panelCloneToBack();
@@ -862,7 +866,14 @@ void panelBlipService() {
       panelShow();
     } else blipUntil = 0;
   }
+  if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
 }
+
+// Present lock for OUTSIDE modules (recursive; holders are one frame at most).
+// canvasTickerSet uses it to wait out an in-flight overlay-hook draw before
+// rewriting ticker state the hook reads (audit: torn-state race).
+void panelPresentLock()   { if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY); }
+void panelPresentUnlock() { if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex); }
 
 // ---- present ----------------------------------------------------------------------
 // Rotate the logical landscape frame into the native portrait scanout. PPA does it in
@@ -943,9 +954,17 @@ void panelPresentRects(const int16_t* rects, int n) {
     if (y < 0) { h += y; y = 0; }
     if (y + h > H) h = H - y;
     if (h <= 0) continue;
-    esp_cache_msync((uint8_t*)fb[drawBuf] + (size_t)y * W * sizeof(px_t),
-                    (size_t)h * W * sizeof(px_t), ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    // Chunked like panelShow: a TALL rect's band would otherwise be one big msync and
+    // quietly reopen the >0.75 ms interrupts-off window this function exists to avoid.
+    const uint8_t* base = (uint8_t*)fb[drawBuf] + (size_t)y * W * sizeof(px_t);
+    const size_t  bytes = (size_t)h * W * sizeof(px_t), CH = 64 * 1024;
+    for (size_t off = 0; off < bytes; off += CH)
+      esp_cache_msync((void*)(base + off), (bytes - off > CH) ? CH : bytes - off,
+                      ESP_CACHE_MSYNC_FLAG_DIR_C2M);
   }
+  bool anyCpu = false;     // any rect fell back to the CPU rotate: ONE hoisted msync after
+                           // the loop, not a full 2 MB interrupts-off msync per rect (audit:
+                           // a PPA failure during aquarium was up to 69 consecutive blinks)
   for (int i = 0; i < n; i++) {
     int x = rects[i*4], y = rects[i*4+1], w = rects[i*4+2], h = rects[i*4+3];
     if (x < 0) { w += x; x = 0; }
@@ -998,9 +1017,14 @@ void panelPresentRects(const int16_t* rects, int n) {
               dst[(size_t)ny * PANEL_NATIVE_W + nx] = v;
             }
         }
-      esp_cache_msync(gScanout, (size_t)PANEL_NATIVE_W * PANEL_NATIVE_H * sizeof(px_t),
-                      ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+      anyCpu = true;
     }
+  }
+  if (anyCpu) {            // hoisted + chunked writeback for every CPU-rotated rect
+    const size_t total = (size_t)PANEL_NATIVE_W * PANEL_NATIVE_H * sizeof(px_t), CH = 64 * 1024;
+    for (size_t off = 0; off < total; off += CH)
+      esp_cache_msync((uint8_t*)gScanout + off, (total - off > CH) ? CH : total - off,
+                      ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
   }
   if (gPpa && gRotDone) xSemaphoreGive(gRotDone);  // blocking ops: the engine is idle again
   gLastShowMs = millis();                          // the wedge detector counts this as presenting
