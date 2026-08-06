@@ -460,9 +460,15 @@ bool dispRender() {
   static CellSnap lastDrawn[VM_MAX_MODULES];
   static bool     wallValid = false;
   static uint32_t lastWallMs = 0;
+  static uint32_t lastEpoch = 0;
   static int16_t  wallRects[4 * VM_MAX_MODULES];
   const uint32_t now = millis();
   if (now - lastWallMs > 500) wallValid = false;
+  // Foreign-present detector (review 2026-08-06): gap detection alone missed anything
+  // shorter than 500 ms -- a touch blip or a sub-second canvas takeover left the glass
+  // out of sync with lastDrawn FOREVER. Every present bumps the epoch; if it moved
+  // without us, someone else painted, and this frame starts from a full clear.
+  if (panelPresentEpoch() != lastEpoch) wallValid = false;
   lastWallMs = now;
 
   int tby = 0, tbh = 0;
@@ -485,8 +491,11 @@ bool dispRender() {
       drawCell(col, row, snap[i]);
       lastDrawn[i] = snap[i];
     }
-    panelShow();
-    panelCloneToBack();
+    panelPresentLock();                 // show+clone+epoch-read as one atomic unit: a
+    panelShow();                        // foreign present slipping between them would
+    panelCloneToBack();                 // either invert the clone or hide its epoch
+    lastEpoch = panelPresentEpoch();
+    panelPresentUnlock();
     wallValid = true;
     return true;
   }
@@ -495,6 +504,10 @@ bool dispRender() {
                                          // pending flag would retry this forever.
 
   int rn = 0;
+  // Transparent-band hygiene (review): the strip's NON-cell areas (margins, row gaps)
+  // are wall background -- black. Refill the whole strip before redrawing under-band
+  // cells, or a transparent band accumulates a permanent smear of old glyph pixels.
+  if (oband) panelFillRect(0, tby, gPanel.panelW, tbh, 0, 0, 0);
   for (int i = 0; i < n; i++) {
     const int col = i % gPanel.cols;
     const int row = i / gPanel.cols;
@@ -518,7 +531,12 @@ bool dispRender() {
     wallRects[rn*4+2] = (int16_t)gPanel.panelW; wallRects[rn*4+3] = (int16_t)tbh;
     rn++;
   }
-  if (rn) panelPresentRects(wallRects, rn);
+  if (rn) {
+    panelPresentLock();                 // present + epoch-read atomically (see full path)
+    panelPresentRects(wallRects, rn);
+    lastEpoch = panelPresentEpoch();
+    panelPresentUnlock();
+  }
   return true;
 }
 

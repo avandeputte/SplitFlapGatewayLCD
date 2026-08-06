@@ -1101,8 +1101,10 @@ static void renderAquarium() {
   }
   tmPl = millis();
   if (aqFirstFrame) {
+    panelPresentLock();                            // show+clone atomically (review)
     panelShow();                                   // seed the scanout with the full frame...
     panelCloneToBack();                            // ...then collapse to single-buffer drawing
+    panelPresentUnlock();
     aqFirstFrame = false;
     aqDirtyN[0] = aqDirtyN[1]; memcpy(aqDirty[0], aqDirty[1], sizeof(AqRect) * aqDirtyN[1]);
     aqDirtyN[1] = 0;

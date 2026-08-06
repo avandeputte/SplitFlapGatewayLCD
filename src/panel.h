@@ -115,6 +115,8 @@ void panelPresentRects(const int16_t* rects, int n);
 void panelPresentLock();     // recursive present lock for outside modules -- wait out an
 void panelPresentUnlock();   //  in-flight present (incl. its overlay hook) before mutating
                              //  state that presents read (ticker set, readback snapshot)
+uint32_t panelPresentEpoch();  // bumped by every present; the dirty-cell wall full-repaints
+                               //  when a present it didn't make moves it (blip, one-shot)
 
 // Sync the back buffer to what is currently on screen, so a partial update (a rectangle, one
 // changed region) can be drawn on top of it instead of on a stale frame. Call before drawing a

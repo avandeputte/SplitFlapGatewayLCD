@@ -281,8 +281,10 @@ void canvasStagePresent() {
         }
         if (xTo > 0) panelBlitRow888(0, y, xTo, rowBuf);
       }
+      panelPresentLock();
       panelShow();
       panelCloneToBack();
+      panelPresentUnlock();
       wdgWebMs = millis();
       vTaskDelay(1);                      // feed idle0 (see header comment)
     }
@@ -1134,7 +1136,15 @@ static void tickerOverlayDraw() {
   const int gw = f->width + 1;
   const int bandH = f->height + 2;
   const int by = sh - bandH;
-  tickScroll = tickerPos(now);              // uploaded-face path: native-rate scroll
+  { // Surface-scaled scroll for the uploaded-face path too (review: native-rate
+    // phase on a scale-5 surface scrolled 5x too fast and mostly off-band).
+    const int textW = (int)strlen(tickText) * gw;
+    int pxs = (int)((int64_t)tickPxSec * sw / (gPanel.panelW ? gPanel.panelW : sw));
+    if (pxs < 1) pxs = 1;
+    uint32_t period = (uint32_t)(textW + sw) * 1000u / (uint32_t)pxs;
+    if (!period) period = 1;
+    tickScroll = (int)((uint64_t)((now - tickStartMs) % period) * (uint32_t)pxs / 1000u);
+  }
   if (tickBand) panelFillRect(0, by, sw, bandH, 0, 0, 0);
   const int y0 = by + 1;
   const int startX = sw - tickScroll;
@@ -1236,6 +1246,9 @@ void canvasTickerTick(uint32_t now) {
 
 void canvasTickerRender() {
   uint32_t now = millis();
+  panelPresentLock();   // excludes canvasTickerSet's state rewrite (this renderer reads the
+                        // same fields the overlay hook does) and makes the show/clone and
+                        // rect-present sequences atomic against foreign presents (review)
   if (tickTtf) {                            // scalable full-screen line (see canvasTickerSet)
     tickScroll = tickerPos(now);
     const int pad = tickSize / 6 + 2;       // TTF descenders/AA can spill past the em box
@@ -1255,6 +1268,7 @@ void canvasTickerRender() {
       panelShow();
       panelCloneToBack();
       tickPrimed = true; tickPrimedMs = now;
+      panelPresentUnlock();
       return;
     }
     // Steady state: only the text band changes, so redraw and present just that rect.
@@ -1267,10 +1281,11 @@ void canvasTickerRender() {
     const int16_t rc[4] = { 0, (int16_t)by, (int16_t)gPanel.panelW, (int16_t)bh };
     panelPresentRects(rc, 1);
     tickPrimedMs = now;                     // cadence stamp: keeps the reprime gap-detector quiet
+    panelPresentUnlock();                   // NEVER hold the present lock across the pacing delay
     vTaskDelay(1);                          // pace between band presents
     return;
   }
-  if (now - tickLastMs < 33) { vTaskDelay(pdMS_TO_TICKS(2)); return; }   // ~30 steps/s
+  if (now - tickLastMs < 33) { panelPresentUnlock(); vTaskDelay(pdMS_TO_TICKS(2)); return; }   // ~30 steps/s
   tickLastMs = now;
   tickScroll = tickerPos(now);              // time-based here too: no step/present beat
   const Font1252* f = tickFont;
@@ -1285,6 +1300,7 @@ void canvasTickerRender() {
     dispDrawGlyph1252(gx, y0, f, (uint8_t)tickText[i], 0, 255, tickR, tickG, tickB);
   }
   panelShow();
+  panelPresentUnlock();
 }
 
 // ---- uploadable fonts (v2.1) -------------------------------------------------------------------

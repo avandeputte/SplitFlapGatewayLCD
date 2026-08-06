@@ -4320,18 +4320,30 @@ static esp_err_t handleApiAtlasGet(httpd_req_t* r) {
   if (!canvasAtlasNameOk(name.c_str())) return atlasRawReply(r, 404);
   httpd_resp_set_type(r, "application/octet-stream");
   uint8_t hdr[12]; size_t bytes = 0;
-  canvasAtlasHold();   // the sheet buffer is only valid under the store lock, and this
-                       // send takes seconds -- lock-free streaming was a use-after-free
-                       // against a concurrent replace/evict (audit). Held to the end.
+  // The sheet buffer is only valid under the store lock (a concurrent replace/evict
+  // free()s it -- audit UAF), but the send is paced by the CLIENT's read rate: holding
+  // the lock across it starved every sprite record on taskWeb for the whole download
+  // (review). So: COPY under the lock (~25 ms for 2 MB), stream the copy unlocked.
+  // If PSRAM can't spare the copy, fall back to streaming under the lock -- correct,
+  // merely contended, and only under memory pressure.
+  canvasAtlasHold();
   const uint8_t* buf = canvasAtlasData(name.c_str(), hdr, &bytes);
+  uint8_t* copy = nullptr;
+  if (buf && bytes) {
+    copy = (uint8_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+    if (copy) memcpy(copy, buf, bytes);
+  }
+  if (copy) canvasAtlasRelease();
   if (buf) {
+    const uint8_t* src = copy ? copy : buf;
     httpxChunk(r, (const char*)hdr, 12);
     for (size_t off = 0; off < bytes; off += 4096) {
       size_t c = (bytes - off < 4096) ? (bytes - off) : 4096;
-      httpxChunk(r, (const char*)(buf + off), c);
+      httpxChunk(r, (const char*)(src + off), c);
       wdgWebMs = millis();
     }
-    canvasAtlasRelease();
+    if (copy) free(copy);
+    else canvasAtlasRelease();
     return httpxChunkEnd(r);
   }
   canvasAtlasRelease();

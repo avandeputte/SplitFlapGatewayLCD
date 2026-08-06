@@ -816,7 +816,9 @@ void panelScroll(int dx, int dy, uint8_t fr, uint8_t fg, uint8_t fb_) {
   // native scroll op): whole packed rows via memcpy when nothing needs compositing
   // and the clip is fully open. Source and destination are different buffers, so
   // copy order is free.
-  if (!gBlendActive && !gLayerBuf && clipX0 == 0 && clipY0 == 0 && clipX1 == W && clipY1 == H) {
+  if (!gBlendActive && !gLayerBuf && clipX0 <= 0 && clipY0 <= 0 && clipX1 >= W && clipY1 >= H) {
+    // (>=, not ==: the cleared-clip sentinel is 1<<14, so equality never matched
+    //  and this fast path was dead code on every ordinary scroll -- review find)
     const px_t fill = pack565(fr, fg, fb_);
     for (int y = 0; y < H; y++) {
       px_t* drow = fb[drawBuf] + (size_t)y * W;
@@ -840,6 +842,13 @@ void panelScroll(int dx, int dy, uint8_t fr, uint8_t fg, uint8_t fb_) {
       } else panelPixel(x, y, fr, fg, fb_);
     }
 }
+
+// Present epoch (review 2026-08-06): bumped by EVERY present (panelShow swap and
+// panelPresentRects). The dirty-cell wall records the epoch after its own presents;
+// any foreign present -- a blip, a canvas one-shot, a transition -- moves the epoch
+// and the wall's next frame starts from a full clear instead of trusting lastDrawn.
+static uint32_t gPresentEpoch = 0;
+uint32_t panelPresentEpoch() { return gPresentEpoch; }
 
 // ---- overlay + gesture ack blip (same contract as the Matrix Gateway) -------------
 static void (*sOverlay)(void) = nullptr;
@@ -872,26 +881,32 @@ static void blipStamp() {                 // panelShow only: drawBuf holds the f
 
 void panelBlipService() {
   if (!info.ok || !blipUntil) return;
-  // Under the present lock END TO END (audit): this runs on taskWeb, and the
-  // clone + draw + show sequence torn against another task's present is a
-  // corrupted frame. Recursive mutex, so the nested panelShow re-take is fine.
+  // Single-buffer rect presents, under the lock end to end (review 2026-08-06): the
+  // old clone+show SWAP path rolled the glass back to the last full-show frame --
+  // under the dirty-cell wall and the aquarium (both single-buffer presenters) a
+  // touch reverted real content and the cell tracker made the damage stick. Now the
+  // blip draws into drawBuf and presents ONLY its own rect; panelPresentRects
+  // mirrors it into liveBuf and bumps the present epoch, so the wall knows a
+  // foreign present happened and self-heals with one full frame.
   if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY);
+  const int x0 = W - BLIP_SZ - 4, y0 = 4;
+  const int16_t rc[4] = { (int16_t)x0, (int16_t)y0, (int16_t)BLIP_SZ, (int16_t)BLIP_SZ };
   const bool expired = (int32_t)(millis() - blipUntil) >= 0;
   if (!expired && !liveHasBlip) {
-    panelCloneToBack();
-    panelShow();
+    blipStamp();                      // save under-pixels from drawBuf + stamp the square
+    liveHasBlip = true;
+    panelPresentRects(rc, 1);
   } else if (expired) {
     if (liveHasBlip) {
-      panelCloneToBack();
-      const int x0 = W - BLIP_SZ - 4, y0 = 4;
       size_t o = 0;
       for (int y = y0; y < y0 + BLIP_SZ; y++)
         for (int x = x0; x < x0 + BLIP_SZ; x++) {
           panelPixel(x, y, blipSave[o], blipSave[o + 1], blipSave[o + 2]);
           o += 3;
         }
+      liveHasBlip = false;
       blipUntil = 0;
-      panelShow();
+      panelPresentRects(rc, 1);
     } else blipUntil = 0;
   }
   if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
@@ -1057,6 +1072,22 @@ void panelPresentRects(const int16_t* rects, int n) {
       esp_cache_msync((uint8_t*)gScanout + off, (total - off > CH) ? CH : total - off,
                       ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
   }
+  // Mirror the presented rects into liveBuf (review 2026-08-06): routine rect presents
+  // left liveBuf frozen at the last full show, so readback screenshots, the blip's
+  // saved under-pixels and transition old-frames all read a stale world. Rect-sized
+  // row copies only; the draw/live roles never swap on this path.
+  for (int i = 0; i < n; i++) {
+    int x = rects[i*4], y = rects[i*4+1], w = rects[i*4+2], h = rects[i*4+3];
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > W) w = W - x;
+    if (y + h > H) h = H - y;
+    if (w <= 0 || h <= 0) continue;
+    for (int yy = y; yy < y + h; yy++)
+      memcpy(fb[liveBuf] + (size_t)yy * W + x, fb[drawBuf] + (size_t)yy * W + x,
+             (size_t)w * sizeof(px_t));
+  }
+  gPresentEpoch++;
   if (gPpa && gRotDone) xSemaphoreGive(gRotDone);  // blocking ops: the engine is idle again
   gLastShowMs = millis();                          // the wedge detector counts this as presenting
   if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
@@ -1124,6 +1155,7 @@ void panelShow() {
   const uint8_t shown = drawBuf;
   drawBuf = liveBuf;
   liveBuf = shown;
+  gPresentEpoch++;                               // wall's foreign-present detector (see panel.h)
   gLastShowMs = millis();                        // wedge detector: we ARE presenting
   if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
 }
