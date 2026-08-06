@@ -147,6 +147,10 @@ void panelSetScale(uint8_t s) {
   if (s < 1) s = 1;
   if (s > 8) s = 8;
   if (!info.ok || s == gScale) return;
+  // Hold the present lock: a concurrent panelShow/panelPresentRects reading W/H/gScale
+  // mid-flip would build a torn PPA config -- and the CPU fallback for a rejected op
+  // can then index far past the scanout buffer (scale-5 coords against native W).
+  if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY);
   panelRotSync();                                // an in-flight rotate reads these buffers
   gScale = s;
   W = (uint16_t)(PANEL_NATIVE_H / s);
@@ -155,6 +159,7 @@ void panelSetScale(uint8_t s) {
   panelClearClip();
   memset(fb[0], 0, gFbBytes);
   memset(fb[1], 0, gFbBytes);
+  if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
 }
 uint8_t panelGetScale() { return gScale; }
 
@@ -342,8 +347,18 @@ void panelFillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) 
   // packed word written in a tight span loop -- no per-pixel calls.
   if (!info.ok) return;
   if (gBlendActive || gLayerBuf) {                 // blending / open layer: composite per pixel
-    for (int yy = 0; yy < h; yy++)
-      for (int xx = 0; xx < w; xx++) panelPixel(x + xx, y + yy, r, g, b);
+    // Clip BEFORE the loop, not per pixel: wire dims are i16, and a hostile/buggy
+    // 32767x32767 blended fill is a billion panelPixel calls -- multi-second, no
+    // yield, on whichever task ran the op (TASK_WDT territory). The layer buffer
+    // is surface-sized (W x H), so the surface clip is correct for it too.
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = (x + w > W) ? W : x + w, y1 = (y + h > H) ? H : y + h;
+    if (x0 < clipX0) x0 = clipX0;
+    if (y0 < clipY0) y0 = clipY0;
+    if (x1 > clipX1) x1 = clipX1;
+    if (y1 > clipY1) y1 = clipY1;
+    for (int yy = y0; yy < y1; yy++)
+      for (int xx = x0; xx < x1; xx++) panelPixel(xx, yy, r, g, b);
     return;
   }
   int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
@@ -1294,10 +1309,15 @@ void panelHealthTick() {
   if (now - lastRecoverMs < 5000) return;        // cooldown: never thrash the re-init
   lastRecoverMs = now;
   printf("[PANEL] DSI wedge: no refresh for 500+ ms while presenting -- re-initing the pipeline\n");
+  // Hold the present lock for the WHOLE re-init: this runs on taskDisplay while
+  // taskWeb / the httpd worker may be presenting -- re-arming the DPI DMA under a
+  // live PPA submit corrupts the transaction queue (documented hard-hang).
+  if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY);
   panelRotSync();                                // let an in-flight PPA rotate land first
   if (esp_lcd_panel_init(gPanel) == ESP_OK) {
     printf("[PANEL] DSI pipeline recovered\n");
     MIPI_DSI_BRIDGE.dpi_rsv_dpi_data.dpi_rsv_data = 0x0000;      // re-apply: re-init resets it
     MIPI_DSI_BRIDGE.dpi_config_update.dpi_config_update = 1;
   } else printf("[PANEL] DSI re-init FAILED -- next stop: the task watchdog\n");
+  if (gShowMutex) xSemaphoreGiveRecursive(gShowMutex);
 }

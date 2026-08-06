@@ -58,6 +58,12 @@ bool audioAcquireI2S() {
   if (i2s_channel_init_std_mode(rxChan, &std) != ESP_OK ||
       i2s_channel_init_std_mode(txChan, &std) != ESP_OK) {
     printf("[AUDIO] i2s duplex init failed\n");
+    // Tear down fully: leaving non-null handles makes every later acquire
+    // early-return "success" on channels that were never initialised, and
+    // i2s reads/writes on those fail INSTANTLY -- turning the audio/synth
+    // task loops into core-0 busy spins (TASK_WDT).
+    i2s_del_channel(rxChan); i2s_del_channel(txChan);
+    rxChan = txChan = NULL;
     return false;
   }
   // EMPIRICAL DUPLEX FACT (found the hard way, 2026-07-27): the TX side only clocks
@@ -67,7 +73,12 @@ bool audioAcquireI2S() {
   // This does NOT run the microphone pipeline: capture (read + DSP) happens only in
   // audioTask, which starts and stops with its consumers as before; an unread RX DMA
   // ring just overruns harmlessly.
-  i2s_channel_enable(rxChan);
+  if (i2s_channel_enable(rxChan) != ESP_OK) {
+    printf("[AUDIO] rx enable failed\n");
+    i2s_del_channel(rxChan); i2s_del_channel(txChan);
+    rxChan = txChan = NULL;
+    return false;
+  }
   return true;
 }
 i2s_chan_handle_t audioTxChan() { return txChan; }
@@ -195,8 +206,12 @@ static void audioTask(void* pv) {
     size_t got = 0;
     if (i2s_channel_read(rxChan, raw, sizeof(raw), &got, pdMS_TO_TICKS(100)) != ESP_OK ||
         got < sizeof(raw)) {
-      // Timeout/short read: check for shutdown, then keep trying.
+      // Timeout/short read: check for shutdown, then keep trying. The delay is
+      // load-bearing: on a wedged channel the read fails INSTANTLY (no 100 ms
+      // block), and this task is pinned to core 0 -- the one core whose idle
+      // task the TWDT watches. An unpaced retry loop here is a 5 s reboot.
       if (!audioHasConsumer()) break;
+      vTaskDelay(1);
       continue;
     }
 

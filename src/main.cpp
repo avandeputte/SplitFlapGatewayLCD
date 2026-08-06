@@ -24,7 +24,23 @@ RTC_NOINIT_ATTR uint8_t  sfResetLog[8];       // esp_reset_reason_t values, newe
 RTC_NOINIT_ATTR uint32_t sfResetUpMin[8];     // minutes of uptime when each reset hit
 RTC_NOINIT_ATTR static uint32_t sfResetMagic; // 0x52534C47 = the ring is initialised
 static uint32_t sfBootMs = 0;                 // set in setup(); loop() stamps uptime
-static char     sfBootNote[128];              // boot line, written to the SD log after mount
+static char     sfBootNote[160];              // boot line, written to the SD log after mount
+
+// TWDT breadcrumb (v0.4.5): a task-watchdog panic names its culprit on serial only --
+// useless on a wall. This strong override of IDF's weak hook runs inside the TWDT
+// interrupt, before the panic: snapshot what each core was running into RTC memory,
+// and the next boot's BOOT line carries it into the SD log. The 2026-08-05 TASK_WDT
+// reboot (core-0 idle starved by an unidentified spinner) is why this exists.
+RTC_NOINIT_ATTR static char     sfWdtTask[2][20];
+RTC_NOINIT_ATTR static uint32_t sfWdtMagic;             // 0x57444754 = snapshot valid
+extern "C" void esp_task_wdt_isr_user_handler(void) {
+  for (int c = 0; c < 2; c++) {
+    TaskHandle_t t = xTaskGetCurrentTaskHandleForCore(c);
+    const char* n = t ? pcTaskGetName(t) : NULL;
+    strlcpy(sfWdtTask[c], n ? n : "?", sizeof(sfWdtTask[c]));
+  }
+  sfWdtMagic = 0x57444754;
+}
 
 // main.cpp -- boot sequence and supervisor.
 // setup() brings the system up in dependency order (mutexes, config, clock,
@@ -112,6 +128,14 @@ void setup() {
              "BOOT %s v%s reset=%s prev-uptime=%lum panicBoots=%lu",
              PRODUCT_NAME, FW_VERSION, rs, (unsigned long)sfResetUpMin[1],
              (unsigned long)sfPanicBoots);
+    if (rr == ESP_RST_TASK_WDT && sfWdtMagic == 0x57444754) {
+      sfWdtTask[0][sizeof(sfWdtTask[0]) - 1] = 0;       // RTC RAM is trusted-but-verified
+      sfWdtTask[1][sizeof(sfWdtTask[1]) - 1] = 0;
+      const size_t l = strlen(sfBootNote);
+      snprintf(sfBootNote + l, sizeof(sfBootNote) - l, " wdt-running: c0=%s c1=%s",
+               sfWdtTask[0], sfWdtTask[1]);
+    }
+    sfWdtMagic = 0;    // one-shot: a stale snapshot must never attach to a later reset
     if (sfPanicBoots >= PANIC_REFORMAT_THRESHOLD) {
       printf("[RECOVERY] %u crash reboots in a row -- reformatting FATFS to break the loop\n",
              (unsigned)sfPanicBoots);

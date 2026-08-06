@@ -6,6 +6,7 @@
 #include "display.h"
 #include "effects.h"
 #include "font1252.h"
+#include "ttf.h"        // scalable ticker text (v0.4.5): bitmap faces are specks at 800p
 #include <string.h>
 #include <esp_cache.h>
 #include <esp_heap_caps.h>
@@ -232,8 +233,12 @@ static inline void stagePx(int x, int y, uint8_t& r, uint8_t& g, uint8_t& b) {
 }
 
 // Present the staged frame through the configured transition. Runs on the httpd task
-// (v3.0 moved request handling off taskWeb); each tween step is paced by panelShow()'s
-// one-frame yield, and the web watchdog is fed.
+// (v3.0 moved request handling off taskWeb) -- which is pinned to CORE 0, the one core
+// whose idle task the TWDT watches. panelShow() does NOT reliably block since the
+// pipelined present (it only waits if the PREVIOUS rotate is still in flight, and the
+// per-pixel compose usually outlasts it), so every tween step and every one-shot
+// present must vTaskDelay explicitly: with the client a frame ahead in the TCP window,
+// back-to-back handler runs otherwise starve idle0 for >5 s = TASK_WDT reboot.
 void canvasStagePresent() {
   const int W = gPanel.panelW, H = gPanel.panelH;
   const uint8_t type = gTransType;
@@ -263,6 +268,7 @@ void canvasStagePresent() {
       }
       panelShow();
       wdgWebMs = millis();
+      vTaskDelay(1);                      // feed idle0 (see header comment)
     }
   } else if (type == 2) {                 // wipe, left to right
     panelCloneToBack();                   // keep the old frame under the un-wiped part
@@ -278,6 +284,7 @@ void canvasStagePresent() {
       panelShow();
       panelCloneToBack();
       wdgWebMs = millis();
+      vTaskDelay(1);                      // feed idle0 (see header comment)
     }
   } else if (type == 3) {                 // slide: new frame pushes the old off to the left
     while ((el = millis() - t0) < dur) {
@@ -292,6 +299,7 @@ void canvasStagePresent() {
       }
       panelShow();
       wdgWebMs = millis();
+      vTaskDelay(1);                      // feed idle0 (see header comment)
     }
   }
   // Land exactly on the new frame regardless of type (also the type==0 direct path).
@@ -303,6 +311,9 @@ void canvasStagePresent() {
     panelBlitRow888(0, y, W, rowBuf);
   }
   panelShow();
+  vTaskDelay(1);   // one guaranteed idle0 tick per one-shot present: a client pushing
+                   // frames back-to-back (body pre-buffered in the TCP window) gives
+                   // the httpd worker no other blocking point in the whole cycle
 }
 
 // ---- animation library (v2.1) ------------------------------------------------------------------
@@ -1051,6 +1062,9 @@ static uint8_t         tickR = 255, tickG = 255, tickB = 255;
 static int             tickSpeed = 2;                 // px per step
 static int             tickScroll = 0, tickTextW = 0;
 static const Font1252* tickFont = &FONT_6x10;
+static bool            tickTtf  = false;   // scalable path: TTF sans at a panel-proportional size
+static int             tickSize = 0;       // em size when tickTtf
+static int             tickMult = 1;       // speed multiplier: keep px/step proportional to glyph size
 static uint32_t        tickLastMs = 0;
 
 static const Font1252* tickerFace() {
@@ -1073,8 +1087,17 @@ static void tickerOverlayDraw() {
   uint32_t now = millis();
   if (now - tickLastMs >= 33) {
     tickLastMs = now;
-    tickScroll += tickSpeed;
+    tickScroll += tickSpeed * tickMult;
     if (tickScroll > tickTextW + gPanel.panelW) tickScroll = 0;
+  }
+  if (tickTtf) {                            // scalable lower-third (see canvasTickerSet)
+    const int bandH = tickSize * 13 / 10;
+    const int by = gPanel.panelH - bandH;
+    if (tickBand) panelFillRect(0, by, gPanel.panelW, bandH, 0, 0, 0);
+    ttfDrawText(gPanel.panelW - tickScroll, by + (bandH - tickSize) / 2, tickSize, TTF_SANS,
+                tickText, 0, tickR, tickG, tickB, true, 0,
+                false, 0, 0, 0, false, 0, 0, 0);
+    return;
   }
   const Font1252* f = tickFont;
   const int gw = f->width + 1;
@@ -1102,8 +1125,21 @@ void canvasTickerSet(const char* text, uint8_t r, uint8_t g, uint8_t b, int spee
   tickR = r; tickG = g; tickB = b; tickBand = band;
   tickSpeed = speed < 1 ? 1 : (speed > 20 ? 20 : speed);
   tickFont = font ? font : tickerFace();     // v2.1: an uploaded face, or the panel-sized default
-  const int gw = tickFont->width + 1;        // 1 px between glyphs
-  tickTextW = (int)strlen(tickText) * gw;
+  // Scalable default (v0.4.5): the bundled bitmap faces top out at 10x20 -- specks on a
+  // 1280x800 panel. With no uploaded face, render through the TTF engine at a size cut
+  // from the panel instead; the glyph cache makes the steady-state scroll a coverage
+  // blit. An explicitly uploaded Font1252 still wins.
+  tickTtf = !font && ttfFaceReady(TTF_SANS) && gPanel.panelH >= 240;
+  if (tickTtf) {
+    tickSize = overlay ? gPanel.panelH / 10 : gPanel.panelH / 6;   // band vs full-screen
+    if (tickSize > TTF_MAX_SIZE) tickSize = TTF_MAX_SIZE;
+    tickMult = tickSize / 16; if (tickMult < 1) tickMult = 1;      // px/step scales with glyphs
+    tickTextW = ttfTextWidth(TTF_SANS, tickSize, tickText, 0);
+  } else {
+    tickSize = 0; tickMult = 1;
+    const int gw = tickFont->width + 1;      // 1 px between glyphs
+    tickTextW = (int)strlen(tickText) * gw;
+  }
   tickScroll = 0; tickLastMs = 0;
   if (overlay) {
     // Composite over whatever is presenting: no panel claim, no mode change.
@@ -1142,6 +1178,16 @@ void canvasTickerRender() {
   uint32_t now = millis();
   if (now - tickLastMs < 33) { vTaskDelay(pdMS_TO_TICKS(2)); return; }   // ~30 steps/s
   tickLastMs = now;
+  if (tickTtf) {                            // scalable full-screen line (see canvasTickerSet)
+    panelClear();
+    ttfDrawText(gPanel.panelW - tickScroll, (gPanel.panelH - tickSize) / 2, tickSize, TTF_SANS,
+                tickText, 0, tickR, tickG, tickB, true, 0,
+                false, 0, 0, 0, false, 0, 0, 0);
+    panelShow();
+    tickScroll += tickSpeed * tickMult;
+    if (tickScroll > tickTextW + gPanel.panelW) tickScroll = 0;
+    return;
+  }
   const Font1252* f = tickFont;
   const int gw = f->width + 1;
   const int y0 = (gPanel.panelH - f->height) / 2;

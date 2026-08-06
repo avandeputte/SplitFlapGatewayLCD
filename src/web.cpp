@@ -1444,7 +1444,15 @@ static bool quietBlocked(httpd_req_t* r) {
 }
 
 static void canvasEnter(bool clear) {
-  if (!gCanvasMode) canvasStandDown();
+  if (!gCanvasMode) {
+    // Eviction race guard: an effect start (or wall return) clears gCanvasMode and
+    // raises the kill flag, but records already inside the pump's CURRENT batch still
+    // execute before the pump re-checks the flag. Without this gate such a record
+    // stands the canvas back up and cancels the pending gEffectReq -- the user-visible
+    // "tapping an effect does nothing" race. Let the doomed stream die instead.
+    if (gCanvasStreamKill) return;
+    canvasStandDown();
+  }
   if (clear && gPanel.ready) { panelClear(); panelShow(); }
 }
 static void canvasPrefixReset();               // release replay storage (defined with its state)
@@ -3020,8 +3028,9 @@ static uint16_t       gBinMacroLen[8] = {};
 static uint8_t        gBinAlpha       = 255;    // batch alpha (0x15); scoped across CALL
 
 // Cooperative yield for the ops runners (resilience). The canvas ops render on the HTTP
-// server task (one-shot PUTs) and on taskWeb (the stream pump), both on core 0; the ESP
-// task watchdog watches idle-core-0 with a 5 s timeout. A large batch, a single expensive
+// server task (one-shot PUTs, pinned to core 0 -- the core whose idle task the 5 s ESP
+// task watchdog watches) and on taskWeb (the stream pump, core 1 since v0.2 -- a spin
+// there hangs rather than reboots, which is just as fatal for the wall). A large batch, a single expensive
 // op, OR a flood of small records drained in one pump tick can render for seconds at this
 // resolution and, without yielding, starve idle-core-0 -- the whole board then reboots
 // (reset cause TASK_WDT), and until it does taskWeb/SSE/other HTTP requests are frozen. A

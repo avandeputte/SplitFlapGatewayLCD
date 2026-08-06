@@ -230,8 +230,9 @@ static void synthTask(void* pv) {
       }
       memset(blk, 0, sizeof(blk));                     // keep the DAC fed with silence
       size_t wr;
-      i2s_channel_write(audioTxChan(), blk, sizeof(blk), &wr, pdMS_TO_TICKS(100));
-      continue;
+      if (i2s_channel_write(audioTxChan(), blk, sizeof(blk), &wr, pdMS_TO_TICKS(100)) != ESP_OK)
+        vTaskDelay(1);   // a not-running channel fails instantly; this write is the
+      continue;          // loop's only pacing, so failure must still yield (core 0/TWDT)
     }
     idleSince = 0;
 
@@ -264,6 +265,7 @@ static void synthTask(void* pv) {
         if (!wrFail) printf("[SOUND] first write fail: err=0x%x wrote=%u/%u\n",
                             (unsigned)we, (unsigned)wr, (unsigned)(frames * 4));
         wrFail++;
+        vTaskDelay(1);   // instant-fail writes drain notes at CPU speed -- keep pacing
       }
       done += frames;
     }

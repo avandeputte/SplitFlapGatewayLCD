@@ -435,8 +435,17 @@ static esp_err_t panel_jd9365_init(esp_lcd_panel_t *panel)
     }
 
     uint8_t ID[3];
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_rx_param(io, 0x04, ID, 3), TAG, "read ID failed");
-    ESP_LOGI(TAG, "LCD ID: %02X %02X %02X", ID[0], ID[1], ID[2]);
+    /* Vendored change (v0.4.5): read the panel ID only ONCE per power-up. The DCS
+     * read busy-polls the DSI host in prebuilt HAL code with NO timeout; the runtime
+     * self-heal (panelHealthTick) re-enters this init against a possibly wedged host,
+     * and a hung read here would spin taskDisplay forever. The boot-time read keeps
+     * its diagnostic value; re-inits skip straight to the command table. */
+    static bool id_read_done = false;
+    if (!id_read_done) {
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_io_rx_param(io, 0x04, ID, 3), TAG, "read ID failed");
+        ESP_LOGI(TAG, "LCD ID: %02X %02X %02X", ID[0], ID[1], ID[2]);
+        id_read_done = true;
+    }
 
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, JD9365_CMD_PAGE, (uint8_t[]){JD9365_PAGE_USER}, 1), TAG, "send command failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, LCD_CMD_MADCTL, (uint8_t[]){
