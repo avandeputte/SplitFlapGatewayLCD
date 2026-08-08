@@ -116,16 +116,98 @@ void audioReadScope(int8_t* out, int n) {
 }
 
 
+#if BOARD_AUDIO_ES7210
+/* ---- ES7210 4-channel ADC (the 7B's dual mics; I2C 0x40..0x43) ---------------------
+   This board captures on a dedicated ES7210, NOT the ES8311's own ADC. The register
+   bring-up is ported from the Matrix gateway (esphome sequence, 16 kHz / MCLK 256x =
+   4.096 MHz). Once configured the ES7210 drives the I2S DIN (GPIO 11) that the RX
+   channel already reads; the ES8311 stays the DAC (sound.cpp). Same shared Wire bus. */
+static uint8_t es7210Addr = 0;   // 7-bit, discovered by probe
+
+static bool esWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(es7210Addr);
+  Wire.write(reg); Wire.write(val);
+  return Wire.endTransmission(true) == 0;
+}
+static bool esRead(uint8_t reg, uint8_t& val) {
+  Wire.beginTransmission(es7210Addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(true) != 0) return false;
+  if (Wire.requestFrom(es7210Addr, (uint8_t)1) != 1) return false;
+  val = (uint8_t)Wire.read();
+  return true;
+}
+static bool esUpdate(uint8_t reg, uint8_t mask, uint8_t bits) {
+  uint8_t v;
+  if (!esRead(reg, v)) return false;
+  return esWrite(reg, (uint8_t)((v & ~mask) | (bits & mask)));
+}
+static bool es7210Configure() {
+  bool ok = true;
+  ok &= esWrite(0x00, 0xff);              // full reset
+  ok &= esWrite(0x00, 0x32);
+  ok &= esWrite(0x01, 0x3f);              // clocks off during config
+  ok &= esWrite(0x09, 0x30);              // power-up timing
+  ok &= esWrite(0x0A, 0x30);
+  ok &= esWrite(0x23, 0x2a);              // HPF, all channels
+  ok &= esWrite(0x22, 0x0a);
+  ok &= esWrite(0x20, 0x0a);
+  ok &= esWrite(0x21, 0x2a);
+  ok &= esUpdate(0x08, 0x01, 0x00);       // I2S slave (ESP32 is bus master)
+  ok &= esWrite(0x40, 0xC3);              // analog power
+  ok &= esWrite(0x41, 0x70);              // mic bias 2.87 V
+  ok &= esWrite(0x42, 0x70);
+  ok &= esWrite(0x11, 0x60);              // SDP: 16-bit I2S
+  ok &= esWrite(0x12, 0x00);              // mic1/2 -> SDOUT1 (our DIN)
+  ok &= esWrite(0x02, 0x01 | (0x01 << 6) | (0x01 << 7));   // reg02 = adc_div | doubler<<6 | dll<<7
+  ok &= esWrite(0x07, 0x20);              // OSR
+  ok &= esWrite(0x04, 0x01);              // LRCK divider 0x0100 (MCLK/256)
+  ok &= esWrite(0x05, 0x00);
+  for (uint8_t r = 0x43; r <= 0x46; r++) ok &= esUpdate(r, 0x10, 0x00);
+  ok &= esUpdate(0x01, 0x0b, 0x00);       // re-enable ADC clocks (LOAD-BEARING: 0x3f above turned them off)
+  ok &= esWrite(0x4B, 0x00);
+  ok &= esUpdate(0x43, 0x10, 0x10);
+  ok &= esUpdate(0x43, 0x0f, 11);         // mic1 gain 33 dB
+  ok &= esWrite(0x4B, 0x00);
+  ok &= esUpdate(0x44, 0x10, 0x10);
+  ok &= esUpdate(0x44, 0x0f, 11);         // mic2 gain 33 dB
+  ok &= esWrite(0x47, 0x08);              // mic power on
+  ok &= esWrite(0x48, 0x08);
+  ok &= esWrite(0x06, 0x04);              // DLL power down
+  ok &= esWrite(0x4B, 0x0F);              // MICBias/ADC/PGA power, ch 1+2
+  ok &= esWrite(0x4C, 0x0F);
+  ok &= esWrite(0x00, 0x71);              // enable
+  ok &= esWrite(0x00, 0x41);
+  return ok;
+}
+#endif // BOARD_AUDIO_ES7210
+
 void audioInit() {
-  // The ES8311 is a COMBINED codec: sound.cpp drives its DAC (speaker), and its ADC
-  // captures the board's single onboard mic onto the same duplex I2S port (our DIN).
-  // There is no separate ES7210 here -- just confirm the codec answers on I2C; the
-  // register config (DAC and ADC both) is done by sound.cpp's es8311Configure() right
-  // after this, in the same single-threaded boot window. Wire is already begun.
+#if BOARD_AUDIO_ES7210
+  // The mics are on a dedicated ES7210 4-channel ADC (0x40..0x43 by strap), not the
+  // ES8311's ADC. Probe + configure it; it then drives the I2S DIN the RX side reads.
+  // The ES8311 (sound.cpp) still does playback. Wire is already begun by rtcHwInit.
+  for (uint8_t a = 0x40; a <= 0x43; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission(true) == 0) { es7210Addr = a; break; }
+  }
+  if (!es7210Addr) {
+    printf("[AUDIO] no ES7210 on I2C 0x40..0x43 -- audio effects disabled\n");
+    gAudioPresent = false;
+    return;
+  }
+  gAudioPresent = es7210Configure();
+  printf("[AUDIO] ES7210 at 0x%02x: %s (dual mic, 16 kHz)\n",
+         es7210Addr, gAudioPresent ? "configured" : "CONFIG FAILED");
+#else
+  // The 10.1" ES8311 is a COMBINED codec: sound.cpp drives its DAC (speaker), and its ADC
+  // captures the board's single onboard mic onto the same duplex I2S port (our DIN). Just
+  // confirm the codec answers; its register config (DAC + ADC) is sound.cpp's job.
   Wire.beginTransmission(0x18);
   gAudioPresent = (Wire.endTransmission(true) == 0);
   printf("[AUDIO] ES8311 mic %s (codec ADC, 16 kHz)\n",
          gAudioPresent ? "available" : "NOT FOUND -- audio effects disabled");
+#endif
 }
 
 /* ---- DSP: 128-point real FFT via iterative radix-2, precomputed tables ---- */

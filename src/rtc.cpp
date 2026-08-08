@@ -24,10 +24,13 @@ static time_t rtcToEpochUTC(uint16_t yr, uint8_t mo, uint8_t dy, uint8_t hr, uin
 
 void rtcHwInit() {
   // Bring up the shared I2C bus (the backlight controller, touch, codec and sensor
-  // all ride it). This is the one bus init -- it runs before those peripherals in
-  // setup(). There is no RTC chip to seed the clock from; NTP does that.
+  // all ride it). This is the one bus init -- it runs before those peripherals in setup().
+  // No I2C RTC chip on these boards (an I2C scan of the 7B found only ES8311 0x18,
+  // ES7210 0x40, GT911 0x5d -- no PCF85063 at 0x51). The 7B's RTC battery backs the P4's
+  // INTERNAL RTC domain, which is a separate feature (RTC_NOINIT retention); until then
+  // NTP is the only clock source, same as the 10.1" board.
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  printf("[RTC] no RTC chip on this board -- clock waits for NTP\n");
+  printf("[RTC] no I2C RTC chip -- clock waits for NTP\n");
 }
 
 // (Re)apply the configured POSIX zone (gPosixTZ) to the process environment. setenv/tzset and the

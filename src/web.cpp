@@ -712,10 +712,10 @@ static esp_err_t handleApiCapabilities(httpd_req_t* r) {
 
   char head[320];
   snprintf(head, sizeof(head),
-           "{\"product\":\"%s\",\"fw\":\"%s\","
+           "{\"product\":\"%s\",\"board\":\"%s\",\"fw\":\"%s\","
            "\"openapi\":\"/openapi.yaml\","
            "\"grid\":{\"rows\":%d,\"cols\":%d},\"modules\":%d,\"maxFlaps\":%d,",
-           PRODUCT_NAME, FW_VERSION, rows, cols, vmCount, SF_MAX_FLAPS);
+           PRODUCT_NAME, BOARD_ID_STR, FW_VERSION, rows, cols, vmCount, SF_MAX_FLAPS);
   capPut(head);
 
   // The colour flaps are NOT characters. They are named, because on the index-addressed path
