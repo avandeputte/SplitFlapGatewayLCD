@@ -43,7 +43,12 @@
 #include <hal/axi_icm_ll.h>          // AXI arbiter QoS: the scan-out must WIN arbitration (v0.4.1)
 #include <soc/mipi_dsi_bridge_struct.h>  // the bridge's underflow substitute pixel (v0.4.1)
 #include <esp_lcd_mipi_dsi.h>        // refresh-done heartbeat callbacks (already included; harmless)
-#include "esp_lcd_jd9365_10_1.h"     // vendored Waveshare panel driver (Apache-2.0)
+#if PANEL_DRIVER_JD9365
+#include "esp_lcd_jd9365_10_1.h"     // vendored Waveshare JD9365 driver (Apache-2.0)
+#endif
+#if PANEL_DRIVER_EK79007
+#include "esp_lcd_ek79007.h"         // vendored Espressif EK79007 driver (Apache-2.0)
+#endif
 #include "sdcard.h"        // sdLog: on-card event log
 #include "board.h"         // board profile: PANEL_NATIVE_W/H, PANEL_ROT_180, MIPI_LDO_*, PANEL_DSI_*
 
@@ -52,6 +57,16 @@
 //      MBPS. The 10.1" JD9365 is 800x1280 native portrait, rotated 90 deg into 1280x800
 //      logical landscape; a native-landscape board (7" EK79007) sets PANEL_ROTATE_DEG 0 and
 //      takes the direct-present path (Phase 2). ---------------------------------------------
+
+// Logical framebuffer dimensions expressed in native pixels: a rotated board's logical width
+// is the native HEIGHT (the 90-degree swap); a native-landscape board maps 1:1.
+#if PANEL_ROTATE_DEG == 0
+#  define PANEL_LOGICAL_NATIVE_W  PANEL_NATIVE_W
+#  define PANEL_LOGICAL_NATIVE_H  PANEL_NATIVE_H
+#else
+#  define PANEL_LOGICAL_NATIVE_W  PANEL_NATIVE_H
+#  define PANEL_LOGICAL_NATIVE_H  PANEL_NATIVE_W
+#endif
 
 typedef uint16_t px_t;               // RGB565, little-endian native
 
@@ -112,9 +127,13 @@ static volatile int gBlPending = -1;           // -1 idle, else 0..255 to write
 static volatile uint8_t bright = 255;
 
 static void blWrite(uint8_t reg, uint8_t val) {
+#if LCD_BL_I2C_ADDR >= 0
   Wire.beginTransmission(LCD_BL_I2C_ADDR);
   Wire.write(reg); Wire.write(val);
   Wire.endTransmission();
+#else
+  (void)reg; (void)val;                          // no I2C backlight controller (e.g. the 7B)
+#endif
 }
 
 void panelSetBrightness(uint8_t b) {
@@ -154,8 +173,8 @@ void panelSetScale(uint8_t s) {
   if (gShowMutex) xSemaphoreTakeRecursive(gShowMutex, portMAX_DELAY);
   panelRotSync();                                // an in-flight rotate reads these buffers
   gScale = s;
-  W = (uint16_t)(PANEL_NATIVE_H / s);
-  H = (uint16_t)(PANEL_NATIVE_W / s);
+  W = (uint16_t)(PANEL_LOGICAL_NATIVE_W / s);
+  H = (uint16_t)(PANEL_LOGICAL_NATIVE_H / s);
   info.width = W; info.height = H;
   panelClearClip();
   memset(fb[0], 0, gFbBytes);
@@ -941,7 +960,11 @@ static void rotateToScanout() {
     op.out.block_offset_x = 0;
     op.out.block_offset_y = 0;
     op.out.srm_cm        = PPA_SRM_COLOR_MODE_RGB565;
+#if PANEL_ROTATE_DEG == 0
+    op.rotation_angle    = PPA_SRM_ROTATION_ANGLE_0;   // native landscape: scale only, no rotate
+#else
     op.rotation_angle    = PANEL_ROT_180 ? PPA_SRM_ROTATION_ANGLE_270 : PPA_SRM_ROTATION_ANGLE_90;
+#endif
     op.scale_x           = (float)gScale;
     op.scale_y           = (float)gScale;
     // Pipelined: the caller (panelShow) has already TAKEN gRotDone, so at most one rotate
@@ -966,10 +989,14 @@ static void rotateToScanout() {
       const px_t v = src[(size_t)y * W + x];
       for (int dy = 0; dy < S; dy++)
         for (int dx = 0; dx < S; dx++) {
-          const int lx = x * S + dx, ly = y * S + dy;   // native landscape coords
+          const int lx = x * S + dx, ly = y * S + dy;   // native coords
           int nx, ny;
+#if PANEL_ROTATE_DEG == 0
+          nx = lx; ny = ly;                             // native landscape: direct, no rotate
+#else
           if (!PANEL_ROT_180) { nx = LH - 1 - ly;  ny = lx; }
           else                { nx = ly;           ny = LW - 1 - lx; }
+#endif
           dst[(size_t)ny * PANEL_NATIVE_W + nx] = v;
         }
     }
@@ -1033,6 +1060,12 @@ void panelPresentRects(const int16_t* rects, int n) {
       op.out.buffer_size   = (size_t)PANEL_NATIVE_W * PANEL_NATIVE_H * sizeof(px_t);
       op.out.pic_w         = PANEL_NATIVE_W;
       op.out.pic_h         = PANEL_NATIVE_H;
+#if PANEL_ROTATE_DEG == 0
+      op.out.block_offset_x = x * gScale;          // native landscape: direct, no rotate
+      op.out.block_offset_y = y * gScale;
+      op.out.srm_cm        = PPA_SRM_COLOR_MODE_RGB565;
+      op.rotation_angle    = PPA_SRM_ROTATION_ANGLE_0;
+#else
       if (!PANEL_ROT_180) {                        // angle 90 (PPA convention): (x,y) -> (y, NH-(x+w))
         op.out.block_offset_x = y * gScale;
         op.out.block_offset_y = PANEL_NATIVE_H - (x + w) * gScale;
@@ -1042,6 +1075,7 @@ void panelPresentRects(const int16_t* rects, int n) {
       }
       op.out.srm_cm        = PPA_SRM_COLOR_MODE_RGB565;
       op.rotation_angle    = PANEL_ROT_180 ? PPA_SRM_ROTATION_ANGLE_270 : PPA_SRM_ROTATION_ANGLE_90;
+#endif
       op.scale_x           = (float)gScale;
       op.scale_y           = (float)gScale;
       op.mode              = PPA_TRANS_MODE_BLOCKING;   // small blocks: total ~5-10 ms
@@ -1058,8 +1092,12 @@ void panelPresentRects(const int16_t* rects, int n) {
             for (int dx = 0; dx < S; dx++) {
               const int lx = xx * S + dx, ly = yy * S + dy;
               int nx, ny;
+#if PANEL_ROTATE_DEG == 0
+              nx = lx; ny = ly;                    // native landscape: direct, no rotate
+#else
               if (!PANEL_ROT_180) { nx = LH2 - 1 - ly; ny = lx; }
               else                { nx = ly;           ny = LW2 - 1 - lx; }
+#endif
               dst[(size_t)ny * PANEL_NATIVE_W + nx] = v;
             }
         }
@@ -1174,12 +1212,12 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   info = {false, width, height, 16, 0, 0};
   // The logical geometry must be the native panel rotated. Anything else (a smaller
   // "window") is representable later; bring-up keeps the 1:1 mapping.
-  if (width != PANEL_NATIVE_H || height != PANEL_NATIVE_W) {
-    printf("[PANEL] %ux%u requested; this build drives the 10.1\" DSI panel only "
-           "(landscape %ux%u) -- using native geometry\n",
-           (unsigned)width, (unsigned)height, PANEL_NATIVE_H, PANEL_NATIVE_W);
+  if (width != PANEL_LOGICAL_NATIVE_W || height != PANEL_LOGICAL_NATIVE_H) {
+    printf("[PANEL] %ux%u requested; this build drives its native panel "
+           "(%ux%u) -- using native geometry\n",
+           (unsigned)width, (unsigned)height, PANEL_LOGICAL_NATIVE_W, PANEL_LOGICAL_NATIVE_H);
   }
-  W = PANEL_NATIVE_H;  H = PANEL_NATIVE_W;        // landscape logical space
+  W = PANEL_LOGICAL_NATIVE_W;  H = PANEL_LOGICAL_NATIVE_H;   // logical landscape space
   info.width = W; info.height = H;
 
   const size_t fbBytes = (size_t)W * H * sizeof(px_t);
@@ -1197,7 +1235,10 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   // must ACK before anything touches DSI -- the JD9365 init READS the panel ID over
   // the bus, and against an unpowered panel that read blocks the boot forever
   // (observed on the bench with the display's power lead unplugged). No controller
-  // = no display: run headless, loudly, and say what to check.
+  // = no display: run headless, loudly, and say what to check. Boards with no I2C
+  // display controller (LCD_BL_I2C_ADDR < 0, e.g. the 7B, whose EK79007 has no FPC
+  // controller and an always-on backlight) skip this and init the DSI panel directly.
+#if LCD_BL_I2C_ADDR >= 0
   Wire.beginTransmission(LCD_BL_I2C_ADDR);
   if (Wire.endTransmission() != 0) {
     printf("[PANEL] display controller (0x%02X) not answering on I2C -- display "
@@ -1205,6 +1246,7 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
            LCD_BL_I2C_ADDR);
     panelFreeAll(); return false;
   }
+#endif
   // MIPI D-PHY power (the P4 routes it through an internal LDO channel).
   esp_ldo_channel_config_t ldo = {};
   ldo.chan_id = MIPI_LDO_CHAN;
@@ -1246,11 +1288,6 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
 
   esp_lcd_dpi_panel_config_t dpiCfg = {};
   dpiCfg.dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT;
-  dpiCfg.dpi_clock_freq_mhz = 80;                  // 60 Hz. DO NOT lower: a 66 MHz trial against
-                                                   // the aquarium's bandwidth flicker LATCHED the
-                                                   // bridge solid blue within a minute (v0.4.1).
-                                                   // Bandwidth relief lives in the DRAW paths
-                                                   // (dirty-rect restores), not the scan clock.
   dpiCfg.virtual_channel = 0;
   // IDF 5.5 takes in_color_format (the legacy pixel_format field is a separate,
   // unread member here); and Waveshare's own 5.5 configs do NOT enable use_dma2d.
@@ -1258,6 +1295,21 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   dpiCfg.num_fbs = 1;
   dpiCfg.video_timing.h_size = PANEL_NATIVE_W;
   dpiCfg.video_timing.v_size = PANEL_NATIVE_H;
+#if PANEL_DRIVER_EK79007
+  // EK79007 1024x600 @60Hz -- Espressif esp_lcd_ek79007 component's recommended DPI timing.
+  dpiCfg.dpi_clock_freq_mhz = 52;
+  dpiCfg.video_timing.hsync_back_porch = 160;
+  dpiCfg.video_timing.hsync_pulse_width = 10;
+  dpiCfg.video_timing.hsync_front_porch = 160;
+  dpiCfg.video_timing.vsync_back_porch = 23;
+  dpiCfg.video_timing.vsync_pulse_width = 1;
+  dpiCfg.video_timing.vsync_front_porch = 12;
+  ek79007_vendor_config_t vendor = {};
+#else
+  // JD9365 800x1280 @60Hz. DO NOT lower 80 MHz: a 66 MHz trial against the aquarium's
+  // bandwidth flicker LATCHED the bridge solid blue within a minute (v0.4.1). Bandwidth
+  // relief lives in the DRAW paths (dirty-rect restores), not the scan clock.
+  dpiCfg.dpi_clock_freq_mhz = 80;
   dpiCfg.video_timing.hsync_back_porch = 20;
   dpiCfg.video_timing.hsync_pulse_width = 20;
   dpiCfg.video_timing.hsync_front_porch = 40;
@@ -1265,22 +1317,29 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   dpiCfg.video_timing.vsync_pulse_width = 4;
   dpiCfg.video_timing.vsync_front_porch = 30;
   jd9365_vendor_config_t vendor = {};
+#endif
   vendor.mipi_config.dsi_bus = gDsiBus;
   vendor.mipi_config.dpi_config = &dpiCfg;
-  vendor.mipi_config.lane_num = 2;
+  vendor.mipi_config.lane_num = PANEL_DSI_LANES;
   esp_lcd_panel_dev_config_t devCfg = {};
   devCfg.reset_gpio_num = DSI_RESET_PIN;
   devCfg.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
   devCfg.bits_per_pixel = 16;
   devCfg.vendor_config = &vendor;
+#if PANEL_DRIVER_EK79007
+  esp_err_t e = esp_lcd_new_panel_ek79007(gDbiIo, &devCfg, &gPanel);
+#else
   esp_err_t e = esp_lcd_new_panel_jd9365(gDbiIo, &devCfg, &gPanel);
+#endif
   if (e == ESP_OK) e = esp_lcd_panel_reset(gPanel);
   if (e == ESP_OK) e = esp_lcd_panel_init(gPanel);
   if (e != ESP_OK) {
-    printf("[PANEL] JD9365 init failed\n");
+    printf("[PANEL] panel init failed\n");
     panelFreeAll(); return false;
   }
-  esp_lcd_panel_disp_on_off(gPanel, true);
+#if PANEL_DRIVER_JD9365
+  esp_lcd_panel_disp_on_off(gPanel, true);        // EK79007 has no disp_on_off op (on after init)
+#endif
 
   // The DPI engine scans its own frame buffer continuously; get its address so the
   // rotate-blit can target it directly.
@@ -1347,8 +1406,13 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   info.bytes = (uint32_t)(gFbBytes * 2);
   info.refreshHz = 60;                             // DPI timing, fixed
   info.ok = true;
+#if PANEL_ROTATE_DEG == 0
+  printf("[PANEL] DSI up: %ux%u landscape (native %ux%u), RGB565, %s direct present\n",
+         (unsigned)W, (unsigned)H, PANEL_NATIVE_W, PANEL_NATIVE_H, gPpa ? "PPA" : "CPU");
+#else
   printf("[PANEL] DSI up: %ux%u landscape (native %ux%u), RGB565, %s rotate\n",
          (unsigned)W, (unsigned)H, PANEL_NATIVE_W, PANEL_NATIVE_H, gPpa ? "PPA" : "CPU");
+#endif
   return true;
 }
 
