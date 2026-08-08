@@ -932,6 +932,7 @@ static esp_err_t handleApiConfigGet(httpd_req_t* r) {
   // clients key on "product" + the capability tokens instead. See common.h.
   doc["version"]   = FW_VERSION;
   doc["product"]   = PRODUCT_NAME;
+  doc["board"]     = BOARD_ID_STR;   // which P4 board (waveshare-p4-lcd-10 | -7b); from the profile
   doc["fwVersion"] = FW_VERSION;
   doc["wSSID"]    = cfg.wifiSSID;
   doc["posixTZ"]    = cfg.posixTZ;

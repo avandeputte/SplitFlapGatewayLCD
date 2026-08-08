@@ -202,6 +202,7 @@ void setup() {
   // Runs alongside WiFi; DHCP on either interface serves the gateway. Pin facts:
   // SMI MDC=31 MDIO=52, PHY reset=51, addr 1, RMII data pins via build flags
   // (IDF-default P4 wiring, matching Waveshare's own ethernetbasic example).
+#if BOARD_HAS_ETH
   Network.onEvent([](arduino_event_id_t ev, arduino_event_info_t info) {
     if (ev == ARDUINO_EVENT_ETH_GOT_IP) {
       printf("[ETH] up: %s\n", ETH.localIP().toString().c_str());
@@ -214,6 +215,11 @@ void setup() {
   ETH.setHostname(cfgHostname());
   if (!ETH.begin(ETH_PHY_IP101, 1, 31, 52, 51, EMAC_CLK_EXT_IN))
     printf("[ETH] init failed (no PHY?)\n");
+#else
+  // No Ethernet PHY on this board (e.g. the 7B): WiFi-only. gEthUp stays false, so
+  // taskNetwork never powers WiFi down. (Skipping ETH.begin also drops the emac
+  // reset-timeout errors the missing PHY logged.)
+#endif
 
   // 8. WiFi -- MUST be initialised here, on the main Arduino task.
   // The SoftAP is a FALLBACK only: start in station mode and connect to the
