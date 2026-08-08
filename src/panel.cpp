@@ -45,13 +45,13 @@
 #include <esp_lcd_mipi_dsi.h>        // refresh-done heartbeat callbacks (already included; harmless)
 #include "esp_lcd_jd9365_10_1.h"     // vendored Waveshare panel driver (Apache-2.0)
 #include "sdcard.h"        // sdLog: on-card event log
+#include "board.h"         // board profile: PANEL_NATIVE_W/H, PANEL_ROT_180, MIPI_LDO_*, PANEL_DSI_*
 
-// ---- tunables ---------------------------------------------------------------------
-#define MIPI_LDO_CHAN       3        // P4 D-PHY power rail (2.5 V on LDO channel 3)
-#define MIPI_LDO_MV         2500
-#define PANEL_NATIVE_W      800      // portrait native; logical W/H arrive rotated
-#define PANEL_NATIVE_H      1280
-#define PANEL_ROT_180       0        // set 1 if the landscape mount is upside-down
+// ---- board-specific tunables now come from the board profile (board.h): MIPI_LDO_CHAN/MV
+//      (D-PHY power rail), PANEL_NATIVE_W/H, PANEL_ROT_180, PANEL_ROTATE_DEG, PANEL_DSI_LANES/
+//      MBPS. The 10.1" JD9365 is 800x1280 native portrait, rotated 90 deg into 1280x800
+//      logical landscape; a native-landscape board (7" EK79007) sets PANEL_ROTATE_DEG 0 and
+//      takes the direct-present path (Phase 2). ---------------------------------------------
 
 typedef uint16_t px_t;               // RGB565, little-endian native
 
@@ -1228,9 +1228,9 @@ bool panelBegin(uint16_t width, uint16_t height, uint8_t depth, bool fbPsram) {
   // vendored esp_lcd_jd9365_10_1.h.
   esp_lcd_dsi_bus_config_t busCfg = {};
   busCfg.bus_id = 0;
-  busCfg.num_data_lanes = 2;
+  busCfg.num_data_lanes = PANEL_DSI_LANES;
   busCfg.phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT;
-  busCfg.lane_bit_rate_mbps = 1500;
+  busCfg.lane_bit_rate_mbps = PANEL_DSI_LANE_MBPS;
   if (esp_lcd_new_dsi_bus(&busCfg, &gDsiBus) != ESP_OK) {
     printf("[PANEL] DSI bus create failed\n");
     panelFreeAll(); return false;

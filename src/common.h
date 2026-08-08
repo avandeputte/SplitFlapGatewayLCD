@@ -92,15 +92,13 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
  *  Default config is for the Waveshare ESP32-P4 + 10.1" DSI panel.
  * ==========================================================================*/
 
-// ---- Display: MIPI-DSI (2-lane) on the ESP32-P4 -- no parallel pin map, the DSI PHY
-// has dedicated pins. What the board DOES route on ordinary GPIO:
-#define DSI_RESET_PIN   -1       // panel reset: TODO confirm from the board schematic (-1 = none)
-#define LCD_BL_I2C_ADDR 0x45     // backlight/power controller on the display FPC (regs 0x95/0x96)
-
-
-/* ---- Other on-board hardware (Waveshare ESP32-P4) ---- */
-#define I2C_SDA_PIN     7        // shared bus: display backlight ctrl (0x45), GT9xx touch,
-#define I2C_SCL_PIN     8        // ES8311 codec control -- Waveshare P4 demo wiring
+// ---- Board hardware profile ----
+// Panel driver + geometry, the MIPI-DSI pins/rail, the shared I2C pins, the backlight
+// method, and per-board capability flags (ETH / RTC / audio codec) all come from the
+// selected board profile under src/boards/, chosen by a -DBOARD_* macro in platformio.ini.
+// This is what lets one codebase target both the 10.1" JD9365 board and the 7" EK79007
+// board. See src/board.h and BOARD_SUPPORT_PLAN.md.
+#include "board.h"
 
 /* ---- Time ----
    No RTC chip on this board: the system clock is invalid until the first NTP sync,
@@ -136,15 +134,13 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 #define DEFAULT_NTP_SERVER   "pool.ntp.org"
 #define NTP_TIMEOUT_MS       8000UL
 
-/* ---- Panel defaults ----
-   The panel geometry is fixed (the 800x1280 DSI panel mounted landscape, 1280x800).
-   The grid is the emulated wall -- one virtual split-flap module per cell, IDs
-   row-major from 0 -- and is runtime-configurable (Settings -> Module Wall, applied
-   on reboot). The default 15x5 gives 82x147 px flap cards; anything from 10x1 to
-   32x10 works, cards keep FLAP_ASPECT_NUM/DEN with rowGap air between rows, wall
-   centred (see dispPlan in display.cpp). */
-#define DEFAULT_PANEL_W      1280   // landscape: the 800x1280 portrait panel mounted wide
-#define DEFAULT_PANEL_H      800
+/* ---- Wall / grid defaults ----
+   The panel pixel geometry (DEFAULT_PANEL_W/H, PANEL_MAX_W, EFFECT_RENDER_SCALE) comes from
+   the board profile -- see board.h. The grid below is the emulated wall -- one virtual
+   split-flap module per cell, IDs row-major from 0 -- and is runtime-configurable (Settings
+   -> Module Wall, applied on reboot). The default 15x5 gives 82x147 px flap cards on the
+   10.1" panel; anything from 10x1 to 32x10 works, cards keep FLAP_ASPECT_NUM/DEN with rowGap
+   air between rows, wall centred (see dispPlan in display.cpp). */
 #define DEFAULT_GRID_COLS    15     // virtual modules across (82x147 px flap cards)
 #define DEFAULT_GRID_ROWS    5      // virtual modules down; any 10x1..32x10 grid works
 #define FLAP_ASPECT_NUM      18     // card height = width * 18/10: ~10% squatter than the
@@ -173,8 +169,8 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 // healthy -- this rarely engages; kept as a floor for the network-buffer transient.)
 #define CANVAS_MIN_UPLOAD_HEAP  (40u * 1024u)
 
-#define PANEL_MAX_W          1280
-#define EFFECT_RENDER_SCALE  5     // effects draw at 1/5 (256x160); the PPA scales up (panel.h)
+// PANEL_MAX_W and EFFECT_RENDER_SCALE are board-specific (panel width / effect surface) --
+// they come from the board profile (board.h).
 
 /* ---- Flip animation ----
    Changing the displayed flap cascades forward through the reel, which is what

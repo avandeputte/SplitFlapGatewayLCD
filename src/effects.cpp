@@ -39,8 +39,8 @@ volatile int     gEffectDensity = -1;              // -1 = effect default; else 
 // the two together: changing EFFECT_RENDER_SCALE alone (e.g. to 4 -> width 320) would
 // otherwise silently overrun mHead/mSpeed/Life's xm/xp. Bump FX_MAXW if you widen.
 #define FX_MAXW      256                  // = ceil(PANEL_NATIVE_H / EFFECT_RENDER_SCALE)
-static_assert((1280 + EFFECT_RENDER_SCALE - 1) / EFFECT_RENDER_SCALE <= FX_MAXW,
-              "FX_MAXW too small for the effect render width (PANEL_NATIVE_H / EFFECT_RENDER_SCALE)");
+static_assert((DEFAULT_PANEL_W + EFFECT_RENDER_SCALE - 1) / EFFECT_RENDER_SCALE <= FX_MAXW,
+              "FX_MAXW too small for the effect render width (DEFAULT_PANEL_W / EFFECT_RENDER_SCALE)");
 #define FX_MAXCELLS  260                  // most flap cells (>= any wall grid)
 
 static bool     fxReady = false;          // LUTs built
