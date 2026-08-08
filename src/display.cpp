@@ -240,11 +240,13 @@ void dispTestPattern() {
   panelVLine(W / 2, 0, H, 40, 40, 40);
   // Diagonal: stair-steps or doubles if the row mapping is wrong.
   for (int x = 0; x < W; x++) panelPixel(x, (int)((long)x * (H - 1) / (W - 1)), 40, 40, 40);
-  // Corners, clockwise from top-left: R G B W. Wrong colours = wrong RGB pin order.
-  panelFillRect(1,     1,     3, 3, 255, 0, 0);
-  panelFillRect(W - 4, 1,     3, 3, 0, 255, 0);
-  panelFillRect(W - 4, H - 4, 3, 3, 0, 0, 255);
-  panelFillRect(1,     H - 4, 3, 3, 255, 255, 255);
+  // Corners, clockwise from top-left: R G B W. Wrong colours = wrong RGB pin order. Sized to
+  // the panel (~10% of the short edge) so they read clearly from across the room, not 3px dots.
+  const int cs = ((W < H ? W : H) / 10) | 1;      // odd so it centres cleanly on the diagonal
+  panelFillRect(2,          2,          cs, cs, 255, 0,   0);     // TL red
+  panelFillRect(W - cs - 2, 2,          cs, cs, 0,   255, 0);     // TR green
+  panelFillRect(W - cs - 2, H - cs - 2, cs, cs, 0,   0,   255);   // BR blue
+  panelFillRect(2,          H - cs - 2, cs, cs, 255, 255, 255);   // BL white
   panelShow();
   printf("[PANEL] boot test pattern up for 4s (PANEL_BOOT_TEST=1 in common.h)\n");
   delay(4000);
