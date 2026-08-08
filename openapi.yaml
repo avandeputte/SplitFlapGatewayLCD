@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: LCD Gateway API
-  version: "1.0"
+  version: "1.1"
   description: |
     REST API for the **LCD Gateway** firmware, running on a Waveshare
     ESP32-P4-WIFI6-POE-ETH board driving a 10.1" MIPI-DSI touch LCD (1280x800). It emulates a
@@ -515,12 +515,16 @@ paths:
         via `touchEnabled` in
         `POST /api/config/settings` (default off). Touch events are pushed on the SSE
         stream (`GET /api/events`) as `event: touch` with `{count, seq}` — count 2 = a
-        double-tap. **A double-tap dismisses a running timer or ringing alarm on-device**
-        (logged to the on-card event log) and is not forwarded to SSE. This endpoint
-        reports the touch controller's presence, the enable flag, a lifetime event
-        counter, and the live touch point (`down`, `x`, `y`).
+        double-tap. **A double-tap dismisses a running timer or ringing alarm on-device**;
+        **a swipe down from the top edge opens the on-device settings shade** (volume, flip
+        speed, quiet & sound, schedules, info, reboot; plus brightness on boards with a real
+        backlight). Neither on-device gesture is forwarded to SSE. This endpoint reports the
+        controller's presence, the enable flag, a lifetime event counter, the live touch
+        point (`down`, `x`, `y` in logical pixels), and the raw pre-mapping controller
+        coordinates (`nx`, `ny`) — a diagnostic for calibrating a new board's touch-to-display
+        orientation.
       responses:
-        "200": { description: "{touch:{available,enabled,total,down,x,y}}" }
+        "200": { description: "{touch:{available,enabled,total,down,x,y,nx,ny}}" }
   /api/timer:
     get:
       tags: [Status]

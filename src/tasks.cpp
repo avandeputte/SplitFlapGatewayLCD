@@ -5,6 +5,7 @@
 #include "timer.h"    // alarmTick: daily alarms fire from taskRTC (v3.14)
 #include "audio.h"    // audio capture for the reactive effects
 #include "touch.h"    // GT911 touchscreen taps (LCD Gateway); I2C stays on taskRTC
+#include "settings_ui.h" // settingsActive(): poll touch faster while the shade is open
 #include "sdcard.h"   // sdLog: gesture-dismissal audit trail (v3.15)
 
 
@@ -160,7 +161,9 @@ void taskRTC(void* pv) {
       lastEnv = millis();
       sensorPoll();
     }
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // 20 ms while the settings shade is open, so touch tracks slider drags smoothly; 100 ms
+    // otherwise. (touchTick is the only runtime I2C, so the poll rate lives here.)
+    vTaskDelay(pdMS_TO_TICKS(settingsActive() ? 20 : 100));
   }
 }
 

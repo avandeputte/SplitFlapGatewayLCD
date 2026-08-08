@@ -3,6 +3,8 @@
 #include "effects.h"
 #include "canvas.h"
 #include "timer.h"     // full-screen countdown/alarm renderer (v3.14)
+#include "touch.h"     // touchSwipeDown: opens the settings shade (LCD Gateway)
+#include "settings_ui.h" // the pull-down on-device settings shade
 #include "fontflap.h"  // the Helvetica flap face for big LCD cells (LCD Gateway)
 
 // display.cpp -- the flap wall: geometry, the flap renderer, and the reel task.
@@ -582,10 +584,18 @@ void taskDisplay(void* pv) {
     // rendering (and releasing) even while the companion pushes frames. The renderer
     // re-evicts canvas mode each frame; a companion frame may flash between alert
     // frames, and that is acceptable for an alert.
+    // Swipe down from the top edge -> open the on-device settings shade (never over an alert).
+    if (touchSwipeDown() && !timerAlarmActive()) settingsOpen();
     if (timerAlarmActive()) {
       gDispParked = false;
       panelSetScale(1);                   // alerts render native, whatever was running
       if (timerAlarmRender()) { wdgDispMs = millis(); continue; }
+    }
+    // Settings shade (swiped down): owns the panel below the alert, above canvas/effects/wall.
+    if (settingsActive()) {
+      gDispParked = false;
+      panelSetScale(1);
+      if (settingsRender()) { wdgDispMs = millis(); continue; }
     }
     if (gCanvasMode) { panelSetScale(1); gDispParked = true; vTaskDelay(pdMS_TO_TICKS(50)); continue; }
     gDispParked = false;                  // rendering again: the panel is ours until we next park

@@ -1815,10 +1815,12 @@ static esp_err_t handleApiEnvironment(httpd_req_t* r) {
 static esp_err_t handleApiGestures(httpd_req_t* r) {
   char buf[192];
   uint16_t tx = 0, ty = 0; const bool tdown = touchPoint(&tx, &ty);
+  uint16_t rnx = 0, rny = 0; touchRawPoint(&rnx, &rny);
   snprintf(buf, sizeof(buf),
-           "{\"touch\":{\"available\":%s,\"enabled\":%s,\"total\":%lu,\"down\":%s,\"x\":%u,\"y\":%u}}",
+           "{\"touch\":{\"available\":%s,\"enabled\":%s,\"total\":%lu,\"down\":%s,\"x\":%u,\"y\":%u,\"nx\":%u,\"ny\":%u}}",
            touchAvailable() ? "true" : "false", cfg.touchEnabled ? "true" : "false",
-           (unsigned long)touchTotal(), tdown ? "true" : "false", (unsigned)tx, (unsigned)ty);
+           (unsigned long)touchTotal(), tdown ? "true" : "false", (unsigned)tx, (unsigned)ty,
+           (unsigned)rnx, (unsigned)rny);
   return httpxSend(r, 200, "application/json", buf);
 }
 

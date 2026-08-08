@@ -21,6 +21,7 @@ static const uint16_t REG_PRODUCT  = 0x8140;
 static uint8_t  gAddr    = 0;                 // 0 until probed OK
 static bool     gDown    = false;            // a finger is currently on the glass
 static uint32_t gLastTapMs = 0;              // refractory
+static uint32_t gLastTouchMs = 0;            // last tick a finger was seen (lift-by-timeout)
 static uint16_t gLastX = 0, gLastY = 0;
 
 static portMUX_TYPE touchMux = portMUX_INITIALIZER_UNLOCKED;
@@ -28,6 +29,25 @@ static volatile uint8_t  gPending = 0;        // 1 = a tap event waiting to be d
 static volatile uint32_t gSeq = 0;
 static volatile uint32_t gTotal = 0;
 static volatile uint16_t gPubX = 0, gPubY = 0;
+static volatile uint16_t gPubNx = 0, gPubNy = 0;   // raw GT911 coords (pre-toLogical), for calibration
+
+// Swipe-down-from-top-edge -> opens the on-device settings shade (settings_ui.cpp), tracked
+// here on taskRTC; the one-shot gSwipeDown is consumed by touchSwipeDown() from taskDisplay.
+static uint16_t gSwStartY = 0;
+static bool     gSwActive = false;          // a top-edge press is in progress
+static volatile bool gSwipeDown = false;    // one-shot: a completed downward swipe
+#define TOUCH_SWIPE_TOP_EDGE  60            // the press must land within this many px of the top
+#define TOUCH_SWIPE_MIN_DIST  110           // and drag down at least this far to fire
+
+// UI tap latch: a stationary press+release (NOT a drag/swipe), captured HERE in touchTick so a
+// slow UI render loop can't miss the brief down phase. Consumed by touchTapConsume(); the point
+// reported is the press location. This is what the settings shade hit-tests buttons/toggles on.
+static uint16_t gTapDownX = 0, gTapDownY = 0;
+static bool     gTapMoved = false;          // this press has moved too far to be a tap (a drag)
+static volatile bool     gUiTap  = false;   // one-shot: a completed tap
+static volatile uint16_t gUiTapX = 0, gUiTapY = 0;
+#define TOUCH_TAP_MOVE_TOL  28             // a press may jitter this far and still count as a tap
+#define TOUCH_LIFT_MS       70             // no fresh touch for this long = the finger has lifted
 
 // ---- raw register I/O (Wire; caller ensures single-threaded / taskRTC) -------------
 static bool gtRead(uint16_t reg, uint8_t* buf, size_t n) {
@@ -69,39 +89,82 @@ bool touchAvailable() { return gAddr != 0; }
 // bottom-right -- derived empirically by touching the four corners. If a rebuild ever
 // mounts the panel the other way round, these two lines are the one place to flip.
 static inline void toLogical(uint16_t nx, uint16_t ny, uint16_t* lx, uint16_t* ly) {
+#if PANEL_ROTATE_DEG == 0
+  // Native-landscape board (7B, EK79007): the GT911 sits rotated 180 from the display, so BOTH
+  // axes run opposite it -- physical top-left reads raw ~(W,H), bottom-right ~(0,0). Verified by
+  // touching all four corners (TL raw(960,527) .. BR raw(71,48) on 1024x600). Invert both; nx is
+  // the width axis, ny the height axis.
+  *lx = (nx < DEFAULT_PANEL_W) ? (uint16_t)(DEFAULT_PANEL_W - 1 - nx) : 0;
+  *ly = (ny < DEFAULT_PANEL_H) ? (uint16_t)(DEFAULT_PANEL_H - 1 - ny) : 0;
+#else
+  // 10.1" portrait panel mounted landscape (rotated 90): the GT911 reports in the panel's
+  // native PORTRAIT frame (nx the 800-axis, ny the 1280-axis); rotate it onto the mount.
   *lx = (ny < DEFAULT_PANEL_W) ? (uint16_t)(DEFAULT_PANEL_W - 1 - ny) : 0;
   *ly = (nx < DEFAULT_PANEL_H) ? nx : (uint16_t)(DEFAULT_PANEL_H - 1);
+#endif
 }
 
 void touchTick() {
   if (!gAddr) return;
   uint8_t st;
   if (!gtRead(REG_STATUS, &st, 1)) return;
-  if (!(st & 0x80)) return;                               // no fresh buffer
-  const uint8_t pts = st & 0x0F;
-  if (pts) {
-    uint8_t p[8];
-    if (gtRead(REG_POINT1, p, 8)) {
-      const uint16_t nx = (uint16_t)(p[0] | (p[1] << 8));   // panel 800-axis
-      const uint16_t ny = (uint16_t)(p[2] | (p[3] << 8));   // panel 1280-axis
-      uint16_t lx, ly; toLogical(nx, ny, &lx, &ly);
-      gLastX = lx; gLastY = ly;
-      // A press EDGE is the tap moment: immediate, responsive for dismiss. A drag is
-      // still one edge = one tap. 120 ms refractory debounces the capacitive jitter.
-      const uint32_t now = millis();
-      if (!gDown && (uint32_t)(now - gLastTapMs) > 120) {
-        gLastTapMs = now;
+  const uint32_t now = millis();
+  bool released = false;
+  if (st & 0x80) {                                        // a fresh touch buffer is ready
+    const uint8_t pts = st & 0x0F;
+    if (pts) {
+      uint8_t p[8];
+      if (gtRead(REG_POINT1, p, 8)) {
+        const uint16_t nx = (uint16_t)(p[0] | (p[1] << 8));   // panel 800-axis
+        const uint16_t ny = (uint16_t)(p[2] | (p[3] << 8));   // panel 1280-axis
+        uint16_t lx, ly; toLogical(nx, ny, &lx, &ly);
+        gLastX = lx; gLastY = ly; gLastTouchMs = now;
+        const bool pressEdge = !gDown;
+        if (pressEdge) {
+          // New press: seed BOTH the swipe-open candidate and the UI-tap candidate.
+          gSwStartY = ly; gSwActive = (ly < TOUCH_SWIPE_TOP_EDGE);
+          gTapDownX = lx; gTapDownY = ly; gTapMoved = false;
+        } else {
+          // Swipe-down-from-top-edge -> open the settings shade (fires once past the threshold).
+          if (gSwActive && (int)ly - (int)gSwStartY >= TOUCH_SWIPE_MIN_DIST) {
+            gSwipeDown = true; gSwActive = false;
+          }
+          // Real movement disqualifies this press from being a tap (it's a drag/swipe).
+          if (abs((int)lx - (int)gTapDownX) > TOUCH_TAP_MOVE_TOL ||
+              abs((int)ly - (int)gTapDownY) > TOUCH_TAP_MOVE_TOL) gTapMoved = true;
+        }
+        // A press EDGE is the tap moment for the SSE gesture (immediate, responsive for dismiss);
+        // 120 ms refractory debounces the jitter. A drag still counts as one edge = one tap.
+        if (pressEdge && (uint32_t)(now - gLastTapMs) > 120) {
+          gLastTapMs = now;
+          taskENTER_CRITICAL(&touchMux);
+          gPending = 1; gSeq = gSeq + 1; gTotal = gTotal + 1;
+          taskEXIT_CRITICAL(&touchMux);
+        }
+        // Publish the LIVE finger position every tick while down (was: only on the press edge)
+        // so the settings shade can drive slider drags + taps; /api/gestures shows it too.
         taskENTER_CRITICAL(&touchMux);
-        gPending = 1; gSeq = gSeq + 1; gTotal = gTotal + 1;
-        gPubX = lx; gPubY = ly;
+        gPubX = lx; gPubY = ly; gPubNx = nx; gPubNy = ny;
         taskEXIT_CRITICAL(&touchMux);
+        gDown = true;
       }
-      gDown = true;
+    } else {
+      released = true;                                    // explicit pts==0 release report
     }
-  } else {
-    gDown = false;                                        // all fingers lifted
+    gtWrite8(REG_STATUS, 0);                              // ack: let the controller refresh
   }
-  gtWrite8(REG_STATUS, 0);                                // ack: let the controller refresh
+  // Finger LIFT = an explicit release OR no fresh touch for TOUCH_LIFT_MS. The GT911 on this
+  // panel does NOT reliably emit the pts==0 release when polled, so the timeout is the real
+  // lift detector -- and the one thing that makes a press+release reliably land as a tap.
+  // A stationary press that lifts is a UI tap; a moved one was a drag/swipe (excluded).
+  if (gDown && (released || (uint32_t)(now - gLastTouchMs) > TOUCH_LIFT_MS)) {
+    if (!gTapMoved) {
+      taskENTER_CRITICAL(&touchMux);
+      gUiTap = true; gUiTapX = gTapDownX; gUiTapY = gTapDownY;
+      taskEXIT_CRITICAL(&touchMux);
+    }
+    gDown = false; gSwActive = false;
+  }
 }
 
 bool touchPoll(uint8_t* countOut, uint32_t* seqOut) {
@@ -123,4 +186,23 @@ bool touchPoint(uint16_t* x, uint16_t* y) {
   if (x) *x = gPubX;
   if (y) *y = gPubY;
   return gDown;
+}
+
+bool touchSwipeDown() {
+  if (!gSwipeDown) return false;
+  gSwipeDown = false;                        // one-shot
+  return true;
+}
+
+void touchRawPoint(uint16_t* nx, uint16_t* ny) {
+  if (nx) *nx = gPubNx;
+  if (ny) *ny = gPubNy;
+}
+
+bool touchTapConsume(uint16_t* x, uint16_t* y) {
+  bool has = false;
+  taskENTER_CRITICAL(&touchMux);
+  if (gUiTap) { if (x) *x = gUiTapX; if (y) *y = gUiTapY; gUiTap = false; has = true; }
+  taskEXIT_CRITICAL(&touchMux);
+  return has;
 }

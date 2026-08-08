@@ -23,3 +23,12 @@ uint32_t touchTotal();                              // tap events since boot (di
 // Last touch point in LOGICAL landscape pixels, and whether a finger is down right
 // now -- for the dashboard/telemetry. Reset-on-read is not needed; these just mirror.
 bool touchPoint(uint16_t* x, uint16_t* y);
+// One-shot: true once when a finger swipes DOWN from the top edge -- opens the on-device
+// settings shade (settings_ui.cpp). Consumed on read.
+bool touchSwipeDown();
+// Raw GT911 coordinates of the live point (pre-toLogical) -- for touch-mapping calibration.
+void touchRawPoint(uint16_t* nx, uint16_t* ny);
+// One completed UI tap (a stationary press+release, NOT a drag) at (x,y) in logical pixels,
+// latched in touchTick so a slow render loop can't miss it. Consumed on read -- for button/
+// toggle hit-testing in the settings shade. (Sliders read touchPoint's live position instead.)
+bool touchTapConsume(uint16_t* x, uint16_t* y);
