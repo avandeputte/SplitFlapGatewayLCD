@@ -109,7 +109,7 @@ static inline uint32_t boardId24() {          // 6 hex digits -- hostname suffix
 // and as "fw" in capabilities. Clients key product-specific behaviour on "product" and on
 // capability tokens, never on version heuristics (the old API_VERSION="3.1.0" masquerade
 // for the physical-gateway companion gate was removed in v3.12).
-#define FW_VERSION           "1.1"      // this product's version (UI + boot log)
+#define FW_VERSION           "1.2"      // this product's version (UI + boot log)
 #define PRODUCT_NAME         "LCD Gateway"
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
