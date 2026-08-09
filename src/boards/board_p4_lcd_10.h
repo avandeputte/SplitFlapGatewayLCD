@@ -40,5 +40,6 @@
 #define BOARD_HAS_IMU         0        // no IMU -- the touch panel replaces tap gestures
 #define BOARD_AUDIO_ES8311    1        // mic capture + playback via the ES8311 codec
 #define BOARD_AUDIO_ES7210    0        // no dedicated capture codec
+#define BOARD_HAS_BATTERY     0        // PoE / Ethernet powered -- no battery, no charger
 
 #endif // LCDGW_BOARD_P4_LCD_10_H

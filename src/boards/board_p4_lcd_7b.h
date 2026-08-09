@@ -46,4 +46,12 @@
 #define BOARD_AUDIO_ES8311    1         // playback + codec control
 #define BOARD_AUDIO_ES7210    1         // dedicated dual-mic capture (echo-cancel) -- Phase 4
 
+// ---- battery sense ----
+// Single-cell Li-ion on the MX1.25 port, charged by an ETA6098 switch-mode charger. That chip
+// has no I2C and its STAT pin isn't broken out, so charge STATE isn't readable -- but battery
+// VOLTAGE is: a divider (BAT -> R92 200K / R93 100K -> GPIO20, ÷3) feeds a P4 ADC pin.
+#define BOARD_HAS_BATTERY     1
+#define BATTERY_ADC_PIN       20        // GPIO20 = the divider midpoint (BAT/3)
+#define BATTERY_DIVIDER       3         // BAT = ADC(GPIO20) * 3
+
 #endif // LCDGW_BOARD_P4_LCD_7B_H

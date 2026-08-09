@@ -9,6 +9,7 @@
 #include "audio.h"           // capabilities audio token + effect "audio" param (v3.4)
 #include "sound.h"           // POST /api/sound + the sound capability token (v3.6)
 #include "sensor.h"          // env fields in status + the environment token (v3.7)
+#include "battery.h"         // battery voltage/level in status (7B)
 #include "sdcard.h"
 #include "backup.h"
 #include <driver/jpeg_decode.h>   // P4 hardware JPEG decoder (canvas jpeg upload)
@@ -885,6 +886,12 @@ size_t statusJson(char* outBuf, size_t outCap) {
     snprintf(sdf, sizeof(sdf), "{\"ok\":true,\"type\":\"%s\",\"sizeMB\":%llu,\"usedMB\":%llu}",
              sdType, sdSz, sdUsed);
   else snprintf(sdf, sizeof(sdf), "{\"ok\":false}");
+  // Battery (7B): pack voltage + a rough % from the GPIO20 divider; {"present":false} elsewhere
+  // or before the first sample. Charge STATE is unavailable (the ETA6098's STAT pin isn't wired).
+  char batf[64]; uint16_t bmv; uint8_t bpct; uint32_t bage;
+  if (batteryRead(bmv, bpct, bage))
+    snprintf(batf, sizeof(batf), "{\"present\":true,\"mv\":%u,\"pct\":%u}", (unsigned)bmv, (unsigned)bpct);
+  else snprintf(batf, sizeof(batf), "{\"present\":false}");
   size_t n = (size_t)snprintf(outBuf, outCap,
     "{\"uptime\":%lu,\"tx\":%lu,"
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\",\"eth\":\"%d.%d.%d.%d\","
@@ -893,7 +900,7 @@ size_t statusJson(char* outBuf, size_t outCap) {
     "\"panel\":{\"ok\":%s,\"w\":%u,\"h\":%u,\"cols\":%u,\"rows\":%u,"
     "\"cellW\":%u,\"cellH\":%u,\"rowGap\":%u,\"depth\":%u,\"refreshHz\":%u,\"font\":\"%s\",\"vmods\":%d},"
     "\"time\":\"%s\",\"ntpSynced\":%s,\"quiet\":%s,"
-    "\"companion\":{\"url\":\"%s\",\"status\":\"%s\",\"age\":%ld},\"env\":%s,\"sd\":%s,\"resets\":%s}",
+    "\"companion\":{\"url\":\"%s\",\"status\":\"%s\",\"age\":%ld},\"env\":%s,\"sd\":%s,\"resets\":%s,\"battery\":%s}",
     millis()/1000, txCount,
     (WiFi.status()==WL_CONNECTED)?"true":"false",
     lip[0],lip[1],lip[2],lip[3],
@@ -909,7 +916,7 @@ size_t statusJson(char* outBuf, size_t outCap) {
     rtcBuf,
     ntpSynced?"true":"false",
     gQuietTime?"true":"false",
-    cfg.companionUrl, gCompanionStatus, compAge, envf, sdf, rst);
+    cfg.companionUrl, gCompanionStatus, compAge, envf, sdf, rst, batf);
   // Truncation would be INVALID JSON for every consumer (dashboard, SSE) -- make it loud,
   // like the capabilities block does. ~166 B of margin today; this is the tripwire.
   if (n >= outCap) printf("[WEB] statusJson TRUNCATED (%u >= %u) -- enlarge the buffer\n",

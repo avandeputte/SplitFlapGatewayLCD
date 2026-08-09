@@ -3,6 +3,7 @@
 #include "audio.h"
 #include "sound.h"
 #include "sensor.h"
+#include "battery.h"
 #include "sdcard.h"
 #include "backup.h"
 #include "touch.h"
@@ -158,6 +159,7 @@ void setup() {
   audioInit();
   soundInit();   // ES8311 speaker DAC -- same single-threaded I2C window
   sensorInit();  // SHTC3 temp/humidity -- same single-threaded I2C window
+  batteryInit(); // configure the battery-sense ADC pin (7B; no-op on boards without a battery)
   touchInit();   // GT911 capacitive touch -- same single-threaded I2C window (LCD)
 
   // 4. Plan the panel geometry. The DSI panel is a fixed size; the module grid is

@@ -1,6 +1,7 @@
 #include "gateway.h"
 #include "sse.h"   // taskWeb is the SSE push pump (v3.0)
 #include "sensor.h"   // SHTC3 temp/humidity, polled from taskRTC (v3.7)
+#include "battery.h"  // Li-ion battery voltage (7B), ADC-polled from taskRTC
 #include "panel.h"    // panelSetBrightness: the brightness schedule (v3.13)
 #include "timer.h"    // alarmTick: daily alarms fire from taskRTC (v3.14)
 #include "audio.h"    // audio capture for the reactive effects
@@ -160,6 +161,7 @@ void taskRTC(void* pv) {
     if (lastEnv == 0 || millis() - lastEnv > 10000UL) {
       lastEnv = millis();
       sensorPoll();
+      batteryPoll();     // ADC-only; rides the 10 s env cadence (no-op without a battery sense)
     }
     // 20 ms while the settings shade is open, so touch tracks slider drags smoothly; 100 ms
     // otherwise. (touchTick is the only runtime I2C, so the poll rate lives here.)
