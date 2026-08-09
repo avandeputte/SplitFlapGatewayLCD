@@ -888,10 +888,12 @@ size_t statusJson(char* outBuf, size_t outCap) {
   else snprintf(sdf, sizeof(sdf), "{\"ok\":false}");
   // Battery (7B): pack voltage + a rough % from the GPIO20 divider; {"present":false} elsewhere
   // or before the first sample. Charge STATE is unavailable (the ETA6098's STAT pin isn't wired).
-  char batf[64]; uint16_t bmv; uint8_t bpct; uint32_t bage;
-  if (batteryRead(bmv, bpct, bage))
-    snprintf(batf, sizeof(batf), "{\"present\":true,\"mv\":%u,\"pct\":%u}", (unsigned)bmv, (unsigned)bpct);
-  else snprintf(batf, sizeof(batf), "{\"present\":false}");
+  char batf[72]; uint16_t bmv; uint8_t bpct; bool bext; uint32_t bage;
+  if (!batteryAvailable())                     snprintf(batf, sizeof(batf), "{\"sense\":false}");
+  else if (batteryRead(bmv, bpct, bext, bage)) {
+    if (bext) snprintf(batf, sizeof(batf), "{\"sense\":true,\"mv\":%u,\"external\":true}", (unsigned)bmv);
+    else      snprintf(batf, sizeof(batf), "{\"sense\":true,\"mv\":%u,\"external\":false,\"pct\":%u}", (unsigned)bmv, (unsigned)bpct);
+  } else                                       snprintf(batf, sizeof(batf), "{\"sense\":true}");
   size_t n = (size_t)snprintf(outBuf, outCap,
     "{\"uptime\":%lu,\"tx\":%lu,"
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\",\"eth\":\"%d.%d.%d.%d\","

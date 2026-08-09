@@ -321,9 +321,10 @@ bool settingsRender() {
            FW_VERSION, BOARD_ID_STR, W, H, (int)gPanel.cols, (int)gPanel.rows);
   sTxt(colX, yInfo + isz + 6, isz, line, 150, 175, 205, 0);
 #if BOARD_HAS_BATTERY
-  { uint16_t bmv; uint8_t bpct; uint32_t bage;
-    if (batteryRead(bmv, bpct, bage)) {
-      snprintf(line, sizeof(line), "battery   %u.%02u V   %u%%", bmv / 1000, (bmv % 1000) / 10, bpct);
+  { uint16_t bmv; uint8_t bpct; bool bext; uint32_t bage;
+    if (batteryRead(bmv, bpct, bext, bage)) {
+      if (bext) snprintf(line, sizeof(line), "battery   ext power   %u.%02u V", bmv / 1000, (bmv % 1000) / 10);
+      else      snprintf(line, sizeof(line), "battery   %u.%02u V   %u%%", bmv / 1000, (bmv % 1000) / 10, bpct);
       sTxt(colX, yInfo + 2 * (isz + 6), isz, line, 150, 205, 170, 0);   // greenish, stands out
     } }
 #endif

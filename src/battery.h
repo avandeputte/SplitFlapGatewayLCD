@@ -8,7 +8,10 @@
 #pragma once
 #include <stdint.h>
 
-void batteryInit();                                              // configure the ADC pin (setup())
-void batteryPoll();                                              // one measurement -> cache
-bool batteryAvailable();                                         // BOARD_HAS_BATTERY
-bool batteryRead(uint16_t& mv, uint8_t& pct, uint32_t& ageMs);   // last reading; mv = pack millivolts
+void batteryInit();          // configure the ADC pin (setup())
+void batteryPoll();          // one measurement -> cache
+bool batteryAvailable();     // BOARD_HAS_BATTERY (the board has a battery-voltage sense)
+// Last reading. mv = BAT-rail millivolts (always valid). external = the rail is pinned at the
+// charger's ~4.2V plateau -> on USB power, a cell that is full OR absent (indistinguishable),
+// so pct is NOT meaningful. pct = rough % off the resting Li-ion curve; use only when !external.
+bool batteryRead(uint16_t& mv, uint8_t& pct, bool& external, uint32_t& ageMs);

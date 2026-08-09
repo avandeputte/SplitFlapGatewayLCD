@@ -3,10 +3,14 @@
 
 #if BOARD_HAS_BATTERY
 
-static uint16_t gMv     = 0;      // smoothed pack voltage (mV)
-static uint8_t  gPct    = 0;
-static uint32_t gAt     = 0;      // millis() of last sample
-static bool     gPrimed = false;
+#define BATT_EXT_HI 4160     // rail >= this: pinned at the charger's plateau (on USB; full or absent)
+#define BATT_EXT_LO 4120     // rail <= this: clearly a discharging cell -> a % is meaningful
+
+static uint16_t gMv       = 0;    // smoothed BAT-rail voltage (mV)
+static uint8_t  gPct      = 0;
+static bool     gExternal = true; // rail pinned at the charge plateau (assume so until proven a cell)
+static uint32_t gAt       = 0;    // millis() of last sample
+static bool     gPrimed   = false;
 
 // Resting single-cell Li-ion voltage -> % (piecewise-linear, approximate). Under charge or load
 // the curve shifts, so this is a rough fuel gauge, not a coulomb count.
@@ -32,14 +36,18 @@ void batteryPoll() {
   gMv     = gPrimed ? (uint16_t)((gMv * 3 + pack) / 4) : (uint16_t)pack;      // EMA over ~4 polls
   gPrimed = true;
   gPct    = pctFromMv(gMv);
+  // On USB the ETA6098 holds BAT at its ~4.2V charge target whether a cell is full or ABSENT, so
+  // a plateau reading means "external power, % not meaningful". Hysteresis avoids boundary flicker.
+  if      (gMv >= BATT_EXT_HI) gExternal = true;
+  else if (gMv <= BATT_EXT_LO) gExternal = false;
   gAt     = millis();
 }
 
 bool batteryAvailable() { return true; }
 
-bool batteryRead(uint16_t& mv, uint8_t& pct, uint32_t& ageMs) {
+bool batteryRead(uint16_t& mv, uint8_t& pct, bool& external, uint32_t& ageMs) {
   if (!gPrimed) return false;
-  mv = gMv; pct = gPct; ageMs = millis() - gAt;
+  mv = gMv; pct = gPct; external = gExternal; ageMs = millis() - gAt;
   return true;
 }
 
@@ -48,6 +56,6 @@ bool batteryRead(uint16_t& mv, uint8_t& pct, uint32_t& ageMs) {
 void batteryInit() {}
 void batteryPoll() {}
 bool batteryAvailable() { return false; }
-bool batteryRead(uint16_t&, uint8_t&, uint32_t&) { return false; }
+bool batteryRead(uint16_t&, uint8_t&, bool&, uint32_t&) { return false; }
 
 #endif
