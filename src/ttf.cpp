@@ -86,20 +86,6 @@ static void cacheEvictOne() {
   if (gCache[bi].cov) { free(gCache[bi].cov); gCacheBytes -= (uint32_t)gCache[bi].w * gCache[bi].h; }
   gCache[bi] = Glyph{};
   gCacheCount--;
-  // Backward-shift deletion: this is an open-addressed, linear-probed table, so an empty slot
-  // left mid-cluster makes any later colliding key unfindable (lookups stop at the first empty
-  // slot) -- it would be needlessly re-rasterized, defeating the cache. Refill the hole from the
-  // following cluster, moving each entry back only when the hole lies on its probe path.
-  int i = bi;
-  for (int j = bi;;) {
-    j = (j + 1) & (TTF_CACHE_SLOTS - 1);
-    if (!gCache[j].key) break;                          // cluster ends at an empty slot
-    const uint32_t k = keyHash(gCache[j].key);          // entry j's ideal slot
-    const bool jStays = (i < j) ? ((uint32_t)i < k && k <= (uint32_t)j)   // k in (i, j] -> keep
-                                : ((uint32_t)i < k || k <= (uint32_t)j);
-    if (jStays) continue;
-    gCache[i] = gCache[j]; gCache[j] = Glyph{}; i = j;  // move j into the hole; j is the new hole
-  }
 }
 
 // Find or rasterize the glyph. Returns null only on a hard failure (never for a blank glyph,
