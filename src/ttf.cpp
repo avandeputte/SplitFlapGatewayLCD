@@ -86,6 +86,20 @@ static void cacheEvictOne() {
   if (gCache[bi].cov) { free(gCache[bi].cov); gCacheBytes -= (uint32_t)gCache[bi].w * gCache[bi].h; }
   gCache[bi] = Glyph{};
   gCacheCount--;
+  // Backward-shift deletion: this is an open-addressed, linear-probed table, so an empty slot
+  // left mid-cluster makes any later colliding key unfindable (lookups stop at the first empty
+  // slot) -- it would be needlessly re-rasterized, defeating the cache. Refill the hole from the
+  // following cluster, moving each entry back only when the hole lies on its probe path.
+  int i = bi;
+  for (int j = bi;;) {
+    j = (j + 1) & (TTF_CACHE_SLOTS - 1);
+    if (!gCache[j].key) break;                          // cluster ends at an empty slot
+    const uint32_t k = keyHash(gCache[j].key);          // entry j's ideal slot
+    const bool jStays = (i < j) ? ((uint32_t)i < k && k <= (uint32_t)j)   // k in (i, j] -> keep
+                                : ((uint32_t)i < k || k <= (uint32_t)j);
+    if (jStays) continue;
+    gCache[i] = gCache[j]; gCache[j] = Glyph{}; i = j;  // move j into the hole; j is the new hole
+  }
 }
 
 // Find or rasterize the glyph. Returns null only on a hard failure (never for a blank glyph,
@@ -112,11 +126,17 @@ static Glyph* glyphGet(uint8_t face, int size, int cp) {
   if (gi) stbtt_GetGlyphBitmapBox(fi, gi, scale, scale, &x0, &y0, &x1, &y1);
   const int w = x1 - x0, hh = y1 - y0;
 
+  const bool hasCov = (gi && w > 0 && hh > 0);
+  const uint32_t need = hasCov ? (uint32_t)w * hh : 0;
+  // Ensure a free slot (and stay under the byte budget). Runs for EVERY glyph, not just glyphs
+  // with coverage: a blank glyph (space / out-of-font char, need==0) still occupies a slot, so it
+  // too must be able to evict when the table is full -- otherwise it wedges below and returns
+  // null, which drops the character's advance and corrupts the text once the cache fills.
+  while ((gCacheCount + 1 >= TTF_CACHE_SLOTS || gCacheBytes + need > TTF_CACHE_BUDGET) && gCacheCount)
+    cacheEvictOne();
+
   uint8_t* cov = nullptr;
-  if (gi && w > 0 && hh > 0) {
-    const uint32_t need = (uint32_t)w * hh;
-    while ((gCacheCount + 1 >= TTF_CACHE_SLOTS || gCacheBytes + need > TTF_CACHE_BUDGET) && gCacheCount)
-      cacheEvictOne();
+  if (hasCov) {
     cov = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
     if (cov) {
       stbtt_MakeGlyphBitmap(fi, cov, w, hh, w, scale, scale, gi);
@@ -126,7 +146,7 @@ static Glyph* glyphGet(uint8_t face, int size, int cp) {
 
   // OOM guard: a REAL glyph whose coverage allocation failed must not be cached as
   // "blank forever" -- skip the insert and let a later, less-pressured frame retry.
-  if (gi && w > 0 && hh > 0 && !cov) return nullptr;
+  if (hasCov && !cov) return nullptr;
 
   // Re-find a free slot (eviction above may have opened one; re-probe from the hash).
   if (firstFree < 0 || gCache[firstFree].key) {
