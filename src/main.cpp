@@ -376,6 +376,26 @@ void loop() {
         delay(200);
         ESP.restart();
       }
+
+      // WiFi-over-SDIO/C6 transport-wedge recovery (v1.3.7). The link to the C6 can silently
+      // wedge under sustained load: the RPC transport dies (100% packet loss, endless
+      // "rpc_core: Response not received" timeouts) while the host keeps WiFi.status() cached at
+      // WL_CONNECTED -- so taskNetwork, which only ever tests WL_CONNECTED, never reconnects and
+      // the board stays unreachable forever. The tell is RSSI==0 while "connected": 0 dBm is
+      // physically impossible, so a read of 0 means the RSSI RPC (WifiStaGetApInfo) timed out.
+      // A sustained run of it = a dead transport; reboot to re-init SDIO + reset the C6 (the slave
+      // is reset on every host boot). WiFi-only boards only -- a wired board runs with WiFi off.
+      static uint8_t rpcDead = 0;
+      if (!gEthUp && WiFi.status() == WL_CONNECTED && WiFi.RSSI() == 0) {
+        if (++rpcDead >= 3) {          // ~3 x 30 s: the C6 RPC has been dead ~90 s
+          printf("[WDG] C6/SDIO transport wedged (RSSI=0 while connected x%u) -- rebooting\n", rpcDead);
+          sdLog("WDG C6 transport wedged -- rebooting");
+          delay(200);
+          ESP.restart();
+        }
+      } else {
+        rpcDead = 0;
+      }
     }
     // Emergency reboot if heap falls critically low -- EXCEPT during a web OTA.
     // A fast sender fills the TCP receive window (~95 KB on this build's lwIP
