@@ -1,6 +1,6 @@
 # LCD Gateway
 
-> ### 📖 [SplitFlap Wiki — the comprehensive documentation](https://github.com/avandeputte/SplitFlapGateway/wiki)
+> ### 📖 [SplitFlap Wiki — the comprehensive documentation](https://splitflap.iothing.net/docs/)
 > Quick start · choosing a configuration · provisioning & calibration · the SplitFlap and
 > Matrix Gateways · the companion and its apps · APIs and wire protocols — the whole
 > ecosystem, documented in one place.
@@ -82,7 +82,7 @@ they live.
 Because the "wall" is really a framebuffer, the gateway exposes it directly alongside the
 split-flap emulation — everything feature-detected through `GET /api/capabilities`, fully
 specified in [openapi.yaml](openapi.yaml) and the
-[wiki's Canvas page](https://github.com/avandeputte/SplitFlapGateway/wiki/Canvas):
+[wiki's Canvas page](https://splitflap.iothing.net/docs/Canvas/):
 
 - **Canvas mode** — push raw frames (`rgb888`/`rgb565`/QOI), partial rects, multi-rect
   deltas, or a JSON batch of draw ops (shapes, text in six sizes plus uploadable fonts,
